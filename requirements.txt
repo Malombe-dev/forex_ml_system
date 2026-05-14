@@ -1,0 +1,34 @@
+# Core data processing
+pandas>=2.0.0
+numpy>=1.24.0
+pyarrow>=12.0.0  # For parquet files
+
+# Machine Learning
+xgboost>=2.0.0
+scikit-learn>=1.3.0
+
+# Optional: Advanced tick data
+dukascopy-python>=0.2.0  # For downloading tick data
+
+# Optional: Live data feeds
+# twelvedata>=1.2.0  # If using TwelveData API
+# python-binance>=1.0.0  # If trading crypto
+# oanda-api-v20>=3.0.0  # If using Oanda broker
+
+# Utilities
+requests>=2.31.0
+python-dateutil>=2.8.0
+
+# Optional: Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Optional: Advanced features
+# tensorflow>=2.13.0  # For deep learning models
+# lightgbm>=4.0.0  # Alternative to XGBoost
+# optuna>=3.0.0  # For hyperparameter optimization
+
+# Development
+pytest>=7.4.0
+black>=23.0.0
+flake8>=6.0.0

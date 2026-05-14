@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Forex ML · Signal Dashboard</title>
+  <link rel="stylesheet" href="/static/css/style.css"/>
+</head>
+<body>
+
+  <!-- ── Top bar ─────────────────────────────────────────────────────────── -->
+  <header class="topbar">
+    <div class="topbar-left">
+      <span class="logo">Forex<strong>ML</strong></span>
+      <div id="pair-tags"></div>
+    </div>
+    <div class="topbar-right">
+      <span id="server-status" class="status-dot unknown" title="Server status"></span>
+      <span id="last-updated" class="muted">—</span>
+      <button id="btn-refresh" onclick="fetchAll()">↻ Refresh</button>
+      <span id="clock" class="muted"></span>
+    </div>
+  </header>
+
+  <!-- ── Main ────────────────────────────────────────────────────────────── -->
+  <main class="main">
+
+    <!-- Metric cards -->
+    <section class="metrics" id="metrics-row"></section>
+
+    <!-- Strategy breakdown mini-bar -->
+    <section class="strat-bar-wrap">
+      <div class="section-label">Strategy distribution</div>
+      <div id="strat-bar"></div>
+    </section>
+
+    <!-- Signals table -->
+    <section>
+      <div class="section-header">
+        <span class="section-label">Live Signals</span>
+        <div class="filters">
+          <select id="f-strategy" onchange="renderSignals()">
+            <option value="">All strategies</option>
+            <option value="HTF_SMC">HTF_SMC</option>
+            <option value="REVERSION">REVERSION</option>
+            <option value="CONTINUATION">CONTINUATION</option>
+          </select>
+          <select id="f-status" onchange="renderSignals()">
+            <option value="">All statuses</option>
+            <option value="hit_tp">Hit TP</option>
+            <option value="hit_sl">Hit SL</option>
+            <option value="active">Active</option>
+          </select>
+          <select id="f-dir" onchange="renderSignals()">
+            <option value="">All directions</option>
+            <option value="BUY">BUY</option>
+            <option value="SELL">SELL</option>
+          </select>
+          <select id="f-tf" onchange="renderSignals()">
+            <option value="">All timeframes</option>
+            <option value="15min">15min</option>
+            <option value="1h">1h</option>
+          </select>
+        </div>
+      </div>
+      <div class="card table-card">
+        <table class="tbl" id="signals-table">
+          <thead><tr>
+            <th>Time EAT</th><th>TF</th><th>Strategy</th><th>Dir</th>
+            <th>Entry</th><th>SL</th><th>TP</th>
+            <th>Risk</th><th>RR</th><th>Probability</th>
+            <th>Conf</th><th>5m ✓</th><th>CT</th><th>Status</th>
+          </tr></thead>
+          <tbody id="signals-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Charts -->
+    <div class="chart-grid">
+      <section>
+        <div class="section-label">Signal Probabilities</div>
+        <div class="card">
+          <div id="prob-legend" class="legend"></div>
+          <div class="chart-wrap" style="height:210px">
+            <canvas id="probChart" role="img" aria-label="Signal probabilities bar chart">Probabilities chart.</canvas>
+          </div>
+        </div>
+      </section>
+      <section>
+        <div class="section-label">Risk vs Reward (pips)</div>
+        <div class="card">
+          <div class="chart-wrap" style="height:210px">
+            <canvas id="rrChart" role="img" aria-label="Risk reward pips chart">RR chart.</canvas>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <!-- Price Zone Map -->
+    <section>
+      <div class="section-label">Price Zone Map</div>
+      <div class="card zone-map-card">
+        <canvas id="zoneMap" role="img" aria-label="Price zone map with supply and demand zones"></canvas>
+        <div class="zone-map-legend">
+          <span class="zml supply">Supply / Cont</span>
+          <span class="zml demand">Demand / Cont</span>
+          <span class="zml rev-supply">Supply / Rev</span>
+          <span class="zml rev-demand">Demand / Rev</span>
+          <span class="zml entry-sell">SELL entry</span>
+          <span class="zml entry-buy">BUY entry</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Zones side-by-side -->
+    <div class="two-col">
+      <section>
+        <div class="section-label">Continuation Zones</div>
+        <div class="card" id="cont-zones"></div>
+      </section>
+      <section>
+        <div class="section-label">Reversion Zones</div>
+        <div class="card" id="rev-zones"></div>
+      </section>
+    </div>
+
+    <!-- Daily plan -->
+    <section>
+      <div class="section-header">
+        <span class="section-label">Daily Plan</span>
+        <span id="daily-updated" class="muted" style="font-size:11px"></span>
+      </div>
+      <div class="card" id="daily-plan"></div>
+    </section>
+
+  </main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+  <script src="/static/js/app.js"></script>
+</body>
+</html>
