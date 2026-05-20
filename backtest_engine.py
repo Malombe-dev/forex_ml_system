@@ -77,7 +77,15 @@ OUTCOMES_FILE = Path("data/outcomes/outcomes.parquet")
 BARS_FILE     = Path("data/bars_15min.parquet")
 RESULTS_DIR   = Path("data/backtest_results")
 
-PIP_SIZE = 0.0001
+PIP_SIZE = 0.0001   # default — overridden per-symbol in position sizing
+
+# Per-symbol pip sizes — used in run_from_outcomes() and _position_size()
+PIP_SIZE_MAP = {
+    "EUR/USD": 0.0001, "EURUSD": 0.0001,
+    "GBP/USD": 0.0001, "GBPUSD": 0.0001,
+    "USD/JPY": 0.01,   "USDJPY": 0.01,
+    "XAU/USD": 0.01,   "XAUUSD": 0.01,
+}
 
 # Kenya = UTC+3 (EAT). All internal processing uses UTC.
 EAT_OFFSET_HOURS = 3
@@ -333,10 +341,11 @@ class BacktestEngine:
 
     # ── position sizing ────────────────────────────────────────────────────────
 
-    def _position_size(self, entry: float, sl: float) -> float:
+    def _position_size(self, entry: float, sl: float, symbol: str = "") -> float:
         """Fixed-fractional lot size: risk = risk_per_trade_pct × balance."""
         risk_amount = self.balance * self.risk_per_trade_pct
-        risk_pips   = abs(entry - sl) / self.pip_size
+        pip_size    = PIP_SIZE_MAP.get(symbol.upper(), self.pip_size)
+        risk_pips   = abs(entry - sl) / pip_size
         if risk_pips <= 0:
             return 0.01
         value_per_pip = 10.0           # $10/pip for 1 standard lot (EUR/USD)
@@ -485,7 +494,7 @@ class BacktestEngine:
             )
             return None
 
-        pos_size   = self._position_size(entry, sl)
+        pos_size   = self._position_size(entry, sl, symbol=sig.get("symbol", ""))
         outcome    = "pending"
         # Default exit at close of last bar in the post-entry window
         post_entry = forward_bars.iloc[entry_bar_num:]
@@ -628,6 +637,12 @@ class BacktestEngine:
             sl          = float(row.get("sl", 0))
             exit_price  = float(row.get("exit_price", entry))
             outcome_str = str(row.get("outcome", "timeout"))
+            symbol      = str(row.get("symbol", ""))
+
+            # per-symbol pip size — falls back to row-level pip_size if present
+            pip_size = float(row.get("pip_size", 0)) or PIP_SIZE_MAP.get(
+                symbol.upper(), self.pip_size
+            )
 
             if outcome_str == "win":
                 outcome = "win"
@@ -641,11 +656,11 @@ class BacktestEngine:
                 outcome = "timeout"
 
             if direction == "BUY":
-                pips = (exit_price - entry) / self.pip_size
+                pips = (exit_price - entry) / pip_size
             else:
-                pips = (entry - exit_price) / self.pip_size
+                pips = (entry - exit_price) / pip_size
 
-            pos_size = self._position_size(entry, sl)
+            pos_size = self._position_size(entry, sl, symbol=symbol)
             pnl      = pips * 10.0 * pos_size
             self.balance += pnl
 

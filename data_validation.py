@@ -38,13 +38,18 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(
 logger = logging.getLogger(__name__)
 
 # ── Thresholds ─────────────────────────────────────────────────────────────────
+# risk_pips limits — 4H zones on XAUUSD/USDJPY are much larger than EURUSD 15min zones.
+# EURUSD/GBPUSD 4H: 10-150 pips typical. XAUUSD 4H: 50-500 pips typical.
+# Hard ceiling of 1000: anything above this = pip_size bug in label_generator.py
+# (e.g. calculating abs(entry-sl) in price units without dividing by pip_size).
+# Preprocessing will clip to a tighter bound after this check passes.
 RISK_PIPS_MIN          = 0.5
-RISK_PIPS_MAX          = 60.0
-LABEL_WIN_RATE_MIN     = 0.10
-LABEL_WIN_RATE_MAX     = 0.40
-CONT_WIN_RATE_MIN      = 0.15
-CONT_WIN_RATE_MAX      = 0.45
-MIN_ROWS               = 500
+RISK_PIPS_MAX          = 1000.0   # hard ceiling — values above = pip_size calculation bug
+LABEL_WIN_RATE_MIN     = 0.20  # post-leakage-fix: 4H binary labels land at 40-60%
+LABEL_WIN_RATE_MAX     = 0.65  # was 0.40 — too tight for 4H zone win rates
+CONT_WIN_RATE_MIN      = 0.10
+CONT_WIN_RATE_MAX      = 0.55
+MIN_ROWS               = 200  # 4H zones are fewer than 15min zones
 MAX_STALENESS_DAYS     = 400
 CORR_WARN_THRESHOLD    = 0.85
 BALANCE_WARN_THRESHOLD = 0.60   # flag if any class > 60%
@@ -82,20 +87,36 @@ def check_nulls(df: pd.DataFrame) -> None:
 
 
 def check_risk_pips(df: pd.DataFrame) -> None:
-    """HARD: all risk_pips in [RISK_PIPS_MIN, RISK_PIPS_MAX]."""
+    """HARD: risk_pips must be in [RISK_PIPS_MIN, RISK_PIPS_MAX].
+    Values above 1000 almost always mean pip_size was not applied
+    (e.g. abs(entry - sl) in price units for XAUUSD gives ~50.0 but
+    dividing by pip_size=0.01 gives 5000 pips — a clear bug).
+    """
     out_of_range = df[(df["risk_pips"] < RISK_PIPS_MIN) |
                       (df["risk_pips"] > RISK_PIPS_MAX)]
     if len(out_of_range) > 0:
         pct = len(out_of_range) / len(df)
+        # Per-symbol breakdown to help diagnose which pip_size is wrong
+        sym_breakdown = ""
+        if "symbol" in df.columns:
+            for sym, grp in out_of_range.groupby("symbol"):
+                sym_breakdown += f"\n    {sym}: {len(grp)} rows  max={grp['risk_pips'].max():.1f}p"
         raise ValueError(
             f"[RISK_PIPS] {len(out_of_range)} rows ({pct:.1%}) have risk_pips "
             f"outside [{RISK_PIPS_MIN}, {RISK_PIPS_MAX}] pips.\n"
-            f"  Min: {df['risk_pips'].min():.2f}  Max: {df['risk_pips'].max():.2f}\n"
-            "label_generator.py should have filtered these — check MAX_RISK_PIPS filter."
+            f"  Overall: min={df['risk_pips'].min():.2f}  max={df['risk_pips'].max():.2f}"
+            f"{sym_breakdown}\n"
+            "  Fix: check pip_size passed to label_generator.py for each symbol.\n"
+            "  XAUUSD and USDJPY use pip_size=0.01, not 0.0001."
         )
+    # Per-symbol summary in the OK message
+    sym_info = ""
+    if "symbol" in df.columns:
+        for sym, grp in df.groupby("symbol"):
+            sym_info += f"  {sym}: mean={grp['risk_pips'].mean():.1f}p max={grp['risk_pips'].max():.1f}p\n"
     logger.info(
-        f"  ✅ risk_pips OK — all in [{RISK_PIPS_MIN}, {RISK_PIPS_MAX}] "
-        f"(mean={df['risk_pips'].mean():.1f}p, max={df['risk_pips'].max():.1f}p)"
+        f"  ✅ risk_pips OK — all in [{RISK_PIPS_MIN}, {RISK_PIPS_MAX}]\n"
+        + sym_info
     )
 
 

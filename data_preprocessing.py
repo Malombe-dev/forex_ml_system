@@ -55,10 +55,16 @@ logger = logging.getLogger(__name__)
 
 # ── Thresholds ─────────────────────────────────────────────────────────────────
 RISK_PIPS_MIN   = 0.5
-RISK_PIPS_MAX   = 30.0
+RISK_PIPS_MAX   = 500.0   # 4H XAUUSD zones can have 200-500 pip SL; old 30.0 clipped everything
 PERCENTILE_CLIP = 99          # clip zone_strength and distance_from_ema20 here
 MAX_TOUCH_COUNT = 20           # drop zones visited more than this many times
-TRAIN_SPLIT_PCT = 0.70        # encoders/scaler fitted on first 70% (chronological)
+# Train boundary — must match model_trainer.py TRAIN_END_DATE
+# Import it directly so the two files always agree
+try:
+    from model_trainer import TRAIN_END_DATE as _TRAIN_END_DATE
+except ImportError:
+    import pandas as _pd
+    _TRAIN_END_DATE = _pd.Timestamp("2022-08-04")  # fallback matches model_trainer default
 
 # Features to drop if somehow present (removed in features.py v4 as r=1.000 duplicates)
 DUPLICATE_FEATURES = ["approach_ema_dist"]
@@ -313,9 +319,14 @@ def preprocess(
     df        = filter_stale_zones(df)
     logger.info("")
 
-    train_end = int(len(df) * TRAIN_SPLIT_PCT)
-    logger.info(f"  Training split boundary: row {train_end} "
-                f"(first {TRAIN_SPLIT_PCT:.0%} chronologically)")
+    # Use the same date boundary as model_trainer.py — row-fraction splits
+    # produce different boundaries each time data grows, causing scaler/encoder
+    # mismatch between preprocessing and training.
+    train_end = int((df["zone_time"] < _TRAIN_END_DATE).sum()) if "zone_time" in df.columns                 else int(len(df) * 0.70)
+    logger.info(
+        f"  Training split boundary: row {train_end} "
+        f"(zone_time < {_TRAIN_END_DATE.date()}  — matches model_trainer.py)"
+    )
     logger.info("")
 
     df, _ = encode_categoricals(
