@@ -84,7 +84,7 @@ class DualTaskTrainer:
     Trains BOTH reversion and continuation models.
 
     Architecture:
-    - Same features (17 columns v5), different targets
+    - Same features (33 columns v7), different targets
     - Separate model artifacts for each task
     - Scaler and encoders fitted ONCE on reversion task, then shared with
       continuation task to guarantee identical scaling
@@ -130,7 +130,7 @@ class DualTaskTrainer:
                 f"Training parquet is missing expected feature columns.\n"
                 f"  Missing numeric:      {missing_numeric}\n"
                 f"  Missing categorical:  {missing_cats}\n"
-                "Re-run label_generator.py to produce a v5-schema parquet "
+                "Re-run label_generator.py to produce a v7-schema parquet "
                 "before retraining."
             )
 
@@ -152,7 +152,7 @@ class DualTaskTrainer:
                     encoded = []
                     for val in df[cat_col].astype(str):
                         encoded.append(
-                            le.transform([val])[0] if val in le.classes_ else -1
+                            le.transform([val])[0] if val in le.classes_ else 0
                         )
                     X[f'{cat_col}_encoded'] = encoded
 
@@ -410,7 +410,7 @@ class DualTaskTrainer:
             'val_end_date':     VAL_END_DATE.isoformat(),
             'created_at':       pd.Timestamp.utcnow().isoformat(),
             'pickle_protocol':  pickle_protocol,
-            'schema_version':   'v5',
+            'schema_version':   'v7',
         }
 
         metadata_path = self.output_dir / f"metadata_{suffix}.json"

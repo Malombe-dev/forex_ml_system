@@ -544,6 +544,15 @@ class SMCDetector:
             return result
 
         merged = _cluster(fvg_zones) + _cluster(ob_zones)
+        # ── Post-merge quality filters ─────────────────────────────────────
+        before = len(merged)
+        merged = [z for z in merged
+                  if (z['price_high'] - z['price_low']) / self.pip_size >= 2.0]
+        merged = [z for z in merged
+                  if (z['price_high'] - z['price_low']) / self.pip_size <= 300.0]
+        dropped = before - len(merged)
+        if dropped:
+            logger.info(f"  Dropped {dropped} zones outside [2, 300] pip range")
         logger.info(f"  Merged into {len(merged)} 4H zones "
                     f"(proximity={proximity/self.pip_size:.1f}p)")
         return merged
@@ -648,16 +657,25 @@ class SMCDetector:
             confluence_boost = 1 if h1_confirmed else 0
             final_confluence = zone.get('confluence', 1) + confluence_boost
 
+            # ── v7: detailed 1H features stored on zone for feature_builder ──
+            h1_trend_val, h1_mss_val, h1_disp_val, h1_sweep_val = \
+                self._compute_h1_zone_features(df_1h, zone_time, zone.get('type', 'demand'))
+
             annotated_zones.append({
                 **zone,
-                'index':            idx_15min,    # 15min bar index for label_generator
-                'index_4h':         zone['index'],  # original 4H bar index
+                'index':            idx_15min,
+                'index_4h':         zone['index'],
                 'tf_source':        tf_source,
-                'h1_confluence':    h1_confirmed,
+                'h1_confluence':    h1_confirmed,   # kept for backwards compat
                 'h1_detail':        h1_detail,
                 'd1_trend':         d1_trend,
-                'htf_alignment':    d1_aligned,   # reuses existing feature name
+                'htf_alignment':    d1_aligned,
                 'confluence':       final_confluence,
+                # v7: granular 1H fields consumed by feature_builder
+                'h1_trend_alignment':    h1_trend_val,
+                'h1_structure_shift':    h1_mss_val,
+                'h1_displacement':       h1_disp_val,
+                'h1_liquidity_sweep':    h1_sweep_val,
             })
 
         logger.info(f"\n4H Zone Annotation Summary:")
@@ -684,6 +702,96 @@ class SMCDetector:
             'liquidity_sweeps': sweeps,            # 15min sweeps
             'bos_choch':       structures,         # 15min structure
         }
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # v7: Compute detailed 1H features per zone (used by feature_builder v7)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _compute_h1_zone_features(
+        self,
+        df_1h: pd.DataFrame,
+        zone_time: pd.Timestamp,
+        zone_type: str,
+    ) -> Tuple[int, int, float, int]:
+        """
+        Returns (h1_trend_alignment, h1_structure_shift, h1_displacement, h1_liquidity_sweep).
+        All computed on 1H bars up to zone_time.
+
+        h1_trend_alignment : -1=bearish, 0=neutral, 1=bullish (aligned to zone_type)
+        h1_structure_shift : -1=bearish BOS, 0=none, 1=bullish BOS (last 30 1H bars)
+        h1_displacement    : max impulse candle body / ATR in last 20 1H bars
+        h1_liquidity_sweep : 1 if 1H swept swing low/high before reversal (last 30 bars)
+        """
+        defaults = (0, 0, 0.0, 0)
+        try:
+            sub = df_1h[pd.to_datetime(df_1h['time']) <= zone_time].copy()
+            if len(sub) < 20:
+                return defaults
+
+            hi = sub['high']; lo = sub['low']; cl = sub['close']
+            tr = pd.concat([
+                hi - lo,
+                (hi - cl.shift(1)).abs(),
+                (lo - cl.shift(1)).abs(),
+            ], axis=1).max(axis=1)
+            atr_1h = float(tr.rolling(14).mean().iloc[-1])
+            if not np.isfinite(atr_1h) or atr_1h <= 0:
+                atr_1h = float(tr.mean()) or 1e-6
+
+            # trend alignment
+            ema20 = float(cl.ewm(span=20, adjust=False).mean().iloc[-1])
+            ema50 = float(cl.ewm(span=50, adjust=False).mean().iloc[-1])
+            if ema20 > ema50 * 1.0001:
+                raw_trend = 1
+            elif ema20 < ema50 * 0.9999:
+                raw_trend = -1
+            else:
+                raw_trend = 0
+            h1_trend = raw_trend if zone_type == 'demand' else -raw_trend
+
+            # structure shift (BOS) in last 30 bars
+            w = sub.tail(30).reset_index(drop=True)
+            sp = 3
+            swing_highs, swing_lows = [], []
+            for i in range(sp, len(w) - sp):
+                bar = w.iloc[i]
+                if (bar['high'] > w.iloc[i-sp:i]['high'].max() and
+                        bar['high'] > w.iloc[i+1:i+sp+1]['high'].max()):
+                    swing_highs.append(bar['high'])
+                if (bar['low'] < w.iloc[i-sp:i]['low'].min() and
+                        bar['low'] < w.iloc[i+1:i+sp+1]['low'].min()):
+                    swing_lows.append(bar['low'])
+            last_cl = float(w['close'].iloc[-1])
+            if swing_highs and last_cl > swing_highs[-1]:
+                h1_mss = 1
+            elif swing_lows and last_cl < swing_lows[-1]:
+                h1_mss = -1
+            else:
+                h1_mss = 0
+
+            # displacement: largest body / ATR in last 20 bars
+            r20   = sub.tail(20)
+            bodies = (r20['close'] - r20['open']).abs()
+            h1_disp = float(min(bodies.max() / atr_1h, 10.0))
+
+            # liquidity sweep in last 30 bars
+            h1_sweep = 0
+            cw = sub.tail(30).reset_index(drop=True)
+            sp2 = 4
+            for i in range(sp2, len(cw) - 1):
+                bar     = cw.iloc[i]
+                prev_lo = cw.iloc[max(0, i-sp2):i]['low'].min()
+                prev_hi = cw.iloc[max(0, i-sp2):i]['high'].max()
+                if zone_type == 'demand' and bar['low'] < prev_lo and bar['close'] > prev_lo:
+                    h1_sweep = 1; break
+                if zone_type == 'supply' and bar['high'] > prev_hi and bar['close'] < prev_hi:
+                    h1_sweep = 1; break
+
+            return (h1_trend, h1_mss, round(h1_disp, 4), h1_sweep)
+
+        except Exception as e:
+            logger.warning(f"_compute_h1_zone_features failed: {e}")
+            return defaults
 
     # ─────────────────────────────────────────────────────────────────────────
     # Backwards-compatible single-TF extraction (15min only, as before)

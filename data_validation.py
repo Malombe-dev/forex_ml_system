@@ -71,7 +71,7 @@ def check_schema(df: pd.DataFrame) -> None:
             f"[SCHEMA] Missing {len(missing)} required column(s): {missing}\n"
             "Re-run label_generator.py to regenerate the parquet."
         )
-    logger.info(f"  ✅ Schema OK — {len(df.columns)} columns, all required present")
+    logger.info(f"  ✅ Schema OK — {len(df.columns)} columns, all required present (v7 schema: 33 features)")
 
 
 def check_nulls(df: pd.DataFrame) -> None:
@@ -238,6 +238,204 @@ def check_class_balance(df: pd.DataFrame) -> None:
             )
 
 
+def check_v7_feature_ranges(df: pd.DataFrame) -> None:
+    """WARNING: sanity-check v6 carry-over features and all new v7 features."""
+
+    # ── v6 carry-overs ────────────────────────────────────────────────────────
+
+    # h4_fvg_inside — binary {0, 1}
+    if "h4_fvg_inside" in df.columns:
+        bad = df["h4_fvg_inside"].dropna()
+        bad = bad[~bad.isin([0.0, 1.0])]
+        if len(bad):
+            logger.warning(f"  ⚠️  [V7] h4_fvg_inside has {len(bad)} non-binary values")
+        else:
+            rate = df["h4_fvg_inside"].mean()
+            logger.info(f"  ✅ h4_fvg_inside OK — {rate:.1%} zones are FVG-backed")
+
+    # d1_ema_distance — expect [0, 10], most values 0–3
+    if "d1_ema_distance" in df.columns:
+        s = df["d1_ema_distance"].dropna()
+        pct_zeros = (s == 0.0).mean()
+        if pct_zeros > 0.95:
+            logger.warning(
+                f"  ⚠️  [V7] d1_ema_distance is 0.0 for {pct_zeros:.0%} of rows — "
+                "df_d1 may not be wired into feature_builder calls. "
+                "Pass df_d1 to build_feature_row() / build_raw_feature_dict()."
+            )
+        else:
+            logger.info(
+                f"  ✅ d1_ema_distance OK — mean={s.mean():.2f}  max={s.max():.2f}"
+            )
+
+    # prev_zone_outcome — valid values {0.0, 0.5, 1.0}
+    if "prev_zone_outcome" in df.columns:
+        valid = {0.0, 0.5, 1.0}
+        bad_vals = df["prev_zone_outcome"].dropna()
+        bad_vals = bad_vals[~bad_vals.isin(valid)]
+        if len(bad_vals):
+            logger.warning(
+                f"  ⚠️  [V7] prev_zone_outcome has {len(bad_vals)} values "
+                f"outside {{0.0, 0.5, 1.0}}"
+            )
+        else:
+            pct_unknown = (df["prev_zone_outcome"] == 0.5).mean()
+            if pct_unknown > 0.95:
+                logger.warning(
+                    f"  ⚠️  [V7] prev_zone_outcome is 0.5 (unknown) for "
+                    f"{pct_unknown:.0%} of rows — zone_history may not be "
+                    "built and passed in label_generator / production_predictor."
+                )
+            else:
+                logger.info(
+                    f"  ✅ prev_zone_outcome OK — "
+                    f"win={(df['prev_zone_outcome']==1.0).mean():.1%}  "
+                    f"loss={(df['prev_zone_outcome']==0.0).mean():.1%}  "
+                    f"unknown={(df['prev_zone_outcome']==0.5).mean():.1%}"
+                )
+
+    # time_since_last_touch — expect [0, 2000] hours
+    if "time_since_last_touch" in df.columns:
+        s = df["time_since_last_touch"].dropna()
+        pct_zeros = (s == 0.0).mean()
+        if pct_zeros > 0.95:
+            logger.warning(
+                f"  ⚠️  [V7] time_since_last_touch is 0.0 for {pct_zeros:.0%} of rows — "
+                "zone_history may not be built/passed."
+            )
+        elif s.max() > 2000:
+            logger.warning(
+                f"  ⚠️  [V7] time_since_last_touch max={s.max():.0f}h > 2000h cap — "
+                "check _zone_level_key bucketing in feature_builder.py."
+            )
+        else:
+            logger.info(
+                f"  ✅ time_since_last_touch OK — "
+                f"median={s.median():.0f}h  max={s.max():.0f}h"
+            )
+
+    # ── v7: 1H alignment features ─────────────────────────────────────────────
+
+    # h1_trend_alignment — valid values {-1, 0, 1}
+    if "h1_trend_alignment" in df.columns:
+        valid = {-1, 0, 1}
+        bad = df["h1_trend_alignment"].dropna()
+        bad = bad[~bad.isin(valid)]
+        if len(bad):
+            logger.warning(
+                f"  ⚠️  [V7] h1_trend_alignment has {len(bad)} values outside {{-1, 0, 1}}"
+            )
+        else:
+            dist = df["h1_trend_alignment"].value_counts().to_dict()
+            logger.info(f"  ✅ h1_trend_alignment OK — distribution: {dist}")
+
+    # h1_structure_shift — valid values {-1, 0, 1}
+    if "h1_structure_shift" in df.columns:
+        valid = {-1, 0, 1}
+        bad = df["h1_structure_shift"].dropna()
+        bad = bad[~bad.isin(valid)]
+        if len(bad):
+            logger.warning(
+                f"  ⚠️  [V7] h1_structure_shift has {len(bad)} values outside {{-1, 0, 1}}"
+            )
+        else:
+            pct_shift = (df["h1_structure_shift"] != 0).mean()
+            logger.info(f"  ✅ h1_structure_shift OK — {pct_shift:.1%} rows have a confirmed BOS/MSS")
+
+    # h1_displacement — float >= 0, warn if mostly zero (MTF data not wired)
+    if "h1_displacement" in df.columns:
+        s = df["h1_displacement"].dropna()
+        if (s < 0).any():
+            logger.warning(
+                f"  ⚠️  [V7] h1_displacement has {(s < 0).sum()} negative values — "
+                "must be ≥ 0 (impulse candle / ATR)."
+            )
+        else:
+            pct_zeros = (s == 0.0).mean()
+            if pct_zeros > 0.95:
+                logger.warning(
+                    f"  ⚠️  [V7] h1_displacement is 0.0 for {pct_zeros:.0%} of rows — "
+                    "1H OHLC data may not be passed to feature_builder."
+                )
+            else:
+                logger.info(
+                    f"  ✅ h1_displacement OK — mean={s.mean():.2f}  max={s.max():.2f}"
+                )
+
+    # h1_liquidity_sweep — binary {0, 1}
+    if "h1_liquidity_sweep" in df.columns:
+        bad = df["h1_liquidity_sweep"].dropna()
+        bad = bad[~bad.isin([0.0, 1.0])]
+        if len(bad):
+            logger.warning(
+                f"  ⚠️  [V7] h1_liquidity_sweep has {len(bad)} non-binary values"
+            )
+        else:
+            rate = df["h1_liquidity_sweep"].mean()
+            logger.info(f"  ✅ h1_liquidity_sweep OK — {rate:.1%} zones have a 1H sweep")
+
+    # ── v7: Premium / Discount features ──────────────────────────────────────
+
+    for col, label in [("d1_premium_discount", "D1"), ("h4_premium_discount", "4H")]:
+        if col in df.columns:
+            valid = {-1, 0, 1}
+            bad = df[col].dropna()
+            bad = bad[~bad.isin(valid)]
+            if len(bad):
+                logger.warning(
+                    f"  ⚠️  [V7] {col} has {len(bad)} values outside {{-1, 0, 1}}"
+                )
+            else:
+                dist = df[col].value_counts().to_dict()
+                logger.info(f"  ✅ {col} OK ({label} range) — distribution: {dist}")
+
+    # ── v7: 5M execution features ─────────────────────────────────────────────
+
+    # m5_micro_bos — binary {0, 1}
+    if "m5_micro_bos" in df.columns:
+        bad = df["m5_micro_bos"].dropna()
+        bad = bad[~bad.isin([0.0, 1.0])]
+        if len(bad):
+            logger.warning(f"  ⚠️  [V7] m5_micro_bos has {len(bad)} non-binary values")
+        else:
+            rate = df["m5_micro_bos"].mean()
+            logger.info(f"  ✅ m5_micro_bos OK — {rate:.1%} entries have a 5M micro BOS")
+
+    # m5_sweep_confirmation — binary {0, 1}
+    if "m5_sweep_confirmation" in df.columns:
+        bad = df["m5_sweep_confirmation"].dropna()
+        bad = bad[~bad.isin([0.0, 1.0])]
+        if len(bad):
+            logger.warning(
+                f"  ⚠️  [V7] m5_sweep_confirmation has {len(bad)} non-binary values"
+            )
+        else:
+            rate = df["m5_sweep_confirmation"].mean()
+            logger.info(f"  ✅ m5_sweep_confirmation OK — {rate:.1%} entries have a 5M sweep")
+
+    # m5_entry_candle_quality — float [0, 1], warn if mostly zero (5M data not wired)
+    if "m5_entry_candle_quality" in df.columns:
+        s = df["m5_entry_candle_quality"].dropna()
+        out_of_range = ((s < 0) | (s > 1)).sum()
+        if out_of_range:
+            logger.warning(
+                f"  ⚠️  [V7] m5_entry_candle_quality has {out_of_range} values "
+                "outside [0, 1]."
+            )
+        else:
+            pct_zeros = (s == 0.0).mean()
+            if pct_zeros > 0.95:
+                logger.warning(
+                    f"  ⚠️  [V7] m5_entry_candle_quality is 0.0 for {pct_zeros:.0%} of rows — "
+                    "5M OHLC data may not be passed to feature_builder."
+                )
+            else:
+                logger.info(
+                    f"  ✅ m5_entry_candle_quality OK — "
+                    f"mean={s.mean():.2f}  min={s.min():.2f}  max={s.max():.2f}"
+                )
+
+
 # ── Orchestrator ───────────────────────────────────────────────────────────────
 
 def validate(parquet_path: str = "data/labels/training_labels_dual.parquet") -> bool:
@@ -277,6 +475,7 @@ def validate(parquet_path: str = "data/labels/training_labels_dual.parquet") -> 
     check_continuation_win_rate(df)
     check_feature_correlations(df)
     check_class_balance(df)
+    check_v7_feature_ranges(df)
 
     logger.info("")
     logger.info("=" * 70)

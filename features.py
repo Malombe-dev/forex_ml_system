@@ -3,44 +3,90 @@ CANONICAL FEATURE SCHEMA
 ========================
 Single source of truth for ALL feature columns used in training AND inference.
 
-v5 (current) — added 7 new high-signal features:
-  approach_rsi         : RSI at the bar price first touches the zone (momentum)
-  approach_distance    : pips from zone when first touch occurs (closeness)
-  candle_body_ratio    : body/range of the approach bar (pin bar signal)
-  volume_ratio         : approach bar volume vs 20-bar avg (confirm interest)
-  zone_age_bars        : bars since zone was formed (freshness)
-  higher_tf_rsi        : RSI on the 1h timeframe at touch (HTF momentum)
-  approach_momentum    : close[touch] - close[touch-3] / ATR (speed of approach)
+v7 (current) — MTF upgrade:
+  REMOVED (replaced by richer 1H-specific features):
+    h1_confluence        → replaced by h1_trend_alignment, h1_structure_shift,
+                           h1_displacement, h1_liquidity_sweep
+  REMOVED (r=1.000 duplicate of h4_fvg_inside):
+    zone_source          → identical FVG-origin flag, redundant column dropped
+
+  ADDED 1H alignment features:
+    h1_trend_alignment   : int {-1, 0, 1} — 1H EMA20/50 trend direction
+                           (-1=bearish, 0=neutral, 1=bullish)
+    h1_structure_shift   : int {-1, 0, 1} — 1H BOS/MSS confirmed direction
+                           (-1=bearish MSS, 0=none, 1=bullish MSS)
+    h1_displacement      : float ≥ 0 — size of last strong 1H institutional
+                           move in ATR units (impulse candle / ATR)
+    h1_liquidity_sweep   : int {0, 1} — 1H swept swing liquidity before reversal
+                           (1 = sweep detected within look-back window)
+
+  ADDED premium/discount features:
+    d1_premium_discount  : int {-1, 0, 1} — price position in D1 swing range
+                           (-1=discount, 0=equilibrium ±10%, 1=premium)
+    h4_premium_discount  : int {-1, 0, 1} — price position in 4H swing range
+
+  ADDED 5M execution features:
+    m5_micro_bos         : int {0, 1} — micro break of structure on 5M before entry
+    m5_sweep_confirmation: int {0, 1} — micro liquidity grab on 5M before entry
+    m5_entry_candle_quality : float [0, 1] — composite score:
+                           engulfing + displacement + strong close + rejection wick
+
+v6:
+  h1_confluence, h4_fvg_inside, d1_ema_distance,
+  prev_zone_outcome, time_since_last_touch added.
+
+v5:
+  approach_distance, candle_body_ratio, zone_age_bars, approach_momentum added.
 
 v4:
-  - Removed approach_rsi and approach_ema_dist (r=1.000 duplicates)
-  - N_FEATURES: 14 → 12
+  Removed approach_rsi and approach_ema_dist (r=1.000 duplicates).
 """
 
 from typing import Tuple
 
 NUMERIC_FEATURES: Tuple[str, ...] = (
-    # ── Zone formation features ───────────────────────────────────────────
+    # ── Zone formation features ───────────────────────────────────────────────
     "zone_strength",
     "zone_confluence",
     "risk_pips",
 
-    # ── Formation-time market context ─────────────────────────────────────
+    # ── Formation-time market context ─────────────────────────────────────────
     "distance_from_ema20",
     "rsi",
     "hour",
     "ema_trend",
 
-    # ── Zone quality predictors ───────────────────────────────────────────
+    # ── Zone quality predictors ───────────────────────────────────────────────
     "zone_touch_count",
     "htf_trend_alignment",
-    "zone_source",
 
-    # ── NEW v5: Approach-time features (most predictive) ─────────────────
-    "approach_distance",    # pips away from zone edge at first touch — precision
-    "candle_body_ratio",    # body/range at approach bar — pin bar = 1.0, doji = 0.0
-    "zone_age_bars",        # bars since zone formed — fresh zones outperform
-    "approach_momentum",    # (close - close[3 bars ago]) / ATR — slowing = reversal
+    # ── v5: Approach-time features ────────────────────────────────────────────
+    "approach_distance",
+    "candle_body_ratio",
+    "zone_age_bars",
+    "approach_momentum",
+
+    # ── v6: Zone-memory + MTF-edge features ───────────────────────────────────
+    # NOTE: h1_confluence REMOVED — replaced by 4 granular 1H features below
+    "h4_fvg_inside",
+    "d1_ema_distance",
+    "prev_zone_outcome",
+    "time_since_last_touch",
+
+    # ── v7: 1H alignment features (replaces generic h1_confluence) ────────────
+    "h1_trend_alignment",       # -1=bearish, 0=neutral, 1=bullish  (1H EMA trend)
+    "h1_structure_shift",       # -1=bearish MSS, 0=none, 1=bullish MSS
+    "h1_displacement",          # impulse candle size / ATR on 1H (≥0)
+    "h1_liquidity_sweep",       # 1=1H swept swing liquidity before reversal
+
+    # ── v7: Premium / Discount features ──────────────────────────────────────
+    "d1_premium_discount",      # -1=discount, 0=equilibrium, 1=premium  (D1 range)
+    "h4_premium_discount",      # -1=discount, 0=equilibrium, 1=premium  (4H range)
+
+    # ── v7: 5M execution features ────────────────────────────────────────────
+    "m5_micro_bos",             # 1=micro BOS present on 5M
+    "m5_sweep_confirmation",    # 1=micro sweep before entry on 5M
+    "m5_entry_candle_quality",  # composite 0–1 score
 )
 
 CATEGORICAL_FEATURES: Tuple[str, ...] = (
@@ -53,7 +99,7 @@ FEATURE_COLUMNS: Tuple[str, ...] = NUMERIC_FEATURES + tuple(
     f"{c}_encoded" for c in CATEGORICAL_FEATURES
 )
 
-N_FEATURES: int = len(FEATURE_COLUMNS)   # 17
+N_FEATURES: int = len(FEATURE_COLUMNS)   # 29 numeric + 3 categorical-encoded = 32
 
 
 def assert_feature_columns_exact(actual: list, expected: Tuple[str, ...] = FEATURE_COLUMNS) -> None:

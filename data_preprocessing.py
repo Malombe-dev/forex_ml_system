@@ -67,7 +67,7 @@ except ImportError:
     _TRAIN_END_DATE = _pd.Timestamp("2022-08-04")  # fallback matches model_trainer default
 
 # Features to drop if somehow present (removed in features.py v4 as r=1.000 duplicates)
-DUPLICATE_FEATURES = ["approach_ema_dist"]
+DUPLICATE_FEATURES = ["approach_ema_dist", "approach_rsi"]
 
 # Paths
 DEFAULT_INPUT  = "data/labels/training_labels_dual.parquet"

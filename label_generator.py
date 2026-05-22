@@ -803,7 +803,20 @@ Output: Single parquet with TWO label columns:
 
 CHANGE LOG
 ----------
-v6 (current):
+v7 (current):
+  - WIRING: generate_labels_from_zones() now builds zone_history as it processes
+    zones chronologically. Each entry records the outcome and touch timestamp of
+    the most recent prior visit to a price level (keyed by _zone_level_key()).
+    Passed to build_raw_feature_dict() so prev_zone_outcome and
+    time_since_last_touch (v6 features) are populated with real values instead
+    of the 0.5/0.0 defaults that fire when zone_history=None.
+  - WIRING: add_context_features() now accepts and threads df_d1 through to
+    build_raw_feature_dict() so d1_ema_distance is computed from real D1 bars.
+    Previously always fell back to 0.0 (df_d1 was never forwarded).
+  - zone dict passed to build_raw_feature_dict() now includes h1_confluence,
+    sources, and tf_source so h1_confluence and h4_fvg_inside are populated
+    directly from smc_detector output (not defaulting to 0).
+v6:
   - CRITICAL FIX: check_reversion_outcome() and check_continuation_outcome()
     now use bar-by-bar simulation that respects the ORDER in which SL/TP/break
     levels are hit. The old code tracked best_tp_progress and best_sl_progress
@@ -847,7 +860,7 @@ from typing import Dict, List, Tuple, Optional
 import logging
 
 import feature_builder as _fb
-from feature_builder import build_raw_feature_dict
+from feature_builder import build_raw_feature_dict, _zone_level_key
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -1191,7 +1204,10 @@ class DualLabelGenerator:
     def generate_labels_from_zones(self,
                                    zones: List[Dict],
                                    df: pd.DataFrame,
-                                   df_d1: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+                                   df_d1: Optional[pd.DataFrame] = None,
+                                   df_1h: Optional[pd.DataFrame] = None,
+                                   df_4h: Optional[pd.DataFrame] = None,
+                                   df_5m: Optional[pd.DataFrame] = None) -> pd.DataFrame:
         """
         Generate BOTH reversion and continuation labels.
 
@@ -1204,6 +1220,18 @@ class DualLabelGenerator:
             logger.info(f"  D1 bars loaded: {len(df_d1)} — HTF alignment active")
         else:
             logger.info("  D1 bars not provided — htf_trend_alignment will be 0")
+        if df_1h is not None:
+            logger.info(f"  1H bars loaded: {len(df_1h)} — 1H alignment features active")
+        else:
+            logger.info("  1H bars not provided — h1 features will be 0")
+        if df_4h is not None:
+            logger.info(f"  4H bars loaded: {len(df_4h)} — h4_premium_discount active")
+        else:
+            logger.info("  4H bars not provided — h4_premium_discount will be 0")
+        if df_5m is not None:
+            logger.info(f"  5M bars loaded: {len(df_5m)} — m5 execution features active")
+        else:
+            logger.info("  5M bars not provided — m5 features will be 0")
 
         atr = self.calculate_atr(df)
 
@@ -1215,6 +1243,10 @@ class DualLabelGenerator:
         continuation_break = 0
         continuation_hold  = 0
         touch_found        = 0
+
+        # zone_history: level_key → {"outcome": float, "time": Timestamp}
+        # Built chronologically so each zone only sees PAST outcomes — no leakage.
+        zone_history: Dict = {}
 
         for zone in zones:
             zone_index = zone.get('index', 0)
@@ -1309,6 +1341,21 @@ class DualLabelGenerator:
             else:
                 continuation_hold += 1
 
+            # ── Update zone_history (for prev_zone_outcome feature) ───────────
+            # Record the outcome at this price level so subsequent zones at the
+            # same level can read it. Keyed by rounded price bucket to survive
+            # minor zone migrations. Only decisive outcomes (TP=1.0, SL=0.0) are
+            # recorded; timeouts (fractional scores) are left as 0.5 (the feature
+            # default) so they don't pollute the history with ambiguous labels.
+            level_key = _zone_level_key(zone, self.pip_size)
+            touch_time = (df["time"].iloc[touch_index]
+                          if "time" in df.columns else None)
+            if label_reversion in (0.0, 1.0):
+                zone_history[level_key] = {
+                    "outcome": label_reversion,
+                    "time":    touch_time,
+                }
+
             # ── Clamp noisy raw values ────────────────────────────────────────
             raw_risk_pips     = risk / self.pip_size
             clamped_risk_pips = float(np.clip(raw_risk_pips, 2.0, 150.0))
@@ -1345,6 +1392,14 @@ class DualLabelGenerator:
                 'label_cont':           label_continuation,
                 'outcome_reversion':    reason_reversion,
                 'outcome_continuation': reason_continuation,
+                # v6 MTF fields — forwarded to add_context_features → build_raw_feature_dict
+                'h1_confluence':        bool(zone.get('h1_confluence', False)),
+                'zone_sources':         zone.get('sources', [zone.get('source', 'order_block')]),
+                'tf_source':            zone.get('tf_source', '4h'),
+                'zone_price_high':      zone['price_high'],
+                'zone_price_low':       zone['price_low'],
+                'zone_price_mid':       zone.get('price_mid',
+                                            (zone['price_high'] + zone['price_low']) / 2),
             }
 
             candidates.append(candidate)
@@ -1469,6 +1524,15 @@ class DualLabelGenerator:
                 "Verify entry-first validation in check_continuation_outcome()."
             )
 
+        # Stash zone_history and MTF dataframes as DataFrame attrs so
+        # add_context_features can pick them up without a public signature change.
+        # attrs are NOT written to parquet — purely in-memory transport.
+        labels_df.attrs["_zone_history"] = zone_history
+        labels_df.attrs["_df_d1"]        = df_d1
+        labels_df.attrs["_df_1h"]        = df_1h
+        labels_df.attrs["_df_4h"]        = df_4h
+        labels_df.attrs["_df_5m"]        = df_5m
+
         return labels_df
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -1498,6 +1562,14 @@ class DualLabelGenerator:
 
         _fb.RISK_PIPS_FALLBACK_COUNT = 0
 
+        # Retrieve zone_history and MTF dataframes stashed by generate_labels_from_zones().
+        # Fall back gracefully if add_context_features is called standalone.
+        zone_history: Dict = labels_df.attrs.get("_zone_history", {})
+        df_d1_ctx          = labels_df.attrs.get("_df_d1", None)
+        df_1h_ctx          = labels_df.attrs.get("_df_1h", None)
+        df_4h_ctx          = labels_df.attrs.get("_df_4h", None)
+        df_5m_ctx          = labels_df.attrs.get("_df_5m", None)
+
         feature_cols = []
         for _, row in labels_df.iterrows():
             zone = {
@@ -1507,8 +1579,15 @@ class DualLabelGenerator:
                 "confluence":    int(row.get("zone_confluence", 1)),
                 "price_low":     float(row.get("zone_price_low",  row.get("sl",    0.0))),
                 "price_high":    float(row.get("zone_price_high", row.get("entry", 0.0))),
+                "price_mid":     float(row.get("zone_price_mid",
+                                    (row.get("zone_price_high", row.get("entry", 0.0)) +
+                                     row.get("zone_price_low",  row.get("sl",    0.0))) / 2)),
                 "touch_count":   int(row.get("zone_touch_count", 1)),
                 "htf_alignment": int(row.get("htf_trend_alignment", 0)),
+                # v6 MTF fields — populated from smc_detector output stored in candidate
+                "h1_confluence": bool(row.get("h1_confluence", False)),
+                "sources":       row.get("zone_sources", ["order_block"]),
+                "tf_source":     row.get("tf_source", "4h"),
             }
             entry = float(row.get("entry", 0.0))
             sl    = float(row.get("sl",    0.0))
@@ -1523,6 +1602,11 @@ class DualLabelGenerator:
                 zone, df, entry, sl,
                 pip_size=self.pip_size,
                 touch_index=touch_index,
+                df_d1=df_d1_ctx,
+                df_1h=df_1h_ctx,
+                df_4h=df_4h_ctx,
+                df_5m=df_5m_ctx,
+                zone_history=zone_history,
             )
             feature_cols.append(feat)
 
@@ -1630,6 +1714,48 @@ def run_one_symbol(sym: str, pip_size: float) -> pd.DataFrame:
     if df_d1 is None:
         logger.warning(f"D1 bars not found for {sym} — htf_trend_alignment=0")
 
+    # ── 1H bars ───────────────────────────────────────────────────────────────
+    df_1h = None
+    for h1_name in [f"data/bars_1h_{sym}.parquet", f"data/bars_h1_{sym}.parquet"]:
+        if Path(h1_name).exists():
+            df_1h = pd.read_parquet(h1_name)
+            if 'time' not in df_1h.columns:
+                df_1h = df_1h.reset_index()
+                if 'index' in df_1h.columns:
+                    df_1h = df_1h.rename(columns={'index': 'time'})
+            logger.info(f"Loaded {len(df_1h):,} 1H bars")
+            break
+    if df_1h is None:
+        logger.warning(f"1H bars not found for {sym} — h1_trend_alignment/structure/displacement/sweep will be 0")
+
+    # ── 4H bars ───────────────────────────────────────────────────────────────
+    df_4h = None
+    for h4_name in [f"data/bars_4h_{sym}.parquet", f"data/bars_h4_{sym}.parquet"]:
+        if Path(h4_name).exists():
+            df_4h = pd.read_parquet(h4_name)
+            if 'time' not in df_4h.columns:
+                df_4h = df_4h.reset_index()
+                if 'index' in df_4h.columns:
+                    df_4h = df_4h.rename(columns={'index': 'time'})
+            logger.info(f"Loaded {len(df_4h):,} 4H bars")
+            break
+    if df_4h is None:
+        logger.warning(f"4H bars not found for {sym} — h4_premium_discount will be 0")
+
+    # ── 5M bars ───────────────────────────────────────────────────────────────
+    df_5m = None
+    for m5_name in [f"data/bars_5min_{sym}.parquet", f"data/bars_5m_{sym}.parquet", f"data/bars_m5_{sym}.parquet"]:
+        if Path(m5_name).exists():
+            df_5m = pd.read_parquet(m5_name)
+            if 'time' not in df_5m.columns:
+                df_5m = df_5m.reset_index()
+                if 'index' in df_5m.columns:
+                    df_5m = df_5m.rename(columns={'index': 'time'})
+            logger.info(f"Loaded {len(df_5m):,} 5M bars")
+            break
+    if df_5m is None:
+        logger.warning(f"5M bars not found for {sym} — m5 execution features will be 0")
+
     # ── Merged zones (from smc_detector.py output) ───────────────────────────
     zones_path = Path(f"data/features/merged_zones_{sym}.parquet")
     if not zones_path.exists():
@@ -1649,7 +1775,9 @@ def run_one_symbol(sym: str, pip_size: float) -> pd.DataFrame:
         pip_size=pip_size,
     )
 
-    labels_df = generator.generate_labels_from_zones(zones, df, df_d1=df_d1)
+    labels_df = generator.generate_labels_from_zones(
+        zones, df, df_d1=df_d1, df_1h=df_1h, df_4h=df_4h, df_5m=df_5m
+    )
 
     if labels_df.empty:
         logger.error(f"❌ No labels generated for {sym}")

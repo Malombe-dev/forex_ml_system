@@ -387,7 +387,7 @@ class ActiveZoneTracker:
         self.active_zones             = {}
         self.ttl_seconds              = ttl_hours * 3600
         self.distance_threshold_pips  = distance_threshold_pips
-        self.pip_size                 = 0.0001
+        self.pip_size                 = 0.0001  # updated per symbol via set_pip_size()
         self.broker_offset            = self._get_broker_server_offset()
         self.state_file               = Path(state_file)
         self._load_state()
@@ -558,7 +558,7 @@ class ProductionForexPredictor:
 
     def __init__(self,
                  api_key: str,
-                 model_path: str = "models/model_v4_reversion.pkl",
+                 model_path: str = "models/model_v5_reversion.pkl",
                  scaler_path: str = "models/scaler_preprocessing.pkl",
                  encoders_path: str = "models/encoders_preprocessing.pkl",
                  stats_path: str = "models/training_stats_v5_reversion.pkl",
@@ -613,7 +613,7 @@ class ProductionForexPredictor:
         if 'JPY' in sym_upper:
             self.pip_size = 0.01
         elif 'XAU' in sym_upper or 'GOLD' in sym_upper:
-            self.pip_size = 0.1
+            self.pip_size = 1.0   # $1 = 1 pip (MT4/MT5 standard, matches training)
 
         self.htf_analyzer = HTFInstitutionalAnalyzer(
             pip_size=self.pip_size,
@@ -666,11 +666,11 @@ class ProductionForexPredictor:
 
             strat  = "continuation" if self.is_continuation_strategy else "reversion"
             cal_st = "with calibrator" if self._calibrator else "no calibrator"
-            print(f"  ✅ Model V4 ({strat}) loaded ({cal_st})")
+            print(f"  ✅ Model v5 ({strat}) loaded ({cal_st})")
 
         except FileNotFoundError:
             logger.warning("Model files not found, falling back to reversion model")
-            with open("models/model_v4_reversion.pkl",          'rb') as f: self.model          = pickle.load(f)
+            with open("models/model_v5_reversion.pkl",          'rb') as f: self.model          = pickle.load(f)
             with open("models/scaler_preprocessing.pkl",         'rb') as f: self.scaler         = pickle.load(f)
             with open("models/encoders_preprocessing.pkl",       'rb') as f: self.encoders       = pickle.load(f)
             with open("models/training_stats_v5_reversion.pkl", 'rb') as f: self.training_stats = pickle.load(f)
@@ -923,12 +923,25 @@ class ProductionForexPredictor:
 
                         # IMPROVE-2: real candle boundaries
                         body_top    = max(bar['open'], bar['close'])
+                        # Confluence = count of HTF structures overlapping this zone
+                        # Matches training schema where confluence is an integer count
+                        z_top = bar['high']; z_bot = body_top
+                        conf_count = 1
+                        for htf_item in (htf_context.get('h4_fvgs', []) +
+                                         htf_context.get('h1_fvgs', []) +
+                                         htf_context.get('h4_order_blocks', []) +
+                                         htf_context.get('h1_order_blocks', [])):
+                            ib = htf_item.get('bottom', htf_item.get('price_low', 0))
+                            it = htf_item.get('top',    htf_item.get('price_high', 0))
+                            if ib < z_top and it > z_bot:
+                                conf_count += 1
                         zones.append({
                             'type':         'supply',
                             'price_mid':    (bar['high'] + body_top) / 2,
-                            'price_high':   bar['high'],          # candle high = distal
-                            'price_low':    body_top,             # body top    = proximal
+                            'price_high':   bar['high'],
+                            'price_low':    body_top,
                             'strength':     strength,
+                            'confluence':   conf_count,
                             'index':        idx_in_df,
                             'distance_pips': (bar['high'] - current_price) / self.pip_size,
                             'validated':    True,
@@ -956,17 +969,36 @@ class ProductionForexPredictor:
 
                         # IMPROVE-2: real candle boundaries
                         body_bottom = min(bar['open'], bar['close'])
+                        z_top = body_bottom; z_bot = bar['low']
+                        conf_count = 1
+                        for htf_item in (htf_context.get('h4_fvgs', []) +
+                                         htf_context.get('h1_fvgs', []) +
+                                         htf_context.get('h4_order_blocks', []) +
+                                         htf_context.get('h1_order_blocks', [])):
+                            ib = htf_item.get('bottom', htf_item.get('price_low', 0))
+                            it = htf_item.get('top',    htf_item.get('price_high', 0))
+                            if ib < z_top and it > z_bot:
+                                conf_count += 1
                         zones.append({
                             'type':         'demand',
                             'price_mid':    (body_bottom + bar['low']) / 2,
-                            'price_high':   body_bottom,          # body bottom = proximal
-                            'price_low':    bar['low'],            # candle low  = distal
+                            'price_high':   body_bottom,
+                            'price_low':    bar['low'],
                             'strength':     strength,
+                            'confluence':   conf_count,
                             'index':        idx_in_df,
                             'distance_pips': (current_price - bar['low']) / self.pip_size,
                             'validated':    True,
                             'bar_time':     bar['time']
                         })
+
+        # Calculate touch count for each zone: how many times has price
+        # entered this zone's range in the recent lookback window?
+        for zone in zones:
+            z_high = zone['price_high']
+            z_low  = zone['price_low']
+            touches = int(((recent['low'] <= z_high) & (recent['high'] >= z_low)).sum())
+            zone['zone_touch_count'] = max(1, touches)
 
         adaptive_max = max(35.0, current_atr / self.pip_size * 4.0)
         return [z for z in zones if abs(z['distance_pips']) < adaptive_max]
@@ -1192,11 +1224,15 @@ class ProductionForexPredictor:
     # ---- ML prediction -------------------------------------------------------
 
     def _predict(self, zone: Dict, df: pd.DataFrame,
-                 entry: float, sl: float) -> float:
+                 entry: float, sl: float,
+                 df_1h: Optional[pd.DataFrame] = None,
+                 df_4h: Optional[pd.DataFrame] = None,
+                 df_5m: Optional[pd.DataFrame] = None) -> float:
         try:
             row_df = build_feature_row(
                 zone=zone, df=df, entry=entry, sl=sl,
-                encoders=self.encoders, pip_size=self.pip_size
+                encoders=self.encoders, pip_size=self.pip_size,
+                df_1h=df_1h, df_4h=df_4h, df_5m=df_5m,
             )
         except ValueError as exc:
             print(f"  ❌ build_feature_row FAILED: {exc}")
@@ -1208,7 +1244,7 @@ class ProductionForexPredictor:
             return 0.5
         try:
             X_scaled = self.scaler.transform(X)
-            raw_prob = float(self.model.predict(X_scaled)[0])
+            raw_prob = float(self.model.predict_proba(X_scaled)[0][1])
             if getattr(self, '_calibrator', None) is not None:
                 try:
                     raw_prob = float(self._calibrator.transform(np.clip([raw_prob], 1e-6, 1 - 1e-6))[0])
@@ -1239,12 +1275,21 @@ class ProductionForexPredictor:
         # IMPROVE-9: duplicate htf_alignment block removed — set once only
         if 'htf_alignment' not in zone:
             d1_trend = htf_context.get('daily_structure', {}).get('trend', 'neutral')
+            if d1_trend == 'neutral':
+                d1_trend = htf_context.get('h4_structure', {}).get('trend', 'neutral')
             if zone['type'] == 'demand':
                 zone['htf_alignment'] = 1 if d1_trend == 'bullish' else 0
             else:
                 zone['htf_alignment'] = 1 if d1_trend == 'bearish' else 0
 
-        return self._predict(zone, df, entry, sl)
+        # v7: fetch MTF bars for new features (use cached — no extra API calls)
+        df_1h = self.fetch_bars(interval="1h",   outputsize=100)
+        df_4h = self.fetch_bars(interval="4h",   outputsize=100)
+        df_5m = self.fetch_bars(interval="5min", outputsize=60)
+        df_d1 = self.fetch_bars(interval="1day", outputsize=30)
+
+        return self._predict(zone, df, entry, sl,
+                             df_1h=df_1h, df_4h=df_4h, df_5m=df_5m)
 
     def _ml_score_htf_zone(self, zone: Dict, df: pd.DataFrame, tf: str,
                             htf_context: Optional[Dict] = None) -> float:
@@ -1607,20 +1652,87 @@ class ProductionForexPredictor:
 
         signals      = []
         rejected_cnt = 0
-        reject_reasons = {'5min_refine': 0, 'prob_low': 0, 'risk_range': 0}
+        reject_reasons = {'5min_refine': 0, 'prob_low': 0, 'risk_range': 0,
+                          'h4_bias': 0, 'd1_premium_discount': 0}
+
+        # ── v7 HARD GATE 1: 4H Bias ───────────────────────────────────────────
+        # Derive 4H structural bias from htf_context.
+        # Demand zones only pass if 4H is bullish or neutral.
+        # Supply zones only pass if 4H is bearish or neutral.
+        h4_trend = htf_context.get('h4_structure', {}).get('trend', 'neutral')
+
+        # ── v7 HARD GATE 2: D1 Premium / Discount ─────────────────────────────
+        # Compute D1 swing range to determine premium/discount.
+        _d1_pd = 0  # default: equilibrium (no gate)
+        _df_d1_gate = self.fetch_bars(interval="1day", outputsize=30)
+        if _df_d1_gate is not None and len(_df_d1_gate) >= 10:
+            _d1_high = float(_df_d1_gate["high"].tail(20).max())
+            _d1_low  = float(_df_d1_gate["low"].tail(20).min())
+            _d1_rng  = _d1_high - _d1_low
+            if _d1_rng > 0:
+                _d1_pos  = (current_price - _d1_low) / _d1_rng
+                if _d1_pos > 0.6:
+                    _d1_pd = 1   # premium
+                elif _d1_pos < 0.4:
+                    _d1_pd = -1  # discount
 
         for zone in all_zones:
             is_cont  = zone.get('is_continuation', False)
             flip_info = zone.get('flip_info')
 
+            # ── Apply 4H bias gate ────────────────────────────────────────────
+            if h4_trend == 'bullish' and zone['type'] == 'supply':
+                rejected_cnt += 1
+                reject_reasons['h4_bias'] += 1
+                if self.debug:
+                    print(f"     ⛔ 4H BIAS GATE: supply zone blocked — 4H is bullish")
+                continue
+            if h4_trend == 'bearish' and zone['type'] == 'demand':
+                rejected_cnt += 1
+                reject_reasons['h4_bias'] += 1
+                if self.debug:
+                    print(f"     ⛔ 4H BIAS GATE: demand zone blocked — 4H is bearish")
+                continue
+
+            # ── Apply D1 premium/discount gate ───────────────────────────────
+            if _d1_pd == 1 and zone['type'] == 'demand':
+                # Price in D1 premium — smart money sells here, don't buy
+                rejected_cnt += 1
+                reject_reasons['d1_premium_discount'] += 1
+                if self.debug:
+                    print(f"     ⛔ D1 PREMIUM GATE: demand zone blocked — price in D1 premium")
+                continue
+            if _d1_pd == -1 and zone['type'] == 'supply':
+                # Price in D1 discount — smart money buys here, don't sell
+                rejected_cnt += 1
+                reject_reasons['d1_premium_discount'] += 1
+                if self.debug:
+                    print(f"     ⛔ D1 DISCOUNT GATE: supply zone blocked — price in D1 discount")
+                continue
+
             base_probability = self.predict_with_proper_features(zone, df, htf_context)
             probability      = base_probability
+
+            # Zone freshness penalty: older zones get a probability haircut
+            # A zone formed 40+ bars ago (10 hours on 15min) is stale
+            zone_age_bars = len(df) - zone.get('index', len(df) - 1)
+            if zone_age_bars > 40:
+                staleness_penalty = min(0.10, (zone_age_bars - 40) * 0.002)
+                probability = max(0.0, probability - staleness_penalty)
 
             if self.use_htf_analysis and zone.get('htf_confluence'):
                 cscore = zone['htf_confluence']['score']
                 boost  = 0.10 if cscore >= 7 else (0.05 if cscore >= 5 else 0.02)
                 probability = self.apply_boost_ceiling(probability, boost)
                 self.stats['htf_boosted'] += 1
+
+            # Multi-touch boost: zone respected 2+ times = institutional interest confirmed
+            touch_count = zone.get('zone_touch_count', 1)
+            if 2 <= touch_count <= 5:
+                probability = self.apply_boost_ceiling(probability, 0.03)
+            elif touch_count > 5:
+                # Too many touches = zone weakening, slight penalty
+                probability = max(0.0, probability - 0.02)
 
             if is_cont and flip_info:
                 probability = self.apply_boost_ceiling(probability, self.continuation_prob_boost)
@@ -1645,7 +1757,14 @@ class ProductionForexPredictor:
                 (zone['type'] == 'supply' and d1_trend == 'bullish')
             ) if d1_trend != 'neutral' else False
 
-            effective_threshold = self.prob_threshold + (0.05 if counter_trend else 0.0)
+            # Session-aware threshold: tighten during low-activity sessions
+            # London (08-13 UTC) and NY (13-21 UTC) = institutional hours = keep threshold
+            # Asia (00-08 UTC) and Sydney (21-24 UTC) = raise threshold by 5%
+            _hour = datetime.utcnow().hour
+            _session_penalty = 0.05 if _hour < 8 or _hour >= 21 else 0.0
+            effective_threshold = (self.prob_threshold
+                                   + (0.05 if counter_trend else 0.0)
+                                   + _session_penalty)
             if base_probability < 0.55 or probability < effective_threshold:
                 rejected_cnt += 1
                 reject_reasons['prob_low'] += 1
@@ -1660,7 +1779,11 @@ class ProductionForexPredictor:
 
             risk_pips   = abs(entry - sl) / self.pip_size
             reward_pips = abs(tp   - entry) / self.pip_size
-            if risk_pips < 2 or risk_pips > 50 or reward_pips > 500:
+            # Symbol-adaptive risk limits: gold has wider natural ranges
+            _is_gold    = 'XAU' in self.symbol.upper() or 'GOLD' in self.symbol.upper()
+            _max_risk   = 300.0 if _is_gold else 50.0
+            _min_risk   = 5.0   if _is_gold else 2.0
+            if risk_pips < _min_risk or risk_pips > _max_risk or reward_pips > 2000:
                 rejected_cnt += 1
                 reject_reasons['risk_range'] += 1
                 if self.debug:
@@ -1696,6 +1819,11 @@ class ProductionForexPredictor:
                 '5min_refined':    refinement is not None,
                 'confluence_score': zone.get('htf_confluence', {}).get('score', 0),
                 'counter_trend':   counter_trend,
+                'd1_trend':        htf_context.get('daily_structure', {}).get('trend', 'neutral'),
+                'h4_trend':        htf_context.get('h4_structure', {}).get('trend', 'neutral'),
+                'zone_age_bars':   zone_age_bars,
+                'touch_count':     touch_count,
+                'session':         _canonical_get_session(datetime.utcnow().hour),
             }
             if is_cont and flip_info:
                 signal['continuation_details'] = {
@@ -1948,9 +2076,9 @@ def run_dual_strategy(symbols: Optional[List[str]] = None):
         safe = sym.replace('/', '_').lower()
         rev  = ProductionForexPredictor(
             api_key=API_KEY_REVERSION,
-            model_path="models/model_v4_reversion.pkl",
-            scaler_path="models/scaler_preprocessing.pkl",
-            encoders_path="models/encoders_preprocessing.pkl",
+            model_path="models/model_v5_reversion.pkl",
+            scaler_path="models/scaler_v5_reversion.pkl",
+            encoders_path="models/encoders_v5_reversion.pkl",
             stats_path="models/training_stats_v5_reversion.pkl",
             symbol=sym,
             prob_threshold=0.55,
@@ -1964,9 +2092,9 @@ def run_dual_strategy(symbols: Optional[List[str]] = None):
         )
         cont = ProductionForexPredictor(
             api_key=API_KEY_CONTINUATION,
-            model_path="models/model_v4_continuation.pkl",
-            scaler_path="models/scaler_preprocessing.pkl",
-            encoders_path="models/encoders_preprocessing.pkl",
+            model_path="models/model_v5_continuation.pkl",
+            scaler_path="models/scaler_v5_continuation.pkl",
+            encoders_path="models/encoders_v5_continuation.pkl",
             stats_path="models/training_stats_v5_continuation.pkl",
             symbol=sym,
             prob_threshold=0.60,
