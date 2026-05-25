@@ -3,7 +3,14 @@ CANONICAL FEATURE SCHEMA
 ========================
 Single source of truth for ALL feature columns used in training AND inference.
 
-v7 (current) — MTF upgrade:
+v8 (current):
+  REMOVED (always constant in live prediction — miscalibrates model):
+    prev_zone_outcome     → always 0.5 live (no persistent zone history DB)
+                            XGB importance 11%, RF 14% → significant miscalibration
+    time_since_last_touch → always 0.0 live
+                            XGB importance 6%, RF 2%
+
+v7:
   REMOVED (replaced by richer 1H-specific features):
     h1_confluence        → replaced by h1_trend_alignment, h1_structure_shift,
                            h1_displacement, h1_liquidity_sweep
@@ -68,10 +75,11 @@ NUMERIC_FEATURES: Tuple[str, ...] = (
 
     # ── v6: Zone-memory + MTF-edge features ───────────────────────────────────
     # NOTE: h1_confluence REMOVED — replaced by 4 granular 1H features below
+    # NOTE: prev_zone_outcome REMOVED v8 — always 0.5 in live (no persistent
+    #       zone history DB); XGB importance 11%, RF 14% → miscalibrates live scores
+    # NOTE: time_since_last_touch REMOVED v8 — always 0.0 in live; XGB 6%, RF 2%
     "h4_fvg_inside",
     "d1_ema_distance",
-    "prev_zone_outcome",
-    "time_since_last_touch",
 
     # ── v7: 1H alignment features (replaces generic h1_confluence) ────────────
     "h1_trend_alignment",       # -1=bearish, 0=neutral, 1=bullish  (1H EMA trend)
@@ -99,7 +107,7 @@ FEATURE_COLUMNS: Tuple[str, ...] = NUMERIC_FEATURES + tuple(
     f"{c}_encoded" for c in CATEGORICAL_FEATURES
 )
 
-N_FEATURES: int = len(FEATURE_COLUMNS)   # 29 numeric + 3 categorical-encoded = 32
+N_FEATURES: int = len(FEATURE_COLUMNS)   # 27 numeric + 3 categorical-encoded = 27 total
 
 
 def assert_feature_columns_exact(actual: list, expected: Tuple[str, ...] = FEATURE_COLUMNS) -> None:

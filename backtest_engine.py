@@ -927,6 +927,9 @@ def main():
                         help="Max bars per phase (default 96 = 24h on 15min). "
                              "Applies to BOTH entry scan and post-entry TP/SL scan.")
     parser.add_argument("--no-save",  action="store_true", help="Don't save results to disk")
+    parser.add_argument("--min-prob", type=float, default=0.0,
+                        help="Minimum probability threshold to trade (default 0.0 = all signals). "
+                             "Recommended: 0.65 for high-confidence trades only.")
     args = parser.parse_args()
 
     engine = BacktestEngine(
@@ -939,6 +942,11 @@ def main():
     if args.source == "outcomes":
         logger.info("Source: pre-resolved outcomes.parquet")
         outcomes = load_outcomes()
+        if args.min_prob > 0.0:
+            prob_col = "predicted_prob" if "predicted_prob" in outcomes.columns else "probability"
+            before   = len(outcomes)
+            outcomes = outcomes[outcomes[prob_col] >= args.min_prob].reset_index(drop=True)
+            logger.info(f"Filtered by min_prob={args.min_prob:.2f}: {before} → {len(outcomes)} signals")
         metrics  = engine.run_from_outcomes(outcomes)
         tag = "outcomes"
     else:

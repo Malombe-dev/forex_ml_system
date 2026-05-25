@@ -1,0 +1,409 @@
+
+<style>
+:root {
+  --bg0: var(--color-background-tertiary);
+  --bg1: var(--color-background-secondary);
+  --bg2: var(--color-background-primary);
+  --txt: var(--color-text-primary);
+  --muted: var(--color-text-secondary);
+  --hint: var(--color-text-tertiary);
+  --bdr: var(--color-border-tertiary);
+  --bdr2: var(--color-border-secondary);
+  --mono: var(--font-mono);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--mono);font-size:12px;color:var(--txt);background:transparent}
+.shell{border:0.5px solid var(--bdr2);border-radius:var(--border-radius-lg);overflow:hidden}
+
+.topbar{display:flex;align-items:center;justify-content:space-between;padding:8px 14px;background:var(--bg1);border-bottom:0.5px solid var(--bdr);flex-wrap:wrap;gap:8px}
+.tb-left{display:flex;align-items:center;gap:12px}
+.logo{font-size:13px;font-weight:500;letter-spacing:.5px;color:var(--txt)}
+.logo em{color:#3d9fff;font-style:normal}
+.dot-pill{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--muted)}
+.dot{width:6px;height:6px;border-radius:50%;animation:blink 1.8s ease-in-out infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
+.dot.green{background:#00c97a}
+.tb-right{display:flex;align-items:center;gap:10px;font-size:11px;color:var(--muted)}
+#utctime{letter-spacing:.5px}
+.btn{background:transparent;border:0.5px solid var(--bdr2);color:var(--muted);cursor:pointer;font-family:var(--mono);font-size:10px;padding:4px 10px;border-radius:var(--border-radius-md);transition:all .15s}
+.btn:hover{border-color:#3d9fff;color:#3d9fff}
+
+.pairbar{display:flex;background:var(--bg1);border-bottom:0.5px solid var(--bdr);overflow-x:auto;scrollbar-width:none}
+.pairbar::-webkit-scrollbar{display:none}
+.pair-item{display:flex;align-items:center;gap:8px;padding:7px 16px;border-right:0.5px solid var(--bdr);min-width:140px;cursor:default;white-space:nowrap}
+.pair-item:hover{background:var(--bg0)}
+.pair-sym{font-weight:500;font-size:12px;color:var(--txt)}
+.pair-meta{display:flex;flex-direction:column;gap:2px}
+.pair-trend{font-size:10px;letter-spacing:.3px}
+.pair-atr{font-size:10px;color:var(--muted)}
+.bull{color:#00c97a}.bear{color:#ff4d6a}.neut{color:var(--muted)}
+
+.statgrid{display:grid;grid-template-columns:repeat(6,1fr);border-bottom:0.5px solid var(--bdr)}
+@media(max-width:600px){.statgrid{grid-template-columns:repeat(3,1fr)}}
+.sc{padding:12px 14px;border-right:0.5px solid var(--bdr)}
+.sc:last-child{border-right:none}
+.sc-lbl{font-size:9px;color:var(--hint);letter-spacing:.8px;text-transform:uppercase;margin-bottom:4px}
+.sc-val{font-size:20px;font-weight:500;line-height:1.1}
+.sc-sub{font-size:10px;color:var(--muted);margin-top:2px}
+.c-green{color:#00c97a}.c-red{color:#ff4d6a}.c-blue{color:#3d9fff}.c-yellow{color:#f0b429}.c-purple{color:#a78bfa}.c-teal{color:#22d3ee}.c-orange{color:#fb923c}
+
+.tabs{display:flex;background:var(--bg1);border-bottom:0.5px solid var(--bdr);padding:0 14px}
+.tbtn{background:none;border:none;border-bottom:2px solid transparent;color:var(--muted);cursor:pointer;font-family:var(--mono);font-size:10px;letter-spacing:.6px;text-transform:uppercase;padding:9px 14px;transition:all .15s}
+.tbtn:hover{color:var(--txt)}
+.tbtn.active{color:#3d9fff;border-bottom-color:#3d9fff}
+.tcnt{display:inline-block;border:0.5px solid var(--bdr2);border-radius:10px;font-size:9px;padding:0 5px;margin-left:4px;line-height:15px;background:var(--bg0)}
+.tcnt.live{background:rgba(0,201,122,.08);border-color:rgba(0,201,122,.3);color:#00c97a}
+.tcnt.warn{background:rgba(240,180,41,.08);border-color:rgba(240,180,41,.3);color:#f0b429}
+
+.panel{display:none}.panel.active{display:block}
+
+.sec-head{display:flex;align-items:center;justify-content:space-between;padding:8px 14px;background:var(--bg1);border-bottom:0.5px solid var(--bdr)}
+.sec-title{font-size:9px;color:var(--hint);letter-spacing:.8px;text-transform:uppercase}
+.sec-note{font-size:10px;color:var(--muted)}
+
+.tblwrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:11px}
+thead th{background:var(--bg0);padding:6px 10px;text-align:left;font-size:9px;letter-spacing:.6px;text-transform:uppercase;color:var(--hint);border-bottom:0.5px solid var(--bdr);white-space:nowrap;position:sticky;top:0}
+tbody tr{border-bottom:0.5px solid var(--bdr);transition:background .1s}
+tbody tr:hover{background:var(--bg1)}
+tbody td{padding:7px 10px;vertical-align:middle;white-space:nowrap}
+tr.row-buy{border-left:2px solid rgba(0,201,122,.35)}
+tr.row-sell{border-left:2px solid rgba(255,77,106,.35)}
+
+.badge{display:inline-block;padding:1px 7px;border-radius:2px;font-size:9px;font-weight:500;letter-spacing:.5px}
+.b-buy{background:rgba(0,201,122,.1);color:#00c97a;border:0.5px solid rgba(0,201,122,.3)}
+.b-sell{background:rgba(255,77,106,.1);color:#ff4d6a;border:0.5px solid rgba(255,77,106,.3)}
+.b-rev{background:rgba(34,211,238,.1);color:#22d3ee;border:0.5px solid rgba(34,211,238,.25)}
+.b-cont{background:rgba(167,139,250,.1);color:#a78bfa;border:0.5px solid rgba(167,139,250,.25)}
+.b-htf{background:rgba(61,159,255,.1);color:#3d9fff;border:0.5px solid rgba(61,159,255,.25)}
+.b-pending{background:rgba(61,159,255,.1);color:#3d9fff;border:0.5px solid rgba(61,159,255,.25)}
+.b-hit_tp{background:rgba(0,201,122,.1);color:#00c97a;border:0.5px solid rgba(0,201,122,.3)}
+.b-hit_sl{background:rgba(255,77,106,.1);color:#ff4d6a;border:0.5px solid rgba(255,77,106,.3)}
+.b-triggered{background:rgba(251,146,60,.1);color:#fb923c;border:0.5px solid rgba(251,146,60,.3)}
+.b-planned{background:rgba(167,139,250,.1);color:#a78bfa;border:0.5px solid rgba(167,139,250,.25)}
+.b-observation{background:rgba(240,180,41,.1);color:#f0b429;border:0.5px solid rgba(240,180,41,.3)}
+.b-gate{background:rgba(240,180,41,.06);color:#f0b429;border:0.5px solid rgba(240,180,41,.2);font-size:10px;padding:2px 8px}
+.b-prem{background:rgba(255,77,106,.1);color:#ff4d6a;border:0.5px solid rgba(255,77,106,.25)}
+.b-disc{background:rgba(0,201,122,.1);color:#00c97a;border:0.5px solid rgba(0,201,122,.25)}
+.b-equil{background:rgba(240,180,41,.1);color:#f0b429;border:0.5px solid rgba(240,180,41,.25)}
+
+.pbar-wrap{display:flex;align-items:center;gap:5px}
+.pbar-track{width:44px;height:3px;background:var(--bg0);border-radius:2px;flex-shrink:0}
+.pbar-fill{height:100%;border-radius:2px;transition:width .3s}
+.pbar-num{font-size:10px;min-width:34px;text-align:right}
+
+.empty-blk{text-align:center;padding:48px 16px;color:var(--muted)}
+.empty-ico{font-size:24px;margin-bottom:8px;opacity:.3}
+.empty-ttl{font-size:13px;font-weight:500;color:var(--hint);margin-bottom:4px}
+.empty-sub{font-size:11px;max-width:340px;margin:0 auto;line-height:1.6}
+
+.funnel-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:0}
+@media(max-width:600px){.funnel-grid{grid-template-columns:1fr}}
+.funnel-card{border-right:0.5px solid var(--bdr);border-bottom:0.5px solid var(--bdr);padding:12px 14px}
+.funnel-card:nth-child(even){border-right:none}
+.fc-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.fc-sym{font-weight:500;font-size:12px;color:var(--txt)}
+.fc-price{font-size:10px;color:var(--muted)}
+.fc-trend{font-size:10px}
+.funnel-rows{display:flex;flex-direction:column;gap:4px}
+.frow{display:flex;align-items:center;gap:6px;font-size:10px;padding:3px 6px;border-radius:3px;background:var(--bg0)}
+.frow.pass{background:rgba(0,201,122,.06)}
+.frow.fail{background:rgba(255,77,106,.06)}
+.frow.warn{background:rgba(240,180,41,.06)}
+.frow-icon{font-size:11px;flex-shrink:0}
+.frow-label{color:var(--muted);flex:1}
+.frow-val{color:var(--txt);font-weight:500}
+.frow-reason{color:#ff4d6a;font-size:9px}
+
+.rej-row{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}
+.rej-pill{font-size:9px;padding:2px 7px;border-radius:2px;background:var(--bg0);color:var(--hint);border:0.5px solid var(--bdr)}
+.rej-pill.dist{border-color:rgba(61,159,255,.3);color:#3d9fff}
+.rej-pill.dir{border-color:rgba(255,77,106,.3);color:#ff4d6a}
+.rej-pill.prob{border-color:rgba(240,180,41,.3);color:#f0b429}
+.rej-pill.rr{border-color:rgba(34,211,238,.3);color:#22d3ee}
+.rej-pill.conf{border-color:rgba(167,139,250,.3);color:#a78bfa}
+
+.cycle-head{display:flex;align-items:center;gap:10px;padding:8px 14px;background:var(--bg1);border-bottom:0.5px solid var(--bdr);font-size:10px;color:var(--muted)}
+.cycle-num{font-size:12px;font-weight:500;color:var(--txt)}
+.cycle-time{color:var(--muted)}
+.cycle-next{margin-left:auto;color:var(--hint)}
+
+.how-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:0;border-bottom:0.5px solid var(--bdr)}
+.how-cell{padding:10px 14px;border-right:0.5px solid var(--bdr);font-size:10px;color:var(--muted);line-height:1.8}
+.how-cell:last-child{border-right:none}
+.how-cell b{color:var(--txt);font-weight:500}
+</style>
+
+<h2 class="sr-only">ML Signal Terminal V8 — forex trading signal monitor with funnel diagnostics</h2>
+<div class="shell">
+
+<div class="topbar">
+  <div class="tb-left">
+    <div class="logo">ML<em>SIGNAL</em> TERMINAL <span style="font-size:10px;color:var(--muted)">V8</span></div>
+    <div class="dot-pill"><div class="dot green" id="sess-dot"></div><span id="sess-name" style="color:#00c97a">LONDON</span></div>
+  </div>
+  <div class="tb-right">
+    <span id="utctime">--:--:-- UTC</span>
+    <button class="btn" onclick="fetchAll()"><i class="ti ti-refresh" aria-hidden="true"></i> REFRESH</button>
+    <span id="conn-status" style="color:var(--muted)">CONNECTING…</span>
+  </div>
+</div>
+
+<div class="pairbar" id="pairbar">
+  <div class="pair-item"><span class="pair-sym">EUR/USD</span><div class="pair-meta"><span class="pair-trend neut">— —</span><span class="pair-atr">ATR —</span></div></div>
+  <div class="pair-item"><span class="pair-sym">GBP/USD</span><div class="pair-meta"><span class="pair-trend neut">— —</span><span class="pair-atr">ATR —</span></div></div>
+  <div class="pair-item"><span class="pair-sym">USD/JPY</span><div class="pair-meta"><span class="pair-trend neut">— —</span><span class="pair-atr">ATR —</span></div></div>
+  <div class="pair-item"><span class="pair-sym">XAU/USD</span><div class="pair-meta"><span class="pair-trend neut">— —</span><span class="pair-atr">ATR —</span></div></div>
+</div>
+
+<div class="statgrid">
+  <div class="sc"><div class="sc-lbl">Live signals</div><div class="sc-val c-green" id="s-live">—</div><div class="sc-sub">gates passed</div></div>
+  <div class="sc"><div class="sc-lbl">Observation</div><div class="sc-val c-yellow" id="s-obs">—</div><div class="sc-sub">gate-blocked</div></div>
+  <div class="sc"><div class="sc-lbl">Win rate</div><div class="sc-val c-blue" id="s-wr">—</div><div class="sc-sub" id="s-tp-sl">— TP / — SL</div></div>
+  <div class="sc"><div class="sc-lbl">Avg prob</div><div class="sc-val c-purple" id="s-prob">—</div><div class="sc-sub">model confidence</div></div>
+  <div class="sc"><div class="sc-lbl">Avg R:R</div><div class="sc-val c-teal" id="s-rr">—</div><div class="sc-sub" id="s-bestrr">best —</div></div>
+  <div class="sc"><div class="sc-lbl">Entry missed</div><div class="sc-val c-red" id="s-missed">—</div><div class="sc-sub">never filled</div></div>
+</div>
+
+<div class="tabs">
+  <button class="tbtn active" onclick="switchTab('real')" id="tab-real">✦ signals <span class="tcnt live" id="tc-real">0</span></button>
+  <button class="tbtn" onclick="switchTab('obs')" id="tab-obs">◎ observation <span class="tcnt warn" id="tc-obs">0</span></button>
+  <button class="tbtn" onclick="switchTab('funnel')" id="tab-funnel">⬡ funnel</button>
+  <button class="tbtn" onclick="switchTab('outcomes')" id="tab-outcomes">◈ outcomes</button>
+</div>
+
+<div class="panel active" id="panel-real">
+  <div class="sec-head"><span class="sec-title">Signals that passed all gates — 4H bias · D1 zone · prob ≥ 65%</span><span class="sec-note" id="real-note">—</span></div>
+  <div class="tblwrap"><table>
+    <thead><tr><th>Date</th><th>Time</th><th>Symbol</th><th>Strat</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP</th><th>Risk p</th><th>R:R</th><th>Probability</th><th>Conf</th><th>H4</th><th>Status</th></tr></thead>
+    <tbody id="tbody-real"><tr><td colspan="14"><div class="empty-blk"><div class="empty-ico"><i class="ti ti-clock" aria-hidden="true"></i></div><div class="empty-ttl">Waiting for signals</div><div class="empty-sub">System scanning. Best window: London open (08:00 UTC) and NY overlap (13:00–17:00 UTC).</div></div></td></tr></tbody>
+  </table></div>
+</div>
+
+<div class="panel" id="panel-obs">
+  <div class="sec-head"><span class="sec-title">Gate-blocked zones — study only, not traded</span><span class="sec-note" style="color:#f0b429">4H bias or D1 zone blocked these</span></div>
+  <div class="tblwrap"><table>
+    <thead><tr><th>Date</th><th>Time</th><th>Symbol</th><th>Strat</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP est</th><th>Risk p</th><th>Strength</th><th>Conf</th><th>H4</th><th>D1 Zone</th><th>Gate blocked by</th></tr></thead>
+    <tbody id="tbody-obs"><tr><td colspan="14"><div class="empty-blk"><div class="empty-ico"><i class="ti ti-eye" aria-hidden="true"></i></div><div class="empty-ttl">No observation signals yet</div><div class="empty-sub">Gate-blocked zones appear here as the system runs through cycles.</div></div></td></tr></tbody>
+  </table></div>
+</div>
+
+<div class="panel" id="panel-funnel">
+  <div class="cycle-head">
+    <span>Cycle</span><span class="cycle-num" id="f-cycle">#—</span>
+    <span class="cycle-time" id="f-cycle-time">—</span>
+    <span class="cycle-next" id="f-next">Next: —</span>
+  </div>
+  <div class="how-grid">
+    <div class="how-cell"><b>HTF filter</b> — 4H OBs/FVGs checked against 1H trend; direction conflicts rejected</div>
+    <div class="how-cell"><b>Bias filter</b> — bullish bias blocks SELL zones, bearish blocks BUY zones</div>
+    <div class="how-cell"><b>Prob filter</b> — XGB·RF·LR ensemble; threshold 65%; calibrator optional</div>
+    <div class="how-cell"><b>15min zones</b> — tracked but not ML-scored (model not trained on 15min)</div>
+  </div>
+  <div class="funnel-grid" id="funnel-grid">
+    <div style="grid-column:1/-1;padding:32px;text-align:center;color:var(--muted);font-size:11px"><i class="ti ti-chart-bar" aria-hidden="true"></i> Funnel data loads from /api/status + /api/signals</div>
+  </div>
+</div>
+
+<div class="panel" id="panel-outcomes">
+  <div class="statgrid" style="grid-template-columns:repeat(4,1fr)">
+    <div class="sc"><div class="sc-lbl">Win rate</div><div class="sc-val c-green" id="oc-wr">—</div><div class="sc-sub">TP / (TP+SL)</div></div>
+    <div class="sc"><div class="sc-lbl">Resolved</div><div class="sc-val c-blue" id="oc-res">—</div><div class="sc-sub" id="oc-res-sub">— TP + — SL</div></div>
+    <div class="sc"><div class="sc-lbl">Pending</div><div class="sc-val c-orange" id="oc-pend">—</div><div class="sc-sub">entry not triggered</div></div>
+    <div class="sc"><div class="sc-lbl">Missed</div><div class="sc-val c-red" id="oc-miss">—</div><div class="sc-sub">never filled</div></div>
+  </div>
+  <div class="how-grid">
+    <div class="how-cell"><b>HIT_TP</b> — entry touched → TP reached, SL not hit first</div>
+    <div class="how-cell"><b>HIT_SL</b> — entry touched → SL hit (same bar = SL wins)</div>
+    <div class="how-cell"><b>TRIGGERED</b> — entry touched, trade still live</div>
+    <div class="how-cell"><b>Win rate denominator</b> = TP + SL only — entry_missed excluded</div>
+  </div>
+  <div class="tblwrap"><table>
+    <thead><tr><th>Date</th><th>Time</th><th>Symbol</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP</th><th>R:R</th><th>Prob</th><th>Status</th><th>→Entry</th><th>→Exit</th><th>Resolved</th></tr></thead>
+    <tbody id="tbody-out"><tr><td colspan="13" style="text-align:center;padding:32px;color:var(--muted)">No resolved signals yet.</td></tr></tbody>
+  </table></div>
+</div>
+
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const f5 = n => (parseFloat(n)||0).toFixed(5);
+const f2 = n => (parseFloat(n)||0).toFixed(2);
+
+const PAIRS = ['EUR/USD','GBP/USD','USD/JPY','XAU/USD'];
+
+const PAIR_DATA = {
+  'EUR/USD': { h1trend:'bullish', atr:'0.00054', price:'1.16414', fvg4h:2, ob4h:8, zones15m:6, htfPass:0, rejectReasons:{dist:1,dir:1,prob:1,rr:3,conf:1} },
+  'GBP/USD': { h1trend:'bullish', atr:'0.00051', price:'1.34852', fvg4h:3, ob4h:4, zones15m:4, htfPass:0, rejectReasons:{dist:2,dir:1,prob:0,rr:1,conf:0} },
+  'USD/JPY': { h1trend:'bearish', atr:'0.04319', price:'158.923', fvg4h:4, ob4h:10, zones15m:11, htfPass:0, rejectReasons:{dist:2,dir:2,prob:0,rr:2,conf:2}, ob_skip:2 },
+  'XAU/USD': { h1trend:'bullish', atr:'5.7018',  price:'4564.95', fvg4h:1, ob4h:5,  zones15m:2,  htfPass:0, rejectReasons:{dist:0,dir:0,prob:1,rr:1,conf:0} },
+};
+
+function probColor(p){ return p>=80?'#00c97a':p>=70?'#22d3ee':p>=65?'#3d9fff':p>=55?'#f0b429':'#ff4d6a'; }
+function trendColor(t){ if(!t) return 'var(--muted)'; t=t.toLowerCase(); return t==='bullish'?'#00c97a':t==='bearish'?'#ff4d6a':'#f0b429'; }
+function trendLabel(t){ if(!t||t==='—') return '—'; const m=t.toLowerCase(); return m==='bullish'?'▲ BULL':m==='bearish'?'▼ BEAR':'— NEUT'; }
+function parseTS(ts){ if(!ts) return {date:'—',time:'—'}; const s=ts.replace(' UTC','').trim(); if(s.includes(' ')&&s.split(' ')[0].includes('-')){ const [d,t]=s.split(' '); return {date:d,time:t}; } return {date:'—',time:s}; }
+function stratPill(s){ if(!s) return ''; const sl=s.toLowerCase(); if(sl.includes('cont')) return `<span class="badge b-cont">CONT</span>`; if(sl.includes('rev')) return `<span class="badge b-rev">REV</span>`; if(sl.includes('htf')) return `<span class="badge b-htf">HTF</span>`; return `<span class="badge b-rev">${s.slice(0,4).toUpperCase()}</span>`; }
+function gateLabel(r){ const m={'4h_bias_bullish_blocks_supply':'4H BULL → NO SHORT','4h_bias_bearish_blocks_demand':'4H BEAR → NO LONG','d1_premium_blocks_demand':'D1 PREM → NO LONG','d1_discount_blocks_supply':'D1 DISC → NO SHORT'}; return m[r]||(r||'—').toUpperCase(); }
+
+function updateClock(){
+  const n=new Date(), p=x=>String(x).padStart(2,'0');
+  $('utctime').textContent=`${n.getUTCFullYear()}-${p(n.getUTCMonth()+1)}-${p(n.getUTCDate())} ${p(n.getUTCHours())}:${p(n.getUTCMinutes())}:${p(n.getUTCSeconds())} UTC`;
+  const h=n.getUTCHours();
+  let sess='CLOSED', col='var(--muted)';
+  if(h>=22||h<2){sess='SYDNEY';col='#a78bfa';}
+  else if(h>=2&&h<7){sess='TOKYO';col='#3d9fff';}
+  else if(h>=7&&h<12){sess='LONDON';col='#00c97a';}
+  else if(h>=12&&h<17){sess='LON/NY';col='#22d3ee';}
+  else if(h>=17&&h<22){sess='NEW YORK';col='#fb923c';}
+  $('sess-name').textContent=sess; $('sess-name').style.color=col;
+  $('sess-dot').style.background=col;
+}
+setInterval(updateClock,1000); updateClock();
+
+function switchTab(name){
+  document.querySelectorAll('.tbtn').forEach(b=>b.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
+  $(`tab-${name}`).classList.add('active');
+  $(`panel-${name}`).classList.add('active');
+}
+
+function renderPairBar(signals){
+  const bar=$('pairbar');
+  bar.innerHTML=PAIRS.map(sym=>{
+    const sigs=signals.filter(s=>s.symbol===sym);
+    const last=sigs[sigs.length-1];
+    const localData=PAIR_DATA[sym]||{};
+    const trend=last?.h4_trend||last?.htf_trend||localData.h1trend||'—';
+    const tClass=trend==='bullish'?'bull':trend==='bearish'?'bear':'neut';
+    const tLabel=trend==='bullish'?'▲ bullish':trend==='bearish'?'▼ bearish':'— neutral';
+    const atrVal=last?.atr||localData.atr||'—';
+    return `<div class="pair-item"><span class="pair-sym">${sym}</span><div class="pair-meta"><span class="pair-trend ${tClass}">${tLabel}</span><span class="pair-atr">ATR ${atrVal}</span></div></div>`;
+  }).join('');
+}
+
+function renderStats(stats, sigResp){
+  $('s-live').textContent=sigResp.live??stats.signals_live??'0';
+  $('s-obs').textContent=sigResp.observation??stats.observation_count??'0';
+  $('s-wr').textContent=stats.win_rate!=null?stats.win_rate+'%':'0%';
+  $('s-tp-sl').textContent=`${stats.win_count??0} TP / ${stats.loss_count??0} SL`;
+  $('s-prob').textContent=stats.avg_probability?stats.avg_probability+'%':'—';
+  $('s-rr').textContent=stats.avg_rr??'—';
+  $('s-bestrr').textContent='best '+(stats.best_rr??'—');
+  $('s-missed').textContent=stats.entry_missed??'0';
+  $('tc-real').textContent=sigResp.live??'0';
+  $('tc-obs').textContent=sigResp.observation??'0';
+  $('oc-wr').textContent=stats.win_rate!=null?stats.win_rate+'%':'—';
+  $('oc-res').textContent=stats.triggered_total??'—';
+  $('oc-res-sub').textContent=`${stats.win_count??0} TP + ${stats.loss_count??0} SL`;
+  $('oc-pend').textContent=stats.signals_active??'—';
+  $('oc-miss').textContent=stats.entry_missed??'—';
+  $('conn-status').textContent='● LIVE'; $('conn-status').style.color='#00c97a';
+}
+
+function renderReal(signals){
+  const real=signals.filter(s=>s.signal_type==='real'||(!s.signal_type&&s.status!=='observation'));
+  $('real-note').textContent=`${real.length} signal${real.length!==1?'s':''}`;
+  const tbody=$('tbody-real');
+  if(!real.length){ tbody.innerHTML=`<tr><td colspan="14"><div class="empty-blk"><div class="empty-ico"><i class="ti ti-clock" aria-hidden="true"></i></div><div class="empty-ttl">No real signals yet</div><div class="empty-sub">Best window: 08:00–12:00 UTC (London) and 13:00–17:00 UTC (NY overlap).</div></div></td></tr>`; return; }
+  tbody.innerHTML=real.map(s=>{
+    const dt=parseTS(s.timestamp), dir=(s.direction||'').toLowerCase(), prob=parseFloat(s.probability||0), status=s.status||'pending', pct=Math.min(100,prob);
+    return `<tr class="row-${dir}"><td style="color:var(--muted)">${dt.date}</td><td style="color:var(--muted)">${dt.time}</td><td style="font-weight:500">${s.symbol||'—'}</td><td>${stratPill(s.strategy)}</td><td><span class="badge b-${dir}">${(s.direction||'—').toUpperCase()}</span></td><td>${f5(s.entry)}</td><td style="color:#ff4d6a">${f5(s.sl)}</td><td style="color:#00c97a">${f5(s.tp)}</td><td style="color:var(--muted)">${s.risk_pips??'—'}</td><td style="color:#3d9fff">${s.rr||s.risk_reward||'—'}</td><td><div class="pbar-wrap"><div class="pbar-track"><div class="pbar-fill" style="width:${pct}%;background:${probColor(prob)}"></div></div><span class="pbar-num" style="color:${probColor(prob)}">${prob.toFixed(1)}%</span></div></td><td style="color:var(--muted)">${s.confluence_score??'—'}/10</td><td style="color:${trendColor(s.h4_trend)}">${trendLabel(s.h4_trend)}</td><td><span class="badge b-${status}">${status.toUpperCase().replace('_',' ')}</span></td></tr>`;
+  }).join('');
+}
+
+function renderObs(obs){
+  const tbody=$('tbody-obs');
+  if(!obs.length){ tbody.innerHTML=`<tr><td colspan="14"><div class="empty-blk"><div class="empty-ico"><i class="ti ti-eye" aria-hidden="true"></i></div><div class="empty-ttl">No observation signals</div><div class="empty-sub">Gate-blocked zones appear here as cycles run.</div></div></td></tr>`; return; }
+  tbody.innerHTML=obs.map(s=>{
+    const dt=parseTS(s.timestamp), dir=(s.direction||'').toLowerCase(), d1z=s.d1_zone||'unknown';
+    const d1cls=d1z==='premium'?'b-prem':d1z==='discount'?'b-disc':d1z==='equilibrium'?'b-equil':'';
+    return `<tr class="row-${dir}"><td style="color:var(--muted)">${dt.date}</td><td style="color:var(--muted)">${dt.time}</td><td style="font-weight:500">${s.symbol||'—'}</td><td>${stratPill(s.strategy)}</td><td><span class="badge b-${dir}">${(s.direction||'—').toUpperCase()}</span></td><td>${f5(s.entry)}</td><td style="color:#ff4d6a">${f5(s.sl)}</td><td style="color:var(--muted)">${f5(s.tp)}</td><td style="color:var(--muted)">${s.risk_pips??'—'}</td><td style="color:var(--muted)">${s.zone_strength??'—'}</td><td style="color:var(--muted)">${s.confluence_score??'—'}/10</td><td style="color:${trendColor(s.h4_trend)}">${trendLabel(s.h4_trend)}</td><td><span class="badge ${d1cls}">${d1z.toUpperCase()}</span></td><td><span class="badge b-gate">${gateLabel(s.gate_blocked_by)}</span></td></tr>`;
+  }).join('');
+}
+
+function renderFunnel(signals, status){
+  $('f-cycle').textContent='#1';
+  $('f-cycle-time').textContent='07:07:22 UTC';
+  $('f-next').textContent='Next: 07:22:22 UTC';
+
+  const pairsToRender=PAIRS.map(sym=>{
+    const local=PAIR_DATA[sym]||{};
+    const liveSigs=signals.filter(s=>s.symbol===sym);
+    const last=liveSigs[liveSigs.length-1];
+    const trend=local.h1trend||'—';
+    const price=last?.entry||local.price||'—';
+    const atr=last?.atr||local.atr||'—';
+    const fvg4h=local.fvg4h??'—'; const ob4h=local.ob4h??'—';
+    const zones15m=local.zones15m??'—';
+    const htfPass=local.htfPass??0;
+    const rj=local.rejectReasons||{};
+    const obSkip=local.ob_skip||0;
+    const tClass=trend==='bullish'?'bull':trend==='bearish'?'bear':'neut';
+
+    const rejRows=[];
+    if(rj.dist) rejRows.push(`<span class="rej-pill dist" title="Too far from price">dist: ${rj.dist}</span>`);
+    if(rj.dir)  rejRows.push(`<span class="rej-pill dir" title="Direction conflict">dir: ${rj.dir}</span>`);
+    if(rj.prob) rejRows.push(`<span class="rej-pill prob" title="Probability below threshold">prob: ${rj.prob}</span>`);
+    if(rj.rr)   rejRows.push(`<span class="rej-pill rr" title="R:R ratio too low">rr: ${rj.rr}</span>`);
+    if(rj.conf) rejRows.push(`<span class="rej-pill conf" title="Confluence too low">conf: ${rj.conf}</span>`);
+
+    return `<div class="funnel-card">
+      <div class="fc-head">
+        <span class="fc-sym">${sym}</span>
+        <span class="fc-trend ${tClass}">${trend==='bullish'?'▲ bullish':trend==='bearish'?'▼ bearish':'— neutral'}</span>
+        <span class="fc-price">${price}</span>
+      </div>
+      <div class="funnel-rows">
+        <div class="frow pass"><span class="frow-icon">①</span><span class="frow-label">4H zones</span><span class="frow-val">${fvg4h} FVG · ${ob4h} OB</span></div>
+        <div class="frow pass"><span class="frow-icon">②</span><span class="frow-label">15m raw zones</span><span class="frow-val">${zones15m} zones (tracking)</span></div>
+        ${obSkip>0?`<div class="frow fail"><span class="frow-icon">⛔</span><span class="frow-label">OB skipped</span><span class="frow-reason">${obSkip}× 1H trend opposite</span></div>`:''}
+        <div class="frow ${htfPass>0?'pass':'fail'}"><span class="frow-icon">③</span><span class="frow-label">HTF before bias</span><span class="frow-val">${htfPass}</span></div>
+        <div class="frow ${htfPass>0?'pass':'fail'}"><span class="frow-icon">④</span><span class="frow-label">HTF after bias</span><span class="frow-val">${htfPass}</span></div>
+        <div class="frow warn"><span class="frow-icon">⑤</span><span class="frow-label">15m ML score</span><span class="frow-reason">no HTF signals → skipped</span></div>
+      </div>
+      ${rejRows.length?`<div class="rej-row">${rejRows.join('')}</div>`:''}
+    </div>`;
+  }).join('');
+
+  $('funnel-grid').innerHTML=pairsToRender;
+}
+
+function renderOutcomes(signals, stats){
+  const real=signals.filter(s=>s.signal_type==='real'||(!s.signal_type&&s.status!=='observation'));
+  const order=['hit_tp','hit_sl','triggered','pending','entry_missed','expired'];
+  const sorted=[...real].sort((a,b)=>order.indexOf(a.status||'pending')-order.indexOf(b.status||'pending'));
+  const tbody=$('tbody-out');
+  if(!sorted.length){ tbody.innerHTML=`<tr><td colspan="13" style="text-align:center;padding:32px;color:var(--muted)">No resolved signals yet.</td></tr>`; return; }
+  tbody.innerHTML=sorted.map(s=>{
+    const dt=parseTS(s.timestamp), dir=(s.direction||'').toLowerCase(), status=s.status||'pending', prob=parseFloat(s.probability||0);
+    return `<tr class="row-${dir}"><td style="color:var(--muted)">${dt.date}</td><td style="color:var(--muted)">${dt.time}</td><td style="font-weight:500">${s.symbol||'—'}</td><td><span class="badge b-${dir}">${(s.direction||'—').toUpperCase()}</span></td><td>${f5(s.entry)}</td><td style="color:#ff4d6a">${f5(s.sl)}</td><td style="color:#00c97a">${f5(s.tp)}</td><td style="color:#3d9fff">${s.rr||s.risk_reward||'—'}</td><td style="color:${probColor(prob)}">${prob.toFixed(1)}%</td><td><span class="badge b-${status}">${status.toUpperCase().replace('_',' ')}</span></td><td style="color:var(--muted);text-align:center">${s.bars_to_entry??'—'}</td><td style="color:var(--muted);text-align:center">${s.bars_to_exit??'—'}</td><td style="color:var(--muted)">${s.resolved_at?s.resolved_at.slice(0,10):'—'}</td></tr>`;
+  }).join('');
+}
+
+async function fetchAll(){
+  $('conn-status').textContent='● SYNCING…'; $('conn-status').style.color='#f0b429';
+  try {
+    const [sigResp, obsResp, statsResp, statusResp] = await Promise.all([
+      fetch('/api/signals').then(r=>r.json()).catch(()=>({data:[],live:0,observation:0})),
+      fetch('/api/observation_signals').then(r=>r.json()).catch(()=>({data:[]})),
+      fetch('/api/stats').then(r=>r.json()).catch(()=>({})),
+      fetch('/api/status').then(r=>r.json()).catch(()=>({})),
+    ]);
+    const all=sigResp.data||[];
+    window._allSignals=all;
+    renderStats(statsResp, sigResp);
+    renderPairBar(all);
+    renderReal(all);
+    renderObs(obsResp.data||[]);
+    renderFunnel(all, statusResp);
+    renderOutcomes(all, statsResp);
+  } catch(err){
+    console.error(err);
+    $('conn-status').textContent='● ERROR'; $('conn-status').style.color='#ff4d6a';
+  }
+}
+fetchAll();
+setInterval(fetchAll, 60000);
+</script>

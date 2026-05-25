@@ -112,14 +112,91 @@ p_ens = np.clip(p_ens, 1e-7, 1 - 1e-7)
 test_df['predicted_prob'] = p_ens
 print(f"\nProbability range on test set: {p_ens.min():.3f} – {p_ens.max():.3f}  mean={p_ens.mean():.3f}")
 
-# ── Build outcomes DataFrame ──────────────────────────────────────────────────
+# ── Load 15min bars for simulation ───────────────────────────────────────────
+print("\nLoading 15min bars for bar-by-bar simulation...")
+bars_by_sym = {}
+for sym in PAIRS:
+    bar_path = Path(f'data/bars_15min_{sym}.parquet')
+    if bar_path.exists():
+        df_bars = pd.read_parquet(bar_path)
+        if 'time' not in df_bars.columns:
+            df_bars = df_bars.reset_index()
+            if 'index' in df_bars.columns:
+                df_bars = df_bars.rename(columns={'index': 'time'})
+        df_bars['time'] = pd.to_datetime(df_bars['time'])
+        df_bars = df_bars.sort_values('time').reset_index(drop=True)
+        bars_by_sym[sym] = df_bars
+        print(f"  {sym}: {len(df_bars):,} bars  ({df_bars['time'].min().date()} → {df_bars['time'].max().date()})")
+    else:
+        print(f"  ⚠️  {sym}: bars not found — outcomes will use label fallback")
+
+MAX_ENTRY_BARS = 96   # max bars to wait for entry fill (24h on 15min)
+MAX_HOLD_BARS  = 96   # max bars to wait for TP/SL after fill
+
+def simulate_trade(sym, direction, signal_time, entry, sl, tp, bars_by_sym,
+                   max_entry_bars=MAX_ENTRY_BARS, max_hold_bars=MAX_HOLD_BARS):
+    """
+    Simulate a limit order against 15min bars.
+    Returns: (outcome, exit_price, bars_to_fill, bars_held)
+      outcome: 'win' | 'loss' | 'expired' | 'timeout'
+    """
+    if sym not in bars_by_sym:
+        return None, None, None, None
+
+    df = bars_by_sym[sym]
+
+    # Find the bar AFTER signal_time (don't fill on signal bar itself)
+    sig_ts = pd.Timestamp(signal_time)
+    start_idx = df['time'].searchsorted(sig_ts, side='right')
+    if start_idx >= len(df):
+        return 'expired', None, None, None
+
+    # ── Phase 1: scan for entry fill ─────────────────────────────────────────
+    fill_idx = None
+    for i in range(start_idx, min(start_idx + max_entry_bars, len(df))):
+        bar = df.iloc[i]
+        if direction == 'BUY'  and bar['low']  <= entry:
+            fill_idx = i; break
+        if direction == 'SELL' and bar['high'] >= entry:
+            fill_idx = i; break
+
+    if fill_idx is None:
+        return 'expired', None, start_idx - start_idx, None
+
+    bars_to_fill = fill_idx - start_idx
+
+    # ── Phase 2: scan for TP or SL after fill ────────────────────────────────
+    scan_start = fill_idx + 1   # exclude fill bar from TP/SL check
+    for j in range(scan_start, min(scan_start + max_hold_bars, len(df))):
+        bar = df.iloc[j]
+        if direction == 'BUY':
+            if bar['high'] >= tp:
+                return 'win',  tp, bars_to_fill, j - fill_idx
+            if bar['low']  <= sl:
+                return 'loss', sl, bars_to_fill, j - fill_idx
+        else:
+            if bar['low']  <= tp:
+                return 'win',  tp, bars_to_fill, j - fill_idx
+            if bar['high'] >= sl:
+                return 'loss', sl, bars_to_fill, j - fill_idx
+
+    # Neither TP nor SL hit within horizon
+    last_bar  = df.iloc[min(scan_start + max_hold_bars - 1, len(df) - 1)]
+    exit_price = float(last_bar['close'])
+    return 'timeout', exit_price, bars_to_fill, max_hold_bars
+
+# ── Build outcomes DataFrame with bar simulation ─────────────────────────────
 rows = []
 geometry_errors = 0
+sim_stats = {'win': 0, 'loss': 0, 'expired': 0, 'timeout': 0, 'no_bars': 0}
 
-for _, r in test_df.iterrows():
+print(f"\nSimulating {len(test_df):,} trades bar-by-bar...")
+for idx, (_, r) in enumerate(test_df.iterrows()):
+    if idx % 200 == 0:
+        print(f"  {idx}/{len(test_df)}...")
+
     sym      = r['symbol']
     pip_size = PIP_SIZES.get(sym, 0.0001)
-    is_win   = r['label'] == 1.0
     entry    = float(r['entry'])
     sl       = float(r['sl'])
     tp       = float(r['tp'])
@@ -133,6 +210,20 @@ for _, r in test_df.iterrows():
         geometry_errors += 1
         continue
 
+    outcome, exit_price, bars_to_fill, bars_held = simulate_trade(
+        sym, direction, r['zone_time'], entry, sl, tp, bars_by_sym
+    )
+
+    if outcome is None:
+        # No bars available — fall back to label
+        sim_stats['no_bars'] += 1
+        outcome    = 'win' if r['label'] == 1.0 else 'loss'
+        exit_price = tp if outcome == 'win' else sl
+        bars_to_fill = 0
+        bars_held    = 0
+    else:
+        sim_stats[outcome] += 1
+
     rows.append({
         'signal_timestamp': r['zone_time'],
         'resolved_at':      r['zone_time'],
@@ -141,16 +232,21 @@ for _, r in test_df.iterrows():
         'entry':            entry,
         'sl':               sl,
         'tp':               tp,
-        'exit_price':       tp if is_win else sl,
+        'exit_price':       exit_price if exit_price is not None else (tp if r['label'] == 1.0 else sl),
         'predicted_prob':   float(r['predicted_prob']),
-        'outcome':          'win' if is_win else 'loss',
+        'outcome':          outcome,
         'strategy':         'REVERSION',
         'pip_size':         pip_size,
-        'bars_held':        0,
+        'bars_held':        bars_held if bars_held is not None else 0,
+        'bars_to_fill':     bars_to_fill if bars_to_fill is not None else 0,
     })
 
 if geometry_errors:
     print(f"⚠️  Skipped {geometry_errors} rows with invalid geometry")
+
+print(f"\nSimulation results:")
+for k, v in sim_stats.items():
+    print(f"  {k:10s}: {v:,}")
 
 out = pd.DataFrame(rows)
 out = out.sort_values('signal_timestamp').reset_index(drop=True)

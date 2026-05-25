@@ -1,142 +1,843 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Forex ML · Signal Dashboard</title>
-  <link rel="stylesheet" href="/static/css/style.css"/>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ML Signal Terminal — V8</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Syne:wght@400;600;800&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg:       #080b0f;
+  --bg1:      #0d1219;
+  --bg2:      #111820;
+  --bg3:      #162030;
+  --border:   #1e2d3d;
+  --border2:  #243647;
+  --text:     #cdd9e5;
+  --muted:    #4d6070;
+  --dim:      #2a3a4a;
+  --green:    #00d084;
+  --green2:   #00a868;
+  --red:      #ff4d6a;
+  --red2:     #cc2244;
+  --yellow:   #f5c518;
+  --blue:     #3d9fff;
+  --blue2:    #1a6fd4;
+  --purple:   #a78bfa;
+  --orange:   #fb923c;
+  --teal:     #22d3ee;
+  --accent:   #3d9fff;
+  --mono:     'JetBrains Mono', monospace;
+  --sans:     'Syne', sans-serif;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.5;
+  min-height: 100vh;
+}
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,0.03) 2px, rgba(0,0,0,0.03) 4px);
+  pointer-events: none;
+  z-index: 9999;
+}
+
+/* HEADER */
+.header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 24px; height: 52px;
+  background: var(--bg1); border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; z-index: 100;
+}
+.header-left { display: flex; align-items: center; gap: 20px; }
+.logo { font-family: var(--sans); font-size: 15px; font-weight: 800; letter-spacing: 1px; color: var(--text); }
+.logo span { color: var(--accent); }
+.session-pill {
+  display: flex; align-items: center; gap: 6px;
+  padding: 3px 10px; border-radius: 3px;
+  border: 1px solid var(--border2); background: var(--bg2);
+  font-size: 11px; color: var(--muted); letter-spacing: 0.5px;
+}
+.session-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); animation: blink 1.8s ease-in-out infinite; }
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
+.header-right { display: flex; align-items: center; gap: 16px; }
+#clock { font-family: var(--mono); font-size: 12px; color: var(--muted); letter-spacing: 1px; }
+.btn {
+  background: transparent; border: 1px solid var(--border2);
+  color: var(--muted); cursor: pointer; font-family: var(--mono);
+  font-size: 11px; padding: 5px 12px; border-radius: 3px;
+  letter-spacing: 0.5px; transition: all 0.15s;
+}
+.btn:hover { border-color: var(--accent); color: var(--accent); }
+#conn-status { font-size: 11px; color: var(--muted); letter-spacing: 0.3px; }
+
+/* PAIR TICKER */
+.ticker-bar {
+  display: flex; gap: 0; background: var(--bg1);
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto; scrollbar-width: none;
+}
+.ticker-bar::-webkit-scrollbar { display: none; }
+.ticker-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 20px; border-right: 1px solid var(--border);
+  min-width: 160px; cursor: default;
+}
+.ticker-item:hover { background: var(--bg2); }
+.ticker-sym { font-family: var(--sans); font-size: 12px; font-weight: 600; color: var(--text); letter-spacing: 0.5px; }
+.ticker-data { display: flex; flex-direction: column; gap: 1px; }
+.ticker-trend { font-size: 10px; letter-spacing: 0.5px; }
+.ticker-atr { font-size: 10px; color: var(--muted); }
+.trend-bull { color: var(--green); }
+.trend-bear { color: var(--red); }
+.trend-neut { color: var(--muted); }
+
+/* D1 ZONE BAR */
+.d1-bar {
+  display: flex; align-items: center; gap: 24px;
+  padding: 8px 24px; background: var(--bg1);
+  border-bottom: 1px solid var(--border); flex-wrap: wrap;
+}
+.d1-label { font-size: 10px; color: var(--muted); letter-spacing: 1px; text-transform: uppercase; }
+.d1-badge {
+  padding: 3px 12px; border-radius: 2px;
+  font-size: 11px; font-weight: 700; letter-spacing: 1px;
+  text-transform: uppercase; font-family: var(--sans);
+}
+.d1-badge.premium    { background: rgba(255,77,106,0.12); color: var(--red);    border: 1px solid rgba(255,77,106,0.3); }
+.d1-badge.discount   { background: rgba(0,208,132,0.12);  color: var(--green);  border: 1px solid rgba(0,208,132,0.3); }
+.d1-badge.equilibrium{ background: rgba(245,197,24,0.12); color: var(--yellow); border: 1px solid rgba(245,197,24,0.3); }
+.d1-badge.unknown    { background: rgba(77,96,112,0.15);  color: var(--muted);  border: 1px solid var(--border2); }
+.d1-track {
+  flex: 1; max-width: 260px; height: 4px;
+  background: var(--bg3); border-radius: 2px; position: relative; border: 1px solid var(--border);
+}
+.d1-fill { height: 100%; border-radius: 2px; background: linear-gradient(90deg, var(--green), var(--yellow) 50%, var(--red)); transition: width 0.6s ease; }
+.d1-cursor {
+  position: absolute; top: -4px; width: 2px; height: 12px;
+  background: var(--blue); border-radius: 1px; transform: translateX(-50%);
+  transition: left 0.6s ease; box-shadow: 0 0 6px var(--blue);
+}
+.d1-range-labels { display: flex; justify-content: space-between; font-size: 9px; color: var(--muted); margin-top: 3px; }
+.d1-pos-text { font-size: 11px; color: var(--muted); }
+.d1-pos-text b { color: var(--text); }
+
+/* STAT GRID */
+.stat-grid {
+  display: grid; grid-template-columns: repeat(8, 1fr);
+  border-bottom: 1px solid var(--border);
+}
+@media (max-width: 900px) { .stat-grid { grid-template-columns: repeat(4,1fr); } }
+@media (max-width: 500px) { .stat-grid { grid-template-columns: repeat(2,1fr); } }
+.stat-cell { padding: 14px 16px; border-right: 1px solid var(--border); }
+.stat-cell:last-child { border-right: none; }
+.sc-label { font-size: 9px; color: var(--muted); letter-spacing: 1.2px; text-transform: uppercase; margin-bottom: 6px; }
+.sc-value { font-family: var(--sans); font-size: 22px; font-weight: 800; line-height: 1; letter-spacing: -0.5px; }
+.sc-sub { font-size: 10px; color: var(--muted); margin-top: 3px; }
+.c-green  { color: var(--green); }
+.c-red    { color: var(--red); }
+.c-blue   { color: var(--blue); }
+.c-yellow { color: var(--yellow); }
+.c-purple { color: var(--purple); }
+.c-orange { color: var(--orange); }
+.c-teal   { color: var(--teal); }
+
+/* TABS */
+.tabs {
+  display: flex; background: var(--bg1);
+  border-bottom: 1px solid var(--border); padding: 0 24px;
+}
+.tab-btn {
+  background: none; border: none; border-bottom: 2px solid transparent;
+  color: var(--muted); cursor: pointer; font-family: var(--mono);
+  font-size: 11px; font-weight: 500; letter-spacing: 0.8px;
+  text-transform: uppercase; padding: 11px 18px; transition: all 0.15s;
+}
+.tab-btn:hover { color: var(--text); }
+.tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+.tab-count {
+  display: inline-block; background: var(--bg3); border: 1px solid var(--border2);
+  border-radius: 10px; font-size: 10px; padding: 0 6px; margin-left: 6px; line-height: 16px;
+}
+.tab-count.live { background: rgba(0,208,132,0.1); border-color: rgba(0,208,132,0.3); color: var(--green); }
+.tab-count.obs  { background: rgba(245,197,24,0.1); border-color: rgba(245,197,24,0.3); color: var(--yellow); }
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+
+/* TABLE */
+.table-wrap { overflow-x: auto; border-bottom: 1px solid var(--border); }
+.tbl { width: 100%; border-collapse: collapse; font-size: 12px; font-family: var(--mono); }
+.tbl thead th {
+  background: var(--bg2); padding: 8px 12px; text-align: left;
+  font-size: 9px; letter-spacing: 1px; text-transform: uppercase;
+  color: var(--muted); border-bottom: 1px solid var(--border);
+  white-space: nowrap; font-weight: 500; position: sticky; top: 52px;
+}
+.tbl tbody tr { border-bottom: 1px solid var(--border); transition: background 0.1s; }
+.tbl tbody tr:hover { background: var(--bg2); }
+.tbl tbody td { padding: 9px 12px; white-space: nowrap; vertical-align: middle; }
+.tbl tbody tr.row-buy  { border-left: 2px solid rgba(0,208,132,0.4); }
+.tbl tbody tr.row-sell { border-left: 2px solid rgba(255,77,106,0.4); }
+
+/* BADGES */
+.dir-badge { display: inline-block; padding: 2px 8px; border-radius: 2px; font-size: 10px; font-weight: 700; letter-spacing: 1px; }
+.dir-badge.buy  { background: rgba(0,208,132,0.12); color: var(--green); border: 1px solid rgba(0,208,132,0.3); }
+.dir-badge.sell { background: rgba(255,77,106,0.12); color: var(--red);   border: 1px solid rgba(255,77,106,0.3); }
+.status-badge { display: inline-block; padding: 2px 8px; border-radius: 2px; font-size: 10px; font-weight: 600; letter-spacing: 0.5px; }
+.status-badge.pending      { background: rgba(61,159,255,0.1);  color: var(--blue);   border: 1px solid rgba(61,159,255,0.25); }
+.status-badge.hit_tp       { background: rgba(0,208,132,0.1);   color: var(--green);  border: 1px solid rgba(0,208,132,0.25); }
+.status-badge.hit_sl       { background: rgba(255,77,106,0.1);  color: var(--red);    border: 1px solid rgba(255,77,106,0.25); }
+.status-badge.triggered    { background: rgba(251,146,60,0.1);  color: var(--orange); border: 1px solid rgba(251,146,60,0.25); }
+.status-badge.entry_missed { background: rgba(77,96,112,0.1);   color: var(--muted);  border: 1px solid var(--border2); }
+.status-badge.expired      { background: rgba(77,96,112,0.1);   color: var(--muted);  border: 1px solid var(--border2); }
+.status-badge.planned      { background: rgba(167,139,250,0.1); color: var(--purple); border: 1px solid rgba(167,139,250,0.25); }
+.status-badge.observation  { background: rgba(245,197,24,0.1);  color: var(--yellow); border: 1px solid rgba(245,197,24,0.25); }
+.gate-pill {
+  display: inline-block; padding: 2px 8px; border-radius: 2px; font-size: 10px;
+  background: rgba(245,197,24,0.08); color: var(--yellow); border: 1px solid rgba(245,197,24,0.2);
+}
+.strat-pill { display: inline-block; padding: 2px 7px; border-radius: 2px; font-size: 9px; letter-spacing: 0.5px; }
+.strat-pill.rev  { background: rgba(34,211,238,0.08); color: var(--teal);   border: 1px solid rgba(34,211,238,0.2); }
+.strat-pill.cont { background: rgba(167,139,250,0.08);color: var(--purple); border: 1px solid rgba(167,139,250,0.2); }
+.strat-pill.htf  { background: rgba(61,159,255,0.08); color: var(--blue);   border: 1px solid rgba(61,159,255,0.2); }
+
+/* PROB BAR */
+.prob-cell { display: flex; align-items: center; gap: 6px; }
+.prob-track { width: 50px; height: 3px; background: var(--bg3); border-radius: 2px; flex-shrink: 0; }
+.prob-fill  { height: 100%; border-radius: 2px; transition: width 0.3s; }
+.prob-num   { font-size: 11px; min-width: 36px; text-align: right; }
+
+/* FUNNEL TAB */
+.funnel-grid { display: grid; grid-template-columns: repeat(2,1fr); }
+@media(max-width:600px){ .funnel-grid { grid-template-columns: 1fr; } }
+.funnel-card { border-right: 1px solid var(--border); border-bottom: 1px solid var(--border); padding: 14px 16px; }
+.funnel-card:nth-child(even) { border-right: none; }
+.fc-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.fc-sym { font-family: var(--sans); font-size: 13px; font-weight: 700; color: var(--text); }
+.fc-price { font-size: 10px; color: var(--muted); }
+.funnel-steps { display: flex; flex-direction: column; gap: 4px; }
+.fstep {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 10px; padding: 4px 8px; border-radius: 3px;
+}
+.fstep.pass { background: rgba(0,208,132,0.06); }
+.fstep.fail { background: rgba(255,77,106,0.06); }
+.fstep.warn { background: rgba(245,197,24,0.06); }
+.fstep.info { background: rgba(61,159,255,0.06); }
+.fstep-num { font-size: 9px; color: var(--muted); min-width: 14px; }
+.fstep-label { color: var(--muted); flex: 1; }
+.fstep-val { color: var(--text); font-weight: 500; text-align: right; }
+.fstep-reason { color: var(--red); font-size: 9px; text-align: right; }
+.rej-pills { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+.rej-pill { font-size: 9px; padding: 2px 7px; border-radius: 2px; background: var(--bg3); }
+.rej-pill.dist { color: var(--blue);   border: 1px solid rgba(61,159,255,0.3); }
+.rej-pill.dir  { color: var(--red);    border: 1px solid rgba(255,77,106,0.3); }
+.rej-pill.prob { color: var(--yellow); border: 1px solid rgba(245,197,24,0.3); }
+.rej-pill.rr   { color: var(--teal);   border: 1px solid rgba(34,211,238,0.3); }
+.rej-pill.conf { color: var(--purple); border: 1px solid rgba(167,139,250,0.3); }
+.cycle-bar {
+  display: flex; align-items: center; gap: 12px;
+  padding: 8px 24px; background: var(--bg1);
+  border-bottom: 1px solid var(--border); font-size: 11px; color: var(--muted);
+}
+.cycle-num { font-family: var(--sans); font-size: 13px; font-weight: 700; color: var(--text); }
+.cycle-next { margin-left: auto; }
+
+/* OUTCOMES */
+.outcomes-header { display: grid; grid-template-columns: repeat(4, 1fr); border-bottom: 1px solid var(--border); }
+@media (max-width:600px) { .outcomes-header { grid-template-columns: repeat(2,1fr); } }
+.oc-cell { padding: 20px 24px; border-right: 1px solid var(--border); }
+.oc-cell:last-child { border-right: none; }
+.oc-label { font-size: 9px; color: var(--muted); letter-spacing: 1.2px; text-transform: uppercase; margin-bottom: 8px; }
+.oc-value { font-family: var(--sans); font-size: 32px; font-weight: 800; line-height: 1; }
+.oc-sub   { font-size: 10px; color: var(--muted); margin-top: 4px; }
+.donut-row { display: flex; align-items: center; gap: 14px; margin-top: 14px; }
+.donut-legend { font-size: 11px; }
+.dl-row { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; color: var(--muted); }
+.dl-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.how-box {
+  margin: 0; padding: 16px 24px;
+  background: var(--bg1); border-bottom: 1px solid var(--border);
+  font-size: 11px; color: var(--muted); line-height: 2;
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(260px,1fr)); gap: 4px 32px;
+}
+.how-box span { color: var(--text); font-weight: 500; }
+
+/* EMPTY */
+.empty { text-align: center; padding: 60px 20px; color: var(--muted); }
+.empty-icon { font-size: 32px; margin-bottom: 12px; opacity: 0.4; }
+.empty-title { font-family: var(--sans); font-size: 15px; font-weight: 600; color: var(--dim); margin-bottom: 6px; }
+.empty-sub { font-size: 11px; max-width: 360px; margin: 0 auto; line-height: 1.6; }
+
+.section-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 24px; background: var(--bg1); border-bottom: 1px solid var(--border);
+}
+.section-title { font-size: 10px; color: var(--muted); letter-spacing: 1px; text-transform: uppercase; }
+.section-note  { font-size: 10px; color: var(--muted); }
+</style>
 </head>
 <body>
 
-  <!-- ── Top bar ─────────────────────────────────────────────────────────── -->
-  <header class="topbar">
-    <div class="topbar-left">
-      <span class="logo">Forex<strong>ML</strong></span>
-      <div id="pair-tags"></div>
+<!-- HEADER -->
+<div class="header">
+  <div class="header-left">
+    <div class="logo">ML<span>SIGNAL</span> TERMINAL <span style="font-size:11px;color:var(--muted)">V8</span></div>
+    <div class="session-pill">
+      <div class="session-dot"></div>
+      <span id="session-name">DETECTING…</span>
     </div>
-    <div class="topbar-right">
-      <span id="server-status" class="status-dot unknown" title="Server status"></span>
-      <span id="last-updated" class="muted">—</span>
-      <button id="btn-refresh" onclick="fetchAll()">↻ Refresh</button>
-      <span id="clock" class="muted"></span>
+  </div>
+  <div class="header-right">
+    <div id="clock">--:--:-- UTC</div>
+    <button class="btn" onclick="fetchAll()">⟳ REFRESH</button>
+    <div id="conn-status">CONNECTING…</div>
+  </div>
+</div>
+
+<!-- PAIR TICKER -->
+<div class="ticker-bar" id="ticker-bar">
+  <div class="ticker-item"><span class="ticker-sym">EUR/USD</span><div class="ticker-data"><span class="ticker-trend trend-neut">—</span><span class="ticker-atr">ATR —</span></div></div>
+  <div class="ticker-item"><span class="ticker-sym">GBP/USD</span><div class="ticker-data"><span class="ticker-trend trend-neut">—</span><span class="ticker-atr">ATR —</span></div></div>
+  <div class="ticker-item"><span class="ticker-sym">USD/JPY</span><div class="ticker-data"><span class="ticker-trend trend-neut">—</span><span class="ticker-atr">ATR —</span></div></div>
+  <div class="ticker-item"><span class="ticker-sym">XAU/USD</span><div class="ticker-data"><span class="ticker-trend trend-neut">—</span><span class="ticker-atr">ATR —</span></div></div>
+</div>
+
+<!-- D1 ZONE BAR -->
+<div class="d1-bar">
+  <div>
+    <div class="d1-label">D1 Zone</div>
+    <div id="d1-badge" class="d1-badge unknown">UNKNOWN</div>
+  </div>
+  <div class="d1-pos-text">Position: <b id="d1-pos">—</b></div>
+  <div style="flex:1;max-width:280px">
+    <div class="d1-track">
+      <div class="d1-fill" id="d1-fill" style="width:50%"></div>
+      <div class="d1-cursor" id="d1-cursor" style="left:50%"></div>
     </div>
-  </header>
+    <div class="d1-range-labels">
+      <span>DISCOUNT &lt;40%</span><span>EQUILIBRIUM</span><span>PREMIUM &gt;60%</span>
+    </div>
+  </div>
+  <div id="conn-updated" style="font-size:10px;color:var(--muted);margin-left:auto"></div>
+</div>
 
-  <!-- ── Main ────────────────────────────────────────────────────────────── -->
-  <main class="main">
+<!-- STAT GRID -->
+<div class="stat-grid">
+  <div class="stat-cell"><div class="sc-label">Live Signals</div><div class="sc-value c-green" id="s-live">—</div><div class="sc-sub">gates passed</div></div>
+  <div class="stat-cell"><div class="sc-label">Observation</div><div class="sc-value c-yellow" id="s-obs">—</div><div class="sc-sub">gate-blocked</div></div>
+  <div class="stat-cell"><div class="sc-label">Win Rate</div><div class="sc-value c-blue" id="s-wr">—</div><div class="sc-sub" id="s-wr-sub">triggered only</div></div>
+  <div class="stat-cell"><div class="sc-label">Triggered</div><div class="sc-value c-orange" id="s-triggered">—</div><div class="sc-sub" id="s-tp-sl">TP / SL</div></div>
+  <div class="stat-cell"><div class="sc-label">Avg Prob</div><div class="sc-value c-purple" id="s-prob">—</div><div class="sc-sub">model confidence</div></div>
+  <div class="stat-cell"><div class="sc-label">Avg R:R</div><div class="sc-value c-teal" id="s-rr">—</div><div class="sc-sub" id="s-bestrr">best —</div></div>
+  <div class="stat-cell"><div class="sc-label">Entry Missed</div><div class="sc-value c-red" id="s-missed">—</div><div class="sc-sub">never filled</div></div>
+  <div class="stat-cell"><div class="sc-label">H4 Bias</div><div class="sc-value" id="s-h4" style="font-size:14px;padding-top:4px">—</div><div class="sc-sub" id="s-d1trend">D1: —</div></div>
+</div>
 
-    <!-- Metric cards -->
-    <section class="metrics" id="metrics-row"></section>
+<!-- TABS -->
+<div class="tabs">
+  <button class="tab-btn active" onclick="switchTab('real')" id="tab-real">✦ Real Signals <span class="tab-count live" id="tc-real">0</span></button>
+  <button class="tab-btn" onclick="switchTab('obs')" id="tab-obs">◎ Observation <span class="tab-count obs" id="tc-obs">0</span></button>
+  <button class="tab-btn" onclick="switchTab('funnel')" id="tab-funnel">⬡ Funnel</button>
+  <button class="tab-btn" onclick="switchTab('outcomes')" id="tab-outcomes">◈ Outcomes</button>
+</div>
 
-    <!-- Strategy breakdown mini-bar -->
-    <section class="strat-bar-wrap">
-      <div class="section-label">Strategy distribution</div>
-      <div id="strat-bar"></div>
-    </section>
+<!-- REAL SIGNALS TAB -->
+<div class="tab-panel active" id="panel-real">
+  <div class="section-header">
+    <div class="section-title">Signals that passed ALL gates — 4H bias · D1 zone · probability ≥ 65%</div>
+    <div class="section-note" id="real-note">—</div>
+  </div>
+  <div class="table-wrap">
+    <table class="tbl">
+      <thead><tr>
+        <th>Date</th><th>Time UTC</th><th>Symbol</th><th>Strategy</th>
+        <th>Dir</th><th>Entry</th><th>SL</th><th>TP</th>
+        <th>Risk p</th><th>R:R</th><th>Probability</th>
+        <th>Confluence</th><th>H4 Trend</th><th>Status</th>
+      </tr></thead>
+      <tbody id="tbody-real">
+        <tr><td colspan="14"><div class="empty"><div class="empty-icon">⏳</div><div class="empty-title">Waiting for signals</div><div class="empty-sub">System is scanning. First signals appear during London open (10:00 EAT) and London/NY overlap (15:00–19:00 EAT).</div></div></td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
 
-    <!-- Signals table -->
-    <section>
-      <div class="section-header">
-        <span class="section-label">Live Signals</span>
-        <div class="filters">
-          <select id="f-strategy" onchange="renderSignals()">
-            <option value="">All strategies</option>
-            <option value="HTF_SMC">HTF_SMC</option>
-            <option value="REVERSION">REVERSION</option>
-            <option value="CONTINUATION">CONTINUATION</option>
-          </select>
-          <select id="f-status" onchange="renderSignals()">
-            <option value="">All statuses</option>
-            <option value="hit_tp">Hit TP</option>
-            <option value="hit_sl">Hit SL</option>
-            <option value="active">Active</option>
-          </select>
-          <select id="f-dir" onchange="renderSignals()">
-            <option value="">All directions</option>
-            <option value="BUY">BUY</option>
-            <option value="SELL">SELL</option>
-          </select>
-          <select id="f-tf" onchange="renderSignals()">
-            <option value="">All timeframes</option>
-            <option value="15min">15min</option>
-            <option value="1h">1h</option>
-          </select>
+<!-- OBSERVATION TAB -->
+<div class="tab-panel" id="panel-obs">
+  <div class="section-header">
+    <div class="section-title">Gate-blocked zones — for study only, not traded</div>
+    <div class="section-note" style="color:var(--yellow)">4H bias or D1 zone gate blocked these</div>
+  </div>
+  <div class="table-wrap">
+    <table class="tbl">
+      <thead><tr>
+        <th>Date</th><th>Time UTC</th><th>Symbol</th><th>Strategy</th>
+        <th>Dir</th><th>Entry</th><th>SL</th><th>TP est</th>
+        <th>Risk p</th><th>Strength</th><th>Confluence</th>
+        <th>H4 Trend</th><th>D1 Zone</th><th>Gate Blocked By</th>
+      </tr></thead>
+      <tbody id="tbody-obs">
+        <tr><td colspan="14"><div class="empty"><div class="empty-icon">◎</div><div class="empty-title">No observation signals yet</div><div class="empty-sub">Gate-blocked zones appear here as the system runs through cycles.</div></div></td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- FUNNEL TAB -->
+<div class="tab-panel" id="panel-funnel">
+  <div class="cycle-bar">
+    <span style="font-size:10px;color:var(--muted);letter-spacing:.5px">CYCLE</span>
+    <span class="cycle-num" id="f-cycle">#—</span>
+    <span id="f-cycle-time" style="color:var(--muted);font-size:11px">—</span>
+    <span class="cycle-next" id="f-next" style="font-size:10px;color:var(--muted)">Next: —</span>
+  </div>
+  <div class="how-box">
+    <div><span>HTF filter</span> — 4H OBs/FVGs checked vs 1H trend; direction conflict = reject</div>
+    <div><span>Bias filter</span> — bullish bias blocks SELL zones; bearish blocks BUY zones</div>
+    <div><span>Prob filter</span> — XGB · RF · LR ensemble, threshold ≥ 65%</div>
+    <div><span>15min zones</span> — tracked but not ML-scored (model not trained on 15min TF)</div>
+  </div>
+  <div class="funnel-grid" id="funnel-grid">
+    <div style="grid-column:1/-1;padding:40px;text-align:center;color:var(--muted)">Funnel data loads from /api/funnel or /api/signals</div>
+  </div>
+</div>
+
+<!-- OUTCOMES TAB -->
+<div class="tab-panel" id="panel-outcomes">
+  <div class="outcomes-header">
+    <div class="oc-cell">
+      <div class="oc-label">Win Rate</div>
+      <div class="oc-value c-green" id="oc-wr">—</div>
+      <div class="oc-sub">TP / (TP + SL)</div>
+      <div id="donut-box" class="donut-row"></div>
+    </div>
+    <div class="oc-cell">
+      <div class="oc-label">Total Resolved</div>
+      <div class="oc-value c-blue" id="oc-resolved">—</div>
+      <div class="oc-sub" id="oc-resolved-sub">TP wins + SL losses</div>
+    </div>
+    <div class="oc-cell">
+      <div class="oc-label">Still Pending</div>
+      <div class="oc-value c-orange" id="oc-pending">—</div>
+      <div class="oc-sub">entry not triggered yet</div>
+    </div>
+    <div class="oc-cell">
+      <div class="oc-label">Entry Missed</div>
+      <div class="oc-value c-red" id="oc-missed">—</div>
+      <div class="oc-sub">price never reached entry</div>
+    </div>
+  </div>
+  <div class="how-box">
+    <div>✅ <span>HIT_TP</span> — entry touched → TP reached, SL not hit first</div>
+    <div>❌ <span>HIT_SL</span> — entry touched → SL hit (same bar = SL wins)</div>
+    <div>⏳ <span>TRIGGERED</span> — entry touched, trade still live</div>
+    <div>🔵 <span>PENDING</span> — signal fired, entry zone not yet touched</div>
+    <div>⚫ <span>ENTRY_MISSED</span> — expired before entry touched (excluded from win rate)</div>
+    <div><span>Win rate denominator</span> = TP + SL only — entry_missed excluded</div>
+  </div>
+  <div class="table-wrap">
+    <table class="tbl">
+      <thead><tr>
+        <th>Date</th><th>Time UTC</th><th>Symbol</th><th>Dir</th>
+        <th>Entry</th><th>SL</th><th>TP</th><th>R:R</th>
+        <th>Prob</th><th>Status</th>
+        <th>Bars→Entry</th><th>Bars→Exit</th><th>Resolved</th>
+      </tr></thead>
+      <tbody id="tbody-outcomes">
+        <tr><td colspan="13" style="text-align:center;padding:40px;color:var(--muted)">No resolved signals yet.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const f5 = n => (parseFloat(n)||0).toFixed(5);
+const f2 = n => (parseFloat(n)||0).toFixed(2);
+
+const PAIRS = ['EUR/USD','GBP/USD','USD/JPY','XAU/USD'];
+
+function probColor(p) {
+  if (p >= 80) return 'var(--green)';
+  if (p >= 70) return 'var(--teal)';
+  if (p >= 65) return 'var(--blue)';
+  if (p >= 55) return 'var(--yellow)';
+  return 'var(--red)';
+}
+function trendColor(t) {
+  if (!t) return 'var(--muted)';
+  t = t.toLowerCase();
+  if (t === 'bullish') return 'var(--green)';
+  if (t === 'bearish') return 'var(--red)';
+  return 'var(--yellow)';
+}
+function trendLabel(t) {
+  if (!t || t === '—') return '—';
+  const m = t.toLowerCase();
+  return m === 'bullish' ? '▲ BULL' : m === 'bearish' ? '▼ BEAR' : '— NEUT';
+}
+function gateLabel(r) {
+  const m = {
+    '4h_bias_bullish_blocks_supply': '4H BULL → NO SHORT',
+    '4h_bias_bearish_blocks_demand': '4H BEAR → NO LONG',
+    'd1_premium_blocks_demand':      'D1 PREM → NO LONG',
+    'd1_discount_blocks_supply':     'D1 DISC → NO SHORT',
+  };
+  return m[r] || (r || '—').toUpperCase();
+}
+function parseTS(ts) {
+  if (!ts) return { date:'—', time:'—' };
+  const s = ts.replace(' UTC','').trim();
+  if (s.includes(' ') && s.split(' ')[0].includes('-')) {
+    const [d,t] = s.split(' ');
+    return { date:d, time:t };
+  }
+  return { date:'—', time:s };
+}
+function stratPill(s) {
+  if (!s) return '';
+  const sl = s.toLowerCase();
+  if (sl.includes('cont')) return `<span class="strat-pill cont">CONT</span>`;
+  if (sl.includes('rev'))  return `<span class="strat-pill rev">REV</span>`;
+  if (sl.includes('htf'))  return `<span class="strat-pill htf">HTF</span>`;
+  return `<span class="strat-pill rev">${s.slice(0,4).toUpperCase()}</span>`;
+}
+
+// Clock & session
+function updateClock() {
+  const n = new Date(), p = x => String(x).padStart(2,'0');
+  $('clock').textContent = `${n.getUTCFullYear()}-${p(n.getUTCMonth()+1)}-${p(n.getUTCDate())} ${p(n.getUTCHours())}:${p(n.getUTCMinutes())}:${p(n.getUTCSeconds())} UTC`;
+  const h = n.getUTCHours();
+  let sess = 'CLOSED', col = 'var(--muted)';
+  if (h >= 22 || h < 2)       { sess = 'SYDNEY';   col = 'var(--purple)'; }
+  else if (h >= 2 && h < 7)   { sess = 'TOKYO';    col = 'var(--blue)'; }
+  else if (h >= 7 && h < 12)  { sess = 'LONDON';   col = 'var(--green)'; }
+  else if (h >= 12 && h < 17) { sess = 'LON/NY';   col = 'var(--teal)'; }
+  else if (h >= 17 && h < 22) { sess = 'NEW YORK'; col = 'var(--orange)'; }
+  $('session-name').textContent = sess;
+  $('session-name').style.color = col;
+  document.querySelector('.session-dot').style.background = col;
+}
+setInterval(updateClock, 1000);
+updateClock();
+
+function switchTab(name) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  $(`tab-${name}`).classList.add('active');
+  $(`panel-${name}`).classList.add('active');
+}
+
+function renderTicker(signals) {
+  const bar = $('ticker-bar');
+  bar.innerHTML = PAIRS.map(sym => {
+    const sigs = signals.filter(s => s.symbol === sym);
+    const last = sigs[sigs.length - 1];
+    const trend = last?.h4_trend || last?.htf_trend || '—';
+    const tClass = trend === 'bullish' ? 'trend-bull' : trend === 'bearish' ? 'trend-bear' : 'trend-neut';
+    const tLabel = trend === 'bullish' ? '▲ BULLISH' : trend === 'bearish' ? '▼ BEARISH' : '— NEUTRAL';
+    const atr = last?.atr || '—';
+    const price = last?.current_price || last?.entry || '—';
+    return `<div class="ticker-item">
+      <span class="ticker-sym">${sym}</span>
+      <div class="ticker-data">
+        <span class="ticker-trend ${tClass}">${tLabel}</span>
+        <span class="ticker-atr">ATR ${atr} | ${price}</span>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function renderD1(stats) {
+  const zone = stats.d1_zone || 'unknown';
+  const pos  = stats.d1_position;
+  const labels = { premium:'🔴 PREMIUM', discount:'🟢 DISCOUNT', equilibrium:'🟡 EQUILIBRIUM', unknown:'UNKNOWN' };
+  const badge = $('d1-badge');
+  badge.className = `d1-badge ${zone}`;
+  badge.textContent = labels[zone] || zone.toUpperCase();
+  $('d1-pos').textContent = pos != null ? (pos*100).toFixed(1)+'%' : '—';
+  if (pos != null) {
+    const pct = Math.min(100, Math.max(0, pos*100));
+    $('d1-fill').style.width = pct+'%';
+    $('d1-cursor').style.left = pct+'%';
+  }
+}
+
+function renderStats(stats, sigResp) {
+  $('s-live').textContent      = sigResp.live ?? stats.signals_live ?? '—';
+  $('s-obs').textContent       = sigResp.observation ?? stats.observation_count ?? '—';
+  $('s-wr').textContent        = stats.win_rate != null ? stats.win_rate+'%' : '—';
+  $('s-triggered').textContent = stats.triggered_total ?? '—';
+  $('s-tp-sl').textContent     = `${stats.win_count??0} TP / ${stats.loss_count??0} SL`;
+  $('s-prob').textContent      = stats.avg_probability ? stats.avg_probability+'%' : '—';
+  $('s-rr').textContent        = stats.avg_rr ?? '—';
+  $('s-bestrr').textContent    = 'best ' + (stats.best_rr ?? '—');
+  $('s-missed').textContent    = stats.entry_missed ?? '—';
+  $('tc-real').textContent     = sigResp.live ?? '0';
+  $('tc-obs').textContent      = sigResp.observation ?? '0';
+  const allSigs = window._allSignals || [];
+  const last = allSigs.find(s => s.h4_trend || s.htf_trend);
+  const h4 = last?.h4_trend || last?.htf_trend || '—';
+  const d1 = last?.d1_trend || '—';
+  const h4el = $('s-h4');
+  h4el.textContent = h4.toUpperCase();
+  h4el.style.color = trendColor(h4);
+  $('s-d1trend').textContent = 'D1: ' + d1.toUpperCase();
+  $('conn-status').textContent = '● LIVE';
+  $('conn-status').style.color = 'var(--green)';
+  $('conn-updated').textContent = stats.updated ? 'Updated ' + stats.updated.replace('UTC','').trim() + ' UTC' : '';
+  renderD1(stats);
+}
+
+function renderReal(signals) {
+  const real = signals.filter(s => s.signal_type === 'real' || (!s.signal_type && s.status !== 'observation'));
+  const tbody = $('tbody-real');
+  $('real-note').textContent = `${real.length} signal${real.length!==1?'s':''}`;
+  if (!real.length) {
+    tbody.innerHTML = `<tr><td colspan="14"><div class="empty"><div class="empty-icon">⏳</div><div class="empty-title">No real signals yet</div><div class="empty-sub">System is scanning all 4 pairs. Best signal window is 08:00–12:00 UTC (London) and 13:00–17:00 UTC (NY overlap).</div></div></td></tr>`;
+    return;
+  }
+  tbody.innerHTML = real.map(s => {
+    const dt = parseTS(s.timestamp);
+    const dir = (s.direction||'').toLowerCase();
+    const prob = parseFloat(s.probability||0);
+    const status = s.status || 'pending';
+    const pct = Math.min(100, prob);
+    return `<tr class="row-${dir}">
+      <td style="color:var(--muted)">${dt.date}</td>
+      <td style="color:var(--muted)">${dt.time}</td>
+      <td><b style="font-family:var(--sans);font-size:12px">${s.symbol||'—'}</b></td>
+      <td>${stratPill(s.strategy)}</td>
+      <td><span class="dir-badge ${dir}">${s.direction||'—'}</span></td>
+      <td>${f5(s.entry)}</td>
+      <td style="color:var(--red)">${f5(s.sl)}</td>
+      <td style="color:var(--green)">${f5(s.tp)}</td>
+      <td style="color:var(--muted)">${s.risk_pips??'—'}</td>
+      <td style="color:var(--blue)">${s.rr||s.risk_reward||'—'}</td>
+      <td>
+        <div class="prob-cell">
+          <div class="prob-track"><div class="prob-fill" style="width:${pct}%;background:${probColor(prob)}"></div></div>
+          <span class="prob-num" style="color:${probColor(prob)}">${prob.toFixed(1)}%</span>
+        </div>
+      </td>
+      <td style="color:var(--muted)">${s.confluence_score??'—'}/10</td>
+      <td style="color:${trendColor(s.h4_trend)}">${trendLabel(s.h4_trend)}</td>
+      <td><span class="status-badge ${status}">${status.toUpperCase().replace('_',' ')}</span></td>
+    </tr>`;
+  }).join('');
+}
+
+function renderObs(obs) {
+  const tbody = $('tbody-obs');
+  if (!obs.length) {
+    tbody.innerHTML = `<tr><td colspan="14"><div class="empty"><div class="empty-icon">◎</div><div class="empty-title">No observation signals yet</div><div class="empty-sub">Gate-blocked zones will appear here as the system runs through cycles.</div></div></td></tr>`;
+    return;
+  }
+  tbody.innerHTML = obs.map(s => {
+    const dt = parseTS(s.timestamp);
+    const dir = (s.direction||'').toLowerCase();
+    const d1z = s.d1_zone || 'unknown';
+    return `<tr class="row-${dir}">
+      <td style="color:var(--muted)">${dt.date}</td>
+      <td style="color:var(--muted)">${dt.time}</td>
+      <td><b style="font-family:var(--sans);font-size:12px">${s.symbol||'—'}</b></td>
+      <td>${stratPill(s.strategy)}</td>
+      <td><span class="dir-badge ${dir}">${s.direction||'—'}</span></td>
+      <td>${f5(s.entry)}</td>
+      <td style="color:var(--red)">${f5(s.sl)}</td>
+      <td style="color:var(--muted)">${f5(s.tp)}</td>
+      <td style="color:var(--muted)">${s.risk_pips??'—'}</td>
+      <td style="color:var(--muted)">${s.zone_strength??'—'}</td>
+      <td style="color:var(--muted)">${s.confluence_score??'—'}/10</td>
+      <td style="color:${trendColor(s.h4_trend)}">${trendLabel(s.h4_trend)}</td>
+      <td><span class="d1-badge ${d1z}" style="font-size:10px;padding:2px 8px">${d1z.toUpperCase()}</span></td>
+      <td><span class="gate-pill">${gateLabel(s.gate_blocked_by)}</span></td>
+    </tr>`;
+  }).join('');
+}
+
+function renderFunnel(signals, funnelData) {
+  // Try live funnel data first, fall back to signal-derived info
+  const cycleNum  = funnelData?.cycle ?? '—';
+  const cycleTime = funnelData?.cycle_time ?? '—';
+  const nextCycle = funnelData?.next_cycle ?? '—';
+  $('f-cycle').textContent     = cycleNum !== '—' ? '#' + cycleNum : '#—';
+  $('f-cycle-time').textContent = cycleTime;
+  $('f-next').textContent      = 'Next: ' + nextCycle;
+
+  const grid = $('funnel-grid');
+  if (!funnelData?.pairs && !signals.length) {
+    grid.innerHTML = `<div style="grid-column:1/-1;padding:40px;text-align:center;color:var(--muted)">No funnel data yet. Add /api/funnel endpoint to server.py to populate this tab.</div>`;
+    return;
+  }
+
+  const pairsData = funnelData?.pairs || {};
+  grid.innerHTML = PAIRS.map(sym => {
+    const pd = pairsData[sym] || pairsData[sym.replace('/','_')] || {};
+    const sigs = signals.filter(s => s.symbol === sym);
+    const last = sigs[sigs.length-1];
+    const trend = pd.h1_trend || last?.h4_trend || '—';
+    const price = pd.price || last?.entry || '—';
+    const atr   = pd.atr   || last?.atr   || '—';
+    const fvg4h = pd.fvg_4h ?? '—';
+    const ob4h  = pd.ob_4h  ?? '—';
+    const fvg1h = pd.fvg_1h ?? '—';
+    const ob1h  = pd.ob_1h  ?? '—';
+    const zones15m   = pd.zones_15m   ?? '—';
+    const htfBefore  = pd.htf_before  ?? 0;
+    const htfAfter   = pd.htf_after   ?? 0;
+    const obSkips    = pd.ob_skips    ?? 0;
+    const rj = pd.reject_reasons || {};
+    const tClass = trend==='bullish'?'trend-bull':trend==='bearish'?'trend-bear':'trend-neut';
+
+    const rejPills = [];
+    if (rj.dist)  rejPills.push(`<span class="rej-pill dist">dist: ${rj.dist}</span>`);
+    if (rj.dir)   rejPills.push(`<span class="rej-pill dir">dir: ${rj.dir}</span>`);
+    if (rj.prob)  rejPills.push(`<span class="rej-pill prob">prob: ${rj.prob}</span>`);
+    if (rj.rr)    rejPills.push(`<span class="rej-pill rr">rr: ${rj.rr}</span>`);
+    if (rj.conf)  rejPills.push(`<span class="rej-pill conf">conf: ${rj.conf}</span>`);
+
+    return `<div class="funnel-card">
+      <div class="fc-head">
+        <span class="fc-sym">${sym}</span>
+        <span class="ticker-trend ${tClass}" style="font-size:10px">${trend==='bullish'?'▲ bullish':trend==='bearish'?'▼ bearish':'— neutral'}</span>
+        <span class="fc-price">${price} | ATR ${atr}</span>
+      </div>
+      <div class="funnel-steps">
+        <div class="fstep pass">
+          <span class="fstep-num">①</span>
+          <span class="fstep-label">4H zones</span>
+          <span class="fstep-val">${fvg4h} FVG · ${ob4h} OB</span>
+        </div>
+        <div class="fstep pass">
+          <span class="fstep-num">②</span>
+          <span class="fstep-label">1H zones</span>
+          <span class="fstep-val">${fvg1h} FVG · ${ob1h} OB</span>
+        </div>
+        <div class="fstep pass">
+          <span class="fstep-num">③</span>
+          <span class="fstep-label">15m raw zones</span>
+          <span class="fstep-val">${zones15m} (tracking only)</span>
+        </div>
+        ${obSkips > 0 ? `<div class="fstep fail">
+          <span class="fstep-num">⛔</span>
+          <span class="fstep-label">OB skipped</span>
+          <span class="fstep-reason">${obSkips}× 1H trend opposite</span>
+        </div>` : ''}
+        <div class="fstep ${htfBefore > 0 ? 'pass' : 'fail'}">
+          <span class="fstep-num">④</span>
+          <span class="fstep-label">HTF before bias filter</span>
+          <span class="fstep-val">${htfBefore}</span>
+        </div>
+        <div class="fstep ${htfAfter > 0 ? 'pass' : 'fail'}">
+          <span class="fstep-num">⑤</span>
+          <span class="fstep-label">HTF after bias filter</span>
+          <span class="fstep-val">${htfAfter}</span>
+        </div>
+        <div class="fstep warn">
+          <span class="fstep-num">⑥</span>
+          <span class="fstep-label">15m ML score</span>
+          <span class="fstep-reason">${htfAfter > 0 ? 'scored' : 'no HTF signals → skipped'}</span>
         </div>
       </div>
-      <div class="card table-card">
-        <table class="tbl" id="signals-table">
-          <thead><tr>
-            <th>Time EAT</th><th>TF</th><th>Strategy</th><th>Dir</th>
-            <th>Entry</th><th>SL</th><th>TP</th>
-            <th>Risk</th><th>RR</th><th>Probability</th>
-            <th>Conf</th><th>5m ✓</th><th>CT</th><th>Status</th>
-          </tr></thead>
-          <tbody id="signals-tbody"></tbody>
-        </table>
-      </div>
-    </section>
+      ${rejPills.length ? `<div class="rej-pills">${rejPills.join('')}</div>` : ''}
+    </div>`;
+  }).join('');
+}
 
-    <!-- Charts -->
-    <div class="chart-grid">
-      <section>
-        <div class="section-label">Signal Probabilities</div>
-        <div class="card">
-          <div id="prob-legend" class="legend"></div>
-          <div class="chart-wrap" style="height:210px">
-            <canvas id="probChart" role="img" aria-label="Signal probabilities bar chart">Probabilities chart.</canvas>
-          </div>
-        </div>
-      </section>
-      <section>
-        <div class="section-label">Risk vs Reward (pips)</div>
-        <div class="card">
-          <div class="chart-wrap" style="height:210px">
-            <canvas id="rrChart" role="img" aria-label="Risk reward pips chart">RR chart.</canvas>
-          </div>
-        </div>
-      </section>
-    </div>
+function renderOutcomes(signals, stats) {
+  const wins   = stats.win_count   || 0;
+  const losses = stats.loss_count  || 0;
+  const total  = wins + losses;
+  $('oc-wr').textContent        = stats.win_rate != null ? stats.win_rate+'%' : '—';
+  $('oc-resolved').textContent  = stats.triggered_total ?? '—';
+  $('oc-resolved-sub').textContent = `${wins} TP wins + ${losses} SL losses`;
+  $('oc-pending').textContent   = stats.signals_active ?? '—';
+  $('oc-missed').textContent    = stats.entry_missed ?? '—';
+  if (total > 0) {
+    const r = 28, cx = 36, cy = 36, sw = 10;
+    const circ = 2*Math.PI*r;
+    const wDash = (wins/total)*circ;
+    $('donut-box').innerHTML = `
+      <svg width="72" height="72" viewBox="0 0 72 72">
+        <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="var(--bg3)" stroke-width="${sw}"/>
+        <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="var(--red)" stroke-width="${sw}"
+          stroke-dasharray="${circ}" stroke-dashoffset="0" transform="rotate(-90 ${cx} ${cy})"/>
+        <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="var(--green)" stroke-width="${sw}"
+          stroke-dasharray="${wDash} ${circ-wDash}" stroke-dashoffset="0" transform="rotate(-90 ${cx} ${cy})"/>
+        <text x="${cx}" y="${cy+5}" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="700" font-family="var(--sans)">${wins}/${total}</text>
+      </svg>
+      <div class="donut-legend">
+        <div class="dl-row"><div class="dl-dot" style="background:var(--green)"></div><span>${wins} TP (${total?Math.round(wins/total*100):0}%)</span></div>
+        <div class="dl-row"><div class="dl-dot" style="background:var(--red)"></div><span>${losses} SL (${total?Math.round(losses/total*100):0}%)</span></div>
+      </div>`;
+  }
+  const real = signals.filter(s => s.signal_type==='real'||(!s.signal_type&&s.status!=='observation'));
+  const order = ['hit_tp','hit_sl','triggered','pending','entry_missed','expired'];
+  const sorted = [...real].sort((a,b) => order.indexOf(a.status||'pending') - order.indexOf(b.status||'pending'));
+  const tbody = $('tbody-outcomes');
+  if (!sorted.length) {
+    tbody.innerHTML = `<tr><td colspan="13" style="text-align:center;padding:40px;color:var(--muted)">No resolved signals yet.</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = sorted.map(s => {
+    const dt = parseTS(s.timestamp);
+    const dir = (s.direction||'').toLowerCase();
+    const status = s.status||'pending';
+    const prob = parseFloat(s.probability||0);
+    return `<tr class="row-${dir}">
+      <td style="color:var(--muted)">${dt.date}</td>
+      <td style="color:var(--muted)">${dt.time}</td>
+      <td><b style="font-family:var(--sans);font-size:12px">${s.symbol||'—'}</b></td>
+      <td><span class="dir-badge ${dir}">${s.direction||'—'}</span></td>
+      <td>${f5(s.entry)}</td>
+      <td style="color:var(--red)">${f5(s.sl)}</td>
+      <td style="color:var(--green)">${f5(s.tp)}</td>
+      <td style="color:var(--blue)">${s.rr||s.risk_reward||'—'}</td>
+      <td style="color:${probColor(prob)}">${prob.toFixed(1)}%</td>
+      <td><span class="status-badge ${status}">${status.toUpperCase().replace('_',' ')}</span></td>
+      <td style="color:var(--muted);text-align:center">${s.bars_to_entry??'—'}</td>
+      <td style="color:var(--muted);text-align:center">${s.bars_to_exit??'—'}</td>
+      <td style="color:var(--muted)">${s.resolved_at?s.resolved_at.slice(0,10):'—'}</td>
+    </tr>`;
+  }).join('');
+}
 
-    <!-- Price Zone Map -->
-    <section>
-      <div class="section-label">Price Zone Map</div>
-      <div class="card zone-map-card">
-        <canvas id="zoneMap" role="img" aria-label="Price zone map with supply and demand zones"></canvas>
-        <div class="zone-map-legend">
-          <span class="zml supply">Supply / Cont</span>
-          <span class="zml demand">Demand / Cont</span>
-          <span class="zml rev-supply">Supply / Rev</span>
-          <span class="zml rev-demand">Demand / Rev</span>
-          <span class="zml entry-sell">SELL entry</span>
-          <span class="zml entry-buy">BUY entry</span>
-        </div>
-      </div>
-    </section>
+async function fetchAll() {
+  $('conn-status').textContent = '● SYNCING…';
+  $('conn-status').style.color = 'var(--yellow)';
+  try {
+    const [sigResp, obsResp, statsResp, funnelResp] = await Promise.all([
+      fetch('/api/signals').then(r=>r.json()).catch(()=>({data:[],live:0,observation:0})),
+      fetch('/api/observation_signals').then(r=>r.json()).catch(()=>({data:[]})),
+      fetch('/api/stats').then(r=>r.json()).catch(()=>({})),
+      fetch('/api/funnel').then(r=>r.json()).catch(()=>({})),
+    ]);
+    const allSignals = sigResp.data || [];
+    window._allSignals = allSignals;
+    renderStats(statsResp, sigResp);
+    renderTicker(allSignals);
+    renderReal(allSignals);
+    renderObs(obsResp.data || []);
+    renderFunnel(allSignals, funnelResp);
+    renderOutcomes(allSignals, statsResp);
+  } catch(err) {
+    console.error('Fetch error:', err);
+    $('conn-status').textContent = '● ERROR';
+    $('conn-status').style.color = 'var(--red)';
+  }
+}
 
-    <!-- Zones side-by-side -->
-    <div class="two-col">
-      <section>
-        <div class="section-label">Continuation Zones</div>
-        <div class="card" id="cont-zones"></div>
-      </section>
-      <section>
-        <div class="section-label">Reversion Zones</div>
-        <div class="card" id="rev-zones"></div>
-      </section>
-    </div>
-
-    <!-- Daily plan -->
-    <section>
-      <div class="section-header">
-        <span class="section-label">Daily Plan</span>
-        <span id="daily-updated" class="muted" style="font-size:11px"></span>
-      </div>
-      <div class="card" id="daily-plan"></div>
-    </section>
-
-  </main>
-
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-  <script src="/static/js/app.js"></script>
+fetchAll();
+setInterval(fetchAll, 60000);
+</script>
 </body>
 </html>

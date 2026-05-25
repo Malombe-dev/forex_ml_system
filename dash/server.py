@@ -1,16 +1,8 @@
 #!/usr/bin/env python3
 """
-Dashboard API Server — fixed
-============================
-Key fixes vs previous version:
-  FIX-1  /api/signals now merges all_signals.json + daily_plan.json so the
-         dashboard always has data even when the live cycle hasn't fired yet.
-  FIX-2  /api/stats win rate counts only triggered trades (hit_tp + hit_sl),
-         not expired/entry_missed which inflate the denominator.
-  FIX-3  /api/zones/<strategy>/<symbol> route order fixed to match app.js calls
-         (/api/zones/cont/EUR_USD  not /api/zones/EUR_USD/cont).
-  FIX-4  /api/status endpoint added so app.js setStatus() doesn't 404.
-  FIX-5  outcome_tracker_v2 import error surfaced clearly in /api/health.
+Dashboard API Server — V8
+=========================
+Adds /api/funnel endpoint so the Funnel tab in index.html gets live data.
 
 Usage:
     cd ~/Desktop/forex_ml_system/forex_ml_system
@@ -54,16 +46,13 @@ def _sig(filename: str) -> Path:
 
 def _merge_signals():
     """
-    FIX-1: Return live signals + daily plan entries as one unified list.
+    Return live signals + daily plan entries as one unified list.
     Live signals (all_signals.json) take priority — daily plan entries are
     added only if no matching entry/direction already exists in live signals.
-    Each daily plan entry is tagged with source='daily_plan' so the frontend
-    can style them differently if needed.
     """
-    live    = _read(_sig("all_signals.json")) or []
-    plan    = _read(_sig("daily_plan.json"))  or []
+    live = _read(_sig("all_signals.json")) or []
+    plan = _read(_sig("daily_plan.json"))  or []
 
-    # Build a set of (direction, entry) keys already in live signals
     live_keys = {
         (s.get("direction"), round(float(s.get("entry", 0)), 5))
         for s in live
@@ -74,11 +63,15 @@ def _merge_signals():
         key = (p.get("direction"), round(float(p.get("entry", 0)), 5))
         if key not in live_keys:
             p = dict(p)
-            p.setdefault("status", "planned")   # not yet active
+            p.setdefault("status", "planned")
             p["source"] = "daily_plan"
             merged.append(p)
 
     return merged
+
+
+def _observation_signals():
+    return _read(_sig("observation_signals.json")) or []
 
 
 # ── static ────────────────────────────────────────────────────────────────────
@@ -92,16 +85,17 @@ def static_files(fname):
     return send_from_directory(BASE_DIR / "static", fname)
 
 
-# ── /api/signals ─────────────────────────────────────────────────────────────
+# ── /api/signals ──────────────────────────────────────────────────────────────
 @app.route("/api/signals")
 def api_signals():
     data = _merge_signals()
     return jsonify({
-        "data":    data,
-        "count":   len(data),
-        "live":    len(_read(_sig("all_signals.json")) or []),
-        "planned": len(_read(_sig("daily_plan.json"))  or []),
-        "updated": _mtime(_sig("all_signals.json")) or _mtime(_sig("daily_plan.json")),
+        "data":        data,
+        "count":       len(data),
+        "live":        len(_read(_sig("all_signals.json")) or []),
+        "planned":     len(_read(_sig("daily_plan.json"))  or []),
+        "observation": len(_observation_signals()),
+        "updated":     _mtime(_sig("all_signals.json")) or _mtime(_sig("daily_plan.json")),
     })
 
 
@@ -123,6 +117,17 @@ def api_weekly_plan():
     return jsonify({"data": data, "updated": _mtime(_sig("weekly_plan.json"))})
 
 
+# ── /api/observation_signals ──────────────────────────────────────────────────
+@app.route("/api/observation_signals")
+def api_observation_signals():
+    data = _observation_signals()
+    return jsonify({
+        "data":    data,
+        "count":   len(data),
+        "updated": _mtime(_sig("observation_signals.json")),
+    })
+
+
 # ── /api/zones ────────────────────────────────────────────────────────────────
 @app.route("/api/zones")
 def api_zones():
@@ -138,8 +143,6 @@ def api_zones():
     return jsonify(result)
 
 
-# FIX-3: route order matches what app.js actually calls
-# app.js calls: /api/zones/cont/EUR_USD and /api/zones/rev/EUR_USD
 @app.route("/api/zones/<strategy>/<symbol>")
 def api_zones_specific(strategy, symbol):
     filename = f"zones_{symbol}_{strategy}.json"
@@ -150,13 +153,60 @@ def api_zones_specific(strategy, symbol):
     return jsonify({"data": data, "count": len(data), "updated": _mtime(path)})
 
 
-# ── /api/zones_state ─────────────────────────────────────────────────────────
+# ── /api/zones_state ──────────────────────────────────────────────────────────
 @app.route("/api/zones_state")
 def api_zones_state():
     data = _read(_sig("zones_state.json"))
     if data is None:
         return jsonify({"error": "zones_state.json not found", "data": {}}), 404
     return jsonify({"data": data, "updated": _mtime(_sig("zones_state.json"))})
+
+
+# ── /api/funnel ───────────────────────────────────────────────────────────────
+@app.route("/api/funnel")
+def api_funnel():
+    """
+    Reads funnel_state.json written by production_predictor.py each cycle.
+
+    Expected shape of funnel_state.json:
+    {
+      "cycle": 1,
+      "cycle_time": "2026-05-25 07:07:22 UTC",
+      "next_cycle":  "2026-05-25 07:22:22 UTC",
+      "pairs": {
+        "EUR/USD": {
+          "h1_trend": "bullish",
+          "price":    "1.16414",
+          "atr":      "0.00054",
+          "fvg_4h": 2,  "ob_4h": 8,
+          "fvg_1h": 0,  "ob_1h": 8,
+          "zones_15m":  6,
+          "htf_before": 0,
+          "htf_after":  0,
+          "ob_skips":   1,
+          "reject_reasons": { "dist":1, "dir":1, "prob":1, "rr":3, "conf":1 }
+        },
+        ...
+      }
+    }
+
+    If the file doesn't exist yet, returns an empty structure so the UI
+    degrades gracefully without a 404.
+    """
+    data = _read(_sig("funnel_state.json"))
+    if data is None:
+        return jsonify({
+            "cycle":      None,
+            "cycle_time": None,
+            "next_cycle": None,
+            "pairs":      {},
+            "updated":    None,
+            "note": "funnel_state.json not found — add funnel serialisation to production_predictor.py"
+        })
+    return jsonify({
+        **data,
+        "updated": _mtime(_sig("funnel_state.json"))
+    })
 
 
 # ── /api/stats ────────────────────────────────────────────────────────────────
@@ -171,7 +221,6 @@ def api_stats():
         if d:
             all_zones.update(d)
 
-    # FIX-2: win rate = wins / triggered only (not expired/entry_missed/planned)
     triggered    = [s for s in signals if s.get("status") in ("hit_tp", "hit_sl")]
     wins         = [s for s in triggered if s.get("status") == "hit_tp"]
     active       = [s for s in signals if s.get("status") in ("active", "triggered")]
@@ -193,8 +242,14 @@ def api_stats():
         k = s.get("strategy", "unknown")
         strats[k] = strats.get(k, 0) + 1
 
-    # Detect which symbols are present
     symbols = list({s.get("symbol", "EUR/USD").replace("/", "_") for s in signals})
+
+    obs_signals   = _observation_signals()
+    d1_positions  = [s.get("d1_position") for s in obs_signals if s.get("d1_position") is not None]
+    d1_zone_label = "unknown"
+    if d1_positions:
+        latest_pos    = d1_positions[-1]
+        d1_zone_label = "premium" if latest_pos > 0.6 else "discount" if latest_pos < 0.4 else "equilibrium"
 
     return jsonify({
         "signals_total":    len(signals),
@@ -213,21 +268,25 @@ def api_stats():
         "daily_plan_count": len(daily),
         "strategy_counts":  strats,
         "symbols_detected": symbols,
-        "updated":          datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "observation_count":   len(obs_signals),
+        "d1_zone":             d1_zone_label,
+        "d1_position":         round(d1_positions[-1], 3) if d1_positions else None,
+        "updated":             datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
     })
 
 
-# ── /api/status  (FIX-4: was missing, caused 404 in app.js) ──────────────────
+# ── /api/status ───────────────────────────────────────────────────────────────
 @app.route("/api/status")
 def api_status():
     files = {
-        "all_signals":  _sig("all_signals.json").exists(),
-        "daily_plan":   _sig("daily_plan.json").exists(),
-        "weekly_plan":  _sig("weekly_plan.json").exists(),
-        "zones_state":  _sig("zones_state.json").exists(),
+        "all_signals":   _sig("all_signals.json").exists(),
+        "daily_plan":    _sig("daily_plan.json").exists(),
+        "weekly_plan":   _sig("weekly_plan.json").exists(),
+        "zones_state":   _sig("zones_state.json").exists(),
+        "funnel_state":  _sig("funnel_state.json").exists(),
     }
     file_updated = {}
-    for k, fname in [("all_signals","all_signals.json"),("daily_plan","daily_plan.json")]:
+    for k, fname in [("all_signals","all_signals.json"),("daily_plan","daily_plan.json"),("funnel_state","funnel_state.json")]:
         mt = _mtime(_sig(fname))
         if mt:
             file_updated[k] = mt
@@ -235,14 +294,13 @@ def api_status():
     zone_files = [p.name for p in SIGNALS_DIR.glob("zones_*.json")]
     symbols    = [p.stem.replace("zones_","").replace("_cont","").replace("_rev","")
                   for p in SIGNALS_DIR.glob("zones_*_cont.json")]
-    symbols_detected = list(set(symbols))
 
     return jsonify({
         "status":           "ok",
         "files":            files,
         "file_updated":     file_updated,
         "zone_files":       zone_files,
-        "symbols_detected": symbols_detected,
+        "symbols_detected": list(set(symbols)),
         "signals_dir":      str(SIGNALS_DIR),
         "server_time":      datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
     })
@@ -251,22 +309,26 @@ def api_status():
 # ── /api/health ───────────────────────────────────────────────────────────────
 @app.route("/api/health")
 def api_health():
-    # FIX-5: check for outcome_tracker_v2 and report clearly
     ot_v2_path = Path(__file__).parent.parent / "outcome_tracker_v2.py"
     checks = {
-        "signals_dir_exists":    SIGNALS_DIR.exists(),
-        "all_signals_json":      _sig("all_signals.json").exists(),
-        "daily_plan_json":       _sig("daily_plan.json").exists(),
-        "outcome_tracker_v2":    ot_v2_path.exists(),
+        "signals_dir_exists":   SIGNALS_DIR.exists(),
+        "all_signals_json":     _sig("all_signals.json").exists(),
+        "daily_plan_json":      _sig("daily_plan.json").exists(),
+        "funnel_state_json":    _sig("funnel_state.json").exists(),
+        "outcome_tracker_v2":   ot_v2_path.exists(),
     }
-    zone_files = [p.name for p in SIGNALS_DIR.glob("zones_*.json")]
-
     if not ot_v2_path.exists():
         checks["outcome_tracker_v2_fix"] = (
             "Copy outcome_tracker_v2.py into forex_ml_system/forex_ml_system/ "
             "then remove the import from production_predictor.py until you do"
         )
+    if not _sig("funnel_state.json").exists():
+        checks["funnel_state_fix"] = (
+            "Add funnel serialisation to production_predictor.py — "
+            "save per-pair htf_before/after/ob_skips/reject_reasons to signals/funnel_state.json each cycle"
+        )
 
+    zone_files = [p.name for p in SIGNALS_DIR.glob("zones_*.json")]
     return jsonify({
         "status":      "ok" if checks["signals_dir_exists"] else "error",
         "checks":      checks,
@@ -279,23 +341,25 @@ def api_health():
 # ── entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print(f"\n{'='*60}")
-    print(f"  ML Signal Dashboard")
+    print(f"  ML Signal Dashboard — V8")
     print(f"  Signals dir : {SIGNALS_DIR}")
     print(f"  Exists      : {SIGNALS_DIR.exists()}")
     print(f"  URL         : http://localhost:5050")
     print(f"{'='*60}\n")
 
-    zone_files = list(SIGNALS_DIR.glob("zones_*.json"))
-    sig_file   = _sig("all_signals.json")
-    plan_file  = _sig("daily_plan.json")
+    sig_file    = _sig("all_signals.json")
+    plan_file   = _sig("daily_plan.json")
+    funnel_file = _sig("funnel_state.json")
+    zone_files  = list(SIGNALS_DIR.glob("zones_*.json"))
 
-    print(f"  all_signals.json : {'✅' if sig_file.exists()  else '❌ missing — will use daily_plan as fallback'}")
-    print(f"  daily_plan.json  : {'✅' if plan_file.exists() else '❌ missing'}")
-    print(f"  Zone files       : {[f.name for f in zone_files] or '❌ none found'}")
+    print(f"  all_signals.json  : {'✅' if sig_file.exists()    else '❌ missing — will use daily_plan as fallback'}")
+    print(f"  daily_plan.json   : {'✅' if plan_file.exists()   else '❌ missing'}")
+    print(f"  funnel_state.json : {'✅' if funnel_file.exists() else '⚠️  missing — Funnel tab will be empty until you add serialisation'}")
+    print(f"  Zone files        : {[f.name for f in zone_files] or '❌ none found'}")
 
     ot_v2 = Path(__file__).parent.parent / "outcome_tracker_v2.py"
     if not ot_v2.exists():
-        print(f"\n  ⚠️  outcome_tracker_v2.py not found in forex_ml_system/forex_ml_system/")
+        print(f"\n  ⚠️  outcome_tracker_v2.py not found")
         print(f"     Either copy it there OR comment out its import in production_predictor.py")
 
     print()

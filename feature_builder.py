@@ -1,9 +1,15 @@
 """
-CANONICAL FEATURE BUILDER  v7
+CANONICAL FEATURE BUILDER  v8
 ==============================
 build_feature_row() is the SINGLE function that produces a feature DataFrame
 for one zone candidate. Called identically from label_generator.py,
 production_predictor.py, and model_trainer.py.
+
+v8: Removed unreliable live features —
+    REMOVED : prev_zone_outcome (always 0.5 live, XGB importance 11%)
+    REMOVED : time_since_last_touch (always 0.0 live, XGB importance 6%)
+    Both were miscalibrating live probability scores. No persistent zone
+    history DB exists in production.
 
 v7: MTF upgrade —
     REMOVED : h1_confluence (replaced by 4 granular 1H features)
@@ -181,7 +187,8 @@ def _compute_raw_features(
     approach_atr_reg = get_atr_regime(t_atr, t_atr_ma)
 
     # ── zone_touch_count and htf_trend_alignment ──────────────────────────────
-    zone_touch_count    = int(zone.get("touch_count", 1))
+    # zone_touch_count    = int(zone.get("touch_count", 1))
+    zone_touch_count = int(zone.get("touch_count", zone.get("zone_touch_count", 1)))
     htf_trend_alignment = int(zone.get("htf_alignment", 0))
 
     # ── v5: Approach-time features ────────────────────────────────────────────
@@ -227,23 +234,11 @@ def _compute_raw_features(
         df_d1=df_d1,
     )
 
-    prev_zone_outcome = 0.5
-    time_since_last_touch = 0.0
-    if zone_history is not None:
-        level_key = _zone_level_key(zone, pip_size)
-        if level_key in zone_history:
-            hist = zone_history[level_key]
-            prev_zone_outcome = float(hist.get("outcome", 0.5))
-            prev_time  = hist.get("time")
-            touch_time = (df["time"].iloc[t_idx] if "time" in df.columns else None)
-            if prev_time is not None and touch_time is not None:
-                try:
-                    delta_hours = (
-                        pd.to_datetime(touch_time) - pd.to_datetime(prev_time)
-                    ).total_seconds() / 3600.0
-                    time_since_last_touch = float(max(0.0, min(delta_hours, 2000.0)))
-                except Exception:
-                    time_since_last_touch = 0.0
+    # ── v6: Zone-memory features ──────────────────────────────────────────────
+    # prev_zone_outcome and time_since_last_touch REMOVED in v8:
+    # both were always constant in live prediction (0.5 / 0.0) because no
+    # persistent zone history DB exists. Combined importance XGB=17%, RF=16%
+    # was miscalibrating live probability scores. Removed from schema entirely.
 
     # ── v7: 1H alignment features ─────────────────────────────────────────────
     touch_time_ts = df["time"].iloc[t_idx] if "time" in df.columns else None
@@ -285,11 +280,9 @@ def _compute_raw_features(
         "candle_body_ratio":        float(candle_body_ratio),
         "zone_age_bars":            float(zone_age_bars),
         "approach_momentum":        float(approach_momentum),
-        # v6 (h1_confluence removed)
+        # v6 (h1_confluence removed; prev_zone_outcome+time_since_last_touch removed v8)
         "h4_fvg_inside":            h4_fvg_inside,
         "d1_ema_distance":          d1_ema_distance,
-        "prev_zone_outcome":        prev_zone_outcome,
-        "time_since_last_touch":    time_since_last_touch,
         # v7: 1H alignment
         "h1_trend_alignment":       float(h1_trend_alignment),
         "h1_structure_shift":       float(h1_structure_shift),
