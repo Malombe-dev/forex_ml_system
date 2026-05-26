@@ -1531,9 +1531,32 @@ class ProductionForexPredictor:
                               direction: str, df_1h) -> Dict:
         """
         Compute 1H confluence features for a 4H OB zone.
-        Returns h1_trend_alignment, h1_structure_shift, h1_displacement,
-        h1_liquidity_sweep — exactly matching training feature names.
-        90% of training data required 4H+1H confluence (tf_source=4h_1h_confluence).
+
+        CANONICAL — mirrors _compute_h1_features() in feature_builder.py exactly.
+        The model was trained on _compute_h1_features; any divergence here produces
+        out-of-distribution values that distort live probability scores.
+
+        Fixes vs old implementation
+        ----------------------------
+        h1_trend_alignment : training outputs {-1, 0, 1} — demand zone aligned with
+                             bullish=1, counter-trend bearish=-1, neutral=0; supply
+                             zone flips the sign so 1=aligned for both directions.
+                             Old code emitted {0, 1} only — never -1, so the model
+                             could not distinguish neutral from counter-trend.
+
+        h1_structure_shift : training uses proper swing-point BOS: finds swing highs
+                             and lows with swing_period=3 lookback+forward, then checks
+                             if last close broke the most recent swing high (=1) or low
+                             (=-1). Old code used a 3-bar CHoCH micropattern that fires
+                             on different conditions at a different rate.
+
+        h1_displacement    : training computes max(|close-open|) / atr_1h over the
+                             last 20 bars — ATR-normalised, dimensionless, ~0.5–3.0.
+                             Old code used closes[i]-lows[i] of the CHoCH bar — a raw
+                             price distance in quote currency (~0.002 for EUR/USD).
+                             The scaler maps these to completely different input spaces.
+
+        h1_liquidity_sweep : unchanged from old implementation (was already correct).
         """
         result = {
             'h1_trend_alignment': 0,
@@ -1545,87 +1568,205 @@ class ProductionForexPredictor:
         if df_1h is None or len(df_1h) < 20:
             return result
 
-        close = df_1h['close']
-        ema20 = close.ewm(span=20, adjust=False).mean()
-        ema50 = close.ewm(span=50, adjust=False).mean()
-        if ema20.iloc[-1] > ema50.iloc[-1] * 1.001:
-            h1_trend = 'bullish'
-        elif ema20.iloc[-1] < ema50.iloc[-1] * 0.999:
-            h1_trend = 'bearish'
-        else:
-            h1_trend = 'neutral'
+        try:
+            sub = df_1h.copy()
 
-        if direction == 'BUY'  and h1_trend == 'bullish': result['h1_trend_alignment'] = 1
-        if direction == 'SELL' and h1_trend == 'bearish': result['h1_trend_alignment'] = 1
+            # ── 1H ATR (Wilder 14-period on true range) ───────────────────────
+            high  = sub['high']; low = sub['low']; close = sub['close']
+            tr    = pd.concat([
+                high - low,
+                (high - close.shift(1)).abs(),
+                (low  - close.shift(1)).abs(),
+            ], axis=1).max(axis=1)
+            atr_1h = float(tr.rolling(14).mean().iloc[-1])
+            if not np.isfinite(atr_1h) or atr_1h <= 0:
+                atr_1h = float(tr.mean()) or 1e-6
 
-        # Look for H1 CHoCH/BOS inside or near the zone (last 20 bars)
-        recent = df_1h.tail(20)
-        highs  = recent['high'].values
-        lows   = recent['low'].values
-        closes = recent['close'].values
-        for i in range(2, len(recent)):
-            if direction == 'BUY':
-                # Bullish CHoCH: swept a low then closed above a recent high
-                if lows[i] < lows[i - 1] and closes[i] > highs[i - 2]:
-                    result['h1_structure_shift'] = 1
-                    result['h1_displacement']    = float(closes[i] - lows[i])
-                    break
+            # ── h1_trend_alignment : {-1, 0, 1} ──────────────────────────────
+            # Training threshold: 0.0001 band around EMA crossover (1.0001 / 0.9999)
+            ema20 = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
+            ema50 = float(close.ewm(span=50, adjust=False).mean().iloc[-1])
+            if ema20 > ema50 * 1.0001:
+                raw_trend = 1       # 1H bullish
+            elif ema20 < ema50 * 0.9999:
+                raw_trend = -1      # 1H bearish
             else:
-                # Bearish CHoCH: swept a high then closed below a recent low
-                if highs[i] > highs[i - 1] and closes[i] < lows[i - 2]:
-                    result['h1_structure_shift'] = 1
-                    result['h1_displacement']    = float(highs[i] - closes[i])
+                raw_trend = 0       # flat / neutral
+
+            # Align to zone direction so 1=aligned, -1=counter, 0=neutral for both
+            if direction == 'BUY':
+                result['h1_trend_alignment'] = raw_trend           # demand: bullish=1
+            else:
+                result['h1_trend_alignment'] = -raw_trend          # supply: bearish=1
+
+            # ── h1_structure_shift : {-1, 0, 1} ──────────────────────────────
+            # Proper swing-point BOS — swing_period=3 lookback and forward.
+            # Training: last close > most recent swing high → bullish BOS (=1)
+            #           last close < most recent swing low  → bearish BOS (=-1)
+            window       = sub.tail(30).reset_index(drop=True)
+            swing_period = 3
+            swing_highs, swing_lows = [], []
+            for i in range(swing_period, len(window) - swing_period):
+                bar = window.iloc[i]
+                if (bar['high'] > window.iloc[i - swing_period:i]['high'].max() and
+                        bar['high'] > window.iloc[i + 1:i + swing_period + 1]['high'].max()):
+                    swing_highs.append({'i': i, 'price': bar['high']})
+                if (bar['low'] < window.iloc[i - swing_period:i]['low'].min() and
+                        bar['low'] < window.iloc[i + 1:i + swing_period + 1]['low'].min()):
+                    swing_lows.append({'i': i, 'price': bar['low']})
+
+            last_close = float(window['close'].iloc[-1])
+            if swing_highs and last_close > swing_highs[-1]['price']:
+                result['h1_structure_shift'] = 1    # bullish BOS
+            elif swing_lows and last_close < swing_lows[-1]['price']:
+                result['h1_structure_shift'] = -1   # bearish BOS
+
+            # ── h1_displacement : ATR-normalised max body, last 20 bars ───────
+            # Training: max(|close-open|) / atr_1h  capped at 10.0
+            # Dimensionless ratio, ~0.5–3.0 for normal bars.
+            recent_20  = sub.tail(20)
+            body_sizes = (recent_20['close'] - recent_20['open']).abs()
+            h1_disp    = float(body_sizes.max() / atr_1h) if atr_1h > 0 else 0.0
+            result['h1_displacement'] = round(min(h1_disp, 10.0), 4)
+
+            # ── h1_liquidity_sweep : zone-boundary wick + reclaim ─────────────
+            # Training: rolling 4-bar lookback window (sp=4), not just zone boundary.
+            # Detects: bar.low < prior 4-bar low AND close > prior 4-bar low (demand)
+            #          bar.high > prior 4-bar high AND close < prior 4-bar high (supply)
+            check_window = sub.tail(30).reset_index(drop=True)
+            sp = 4
+            for i in range(sp, len(check_window) - 3):
+                bar     = check_window.iloc[i]
+                prev_lo = check_window.iloc[i - sp:i]['low'].min()
+                prev_hi = check_window.iloc[i - sp:i]['high'].max()
+                if direction == 'BUY' and bar['low'] < prev_lo and bar['close'] > prev_lo:
+                    result['h1_liquidity_sweep'] = 1
+                    break
+                if direction == 'SELL' and bar['high'] > prev_hi and bar['close'] < prev_hi:
+                    result['h1_liquidity_sweep'] = 1
                     break
 
-        # Liquidity sweep: wick beyond zone boundary, close back inside
-        for i in range(max(0, len(recent) - 6), len(recent)):
-            row = recent.iloc[i]
-            if direction == 'BUY'  and row['low']  < zone_bot and row['close'] > zone_bot:
-                result['h1_liquidity_sweep'] = 1; break
-            if direction == 'SELL' and row['high'] > zone_top and row['close'] < zone_top:
-                result['h1_liquidity_sweep'] = 1; break
+            result['confirmed'] = bool(
+                result['h1_trend_alignment'] != 0 or result['h1_structure_shift'] != 0)
+            return result
 
-        result['confirmed'] = bool(
-            result['h1_trend_alignment'] or result['h1_structure_shift'])
-        return result
+        except Exception as e:
+            logger.warning(f"_check_1h_confluence failed: {e}")
+            return result
 
     def _check_5min_entry(self, zone_top: float, zone_bot: float,
                            direction: str, df_5m) -> Dict:
         """
-        Detect 5min entry trigger inside/near the zone.
-        Returns m5_micro_bos, m5_sweep_confirmation, m5_entry_candle_quality —
-        exactly matching training feature names.
+        Compute 5M execution features — CANONICAL version matching
+        _compute_m5_features() in feature_builder.py exactly.
+
+        IMPORTANT: the previous implementation filtered to bars where
+        price_in_zone was True (zone-proximity filter). Training uses
+        df_5m.tail(20) with NO such filter — all 20 bars are evaluated.
+        The zone-proximity filter changed which bars were seen, producing
+        different m5_micro_bos / m5_sweep_confirmation values than the
+        model was trained on.  This version removes that filter.
+
+        m5_micro_bos          : 1 if a micro BOS exists in the last 20 5M bars
+        m5_sweep_confirmation : 1 if a micro liquidity grab in the last 20 5M bars
+        m5_entry_candle_quality : composite float [0,1] from last 5 5M bars
         """
         result = {
             'm5_micro_bos':            0,
             'm5_sweep_confirmation':   0,
             'm5_entry_candle_quality': 0.0,
         }
-        if df_5m is None or len(df_5m) < 10:
+        if df_5m is None or len(df_5m) < 20:
             return result
 
-        recent = df_5m.tail(20)
-        for i in range(1, len(recent)):
-            row  = recent.iloc[i]
-            prev = recent.iloc[i - 1]
-            body       = abs(row['close'] - row['open'])
-            wick       = row['high'] - row['low']
-            body_ratio = body / wick if wick > 0 else 0.0
+        try:
+            import numpy as np
+            import pandas as pd
 
-            if direction == 'BUY':
-                if row['close'] > prev['high'] and row['low'] <= zone_top * 1.002:
-                    result['m5_micro_bos'] = 1
-                if row['low'] < zone_bot and row['close'] > zone_bot:
-                    result['m5_sweep_confirmation'] = 1
-                if row['close'] > row['open'] and body_ratio > 0.6:
-                    result['m5_entry_candle_quality'] = round(body_ratio, 4)
-            else:
-                if row['close'] < prev['low'] and row['high'] >= zone_bot * 0.998:
-                    result['m5_micro_bos'] = 1
-                if row['high'] > zone_top and row['close'] < zone_top:
-                    result['m5_sweep_confirmation'] = 1
-                if row['close'] < row['open'] and body_ratio > 0.6:
-                    result['m5_entry_candle_quality'] = round(body_ratio, 4)
+            zone_type = 'demand' if direction == 'BUY' else 'supply'
+            recent    = df_5m.tail(20).reset_index(drop=True)
+
+            # ── ATR on 5M ────────────────────────────────────────────────────
+            hi = recent['high']; lo = recent['low']; cl = recent['close']
+            tr = pd.concat([
+                hi - lo,
+                (hi - cl.shift(1)).abs(),
+                (lo - cl.shift(1)).abs(),
+            ], axis=1).max(axis=1)
+            atr_5m = float(tr.rolling(7).mean().iloc[-1])
+            if not np.isfinite(atr_5m) or atr_5m <= 0:
+                atr_5m = self.pip_size * 5
+
+            # ── m5_micro_bos — swing-high/low BOS (sp=3) ────────────────────
+            sp = 3
+            for i in range(sp, len(recent) - 1):
+                bar = recent.iloc[i]
+                if zone_type == 'demand':
+                    prev_hi = recent.iloc[max(0, i - sp):i]['high'].max()
+                    if bar['close'] > prev_hi:
+                        result['m5_micro_bos'] = 1
+                        break
+                else:
+                    prev_lo = recent.iloc[max(0, i - sp):i]['low'].min()
+                    if bar['close'] < prev_lo:
+                        result['m5_micro_bos'] = 1
+                        break
+
+            # ── m5_sweep_confirmation — wick-beyond + close-back (lookback=4) ─
+            for i in range(4, len(recent)):
+                bar     = recent.iloc[i]
+                prev_lo = recent.iloc[max(0, i - 4):i]['low'].min()
+                prev_hi = recent.iloc[max(0, i - 4):i]['high'].max()
+                if zone_type == 'demand':
+                    if bar['low'] < prev_lo and bar['close'] > prev_lo:
+                        result['m5_sweep_confirmation'] = 1
+                        break
+                else:
+                    if bar['high'] > prev_hi and bar['close'] < prev_hi:
+                        result['m5_sweep_confirmation'] = 1
+                        break
+
+            # ── m5_entry_candle_quality — composite score on last 5 bars ─────
+            last_5 = recent.tail(5).reset_index(drop=True)
+            score  = 0.0
+            last   = last_5.iloc[-1]
+            prev   = last_5.iloc[-2] if len(last_5) >= 2 else last_5.iloc[-1]
+            body   = abs(last['close'] - last['open'])
+            rng    = last['high'] - last['low']
+
+            # 1. Engulfing
+            prev_body = abs(prev['close'] - prev['open'])
+            if body > prev_body and rng > 0:
+                score += 0.25
+
+            # 2. Displacement (body ≥ 60% of ATR)
+            if atr_5m > 0 and body / atr_5m >= 0.6:
+                score += 0.25
+
+            # 3. Strong close (top/bottom 30% of range in zone direction)
+            if rng > 0:
+                if zone_type == 'demand' and (last['close'] - last['low']) / rng >= 0.7:
+                    score += 0.25
+                elif zone_type == 'supply' and (last['high'] - last['close']) / rng >= 0.7:
+                    score += 0.25
+
+            # 4. Rejection wick (counter-directional wick > body)
+            if rng > 0 and body > 0:
+                if zone_type == 'demand':
+                    lower_wick = min(last['open'], last['close']) - last['low']
+                    if lower_wick > body:
+                        score += 0.25
+                else:
+                    upper_wick = last['high'] - max(last['open'], last['close'])
+                    if upper_wick > body:
+                        score += 0.25
+
+            result['m5_entry_candle_quality'] = round(score, 4)
+
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"_check_5min_entry failed: {e}")
+
         return result
 
     def _get_15min_approach(self, zone_top: float, zone_bot: float,
@@ -1685,7 +1826,7 @@ class ProductionForexPredictor:
         MAX_DIST_PIPS    = 80
         MIN_HTF_RR       = 1.5
         MAX_HTF_RR       = 6.0
-        MIN_HTF_STRENGTH = 0.8
+        MIN_HTF_STRENGTH = 0.5  # lowered from 0.8 — 0.8 kills valid zones in low-vol sessions
 
         if self.debug:
             print(f"\n  🔍 HTF [{self.symbol}|{tf}] current_price={current_price:.5f} "
@@ -1719,6 +1860,9 @@ class ProductionForexPredictor:
                 'd1_trend':     htf_context.get('daily_structure', {}).get('trend', 'neutral') if htf_context else 'unknown',
                 'zone_strength': round(zone_obj.get('strength', 0), 2),
                 'htf_trend':    htf_context.get('h1_trend', 'unknown') if htf_context else 'unknown',
+                # Zone body boundaries — required by PriceZoneMonitor for Step 3 body check
+                'zone_top':     round(zone_obj.get('top', zone_obj.get('price_high', entry)), 5),
+                'zone_bottom':  round(zone_obj.get('bottom', zone_obj.get('price_low', sl)), 5),
             }
 
         # FVGs
@@ -1739,8 +1883,10 @@ class ProductionForexPredictor:
             entry     = fvg['mid']
             sl        = fvg['bottom'] if direction == 'BUY' else fvg['top']
 
-            if direction == 'BUY'  and entry >= current_price: htf_fvg_rejected['direction'] += 1; continue
-            if direction == 'SELL' and entry <= current_price: htf_fvg_rejected['direction'] += 1; continue
+            # Bullish FVG must be BELOW current price (support/demand zone for continuation long)
+            # Bearish FVG must be ABOVE current price (resistance/supply zone for continuation short)
+            if direction == 'BUY'  and fvg['top'] >= current_price: htf_fvg_rejected['direction'] += 1; continue
+            if direction == 'SELL' and fvg['bottom'] <= current_price: htf_fvg_rejected['direction'] += 1; continue
 
             tp_target = (max(fib_levels.get('0.5', entry + fvg['size'] * 2), entry + fvg['size'] * 2)
                          if direction == 'BUY' else
@@ -1783,8 +1929,10 @@ class ProductionForexPredictor:
             _atr_buf  = df['atr'].iloc[-1] * 0.2 if 'atr' in df.columns else 0.0002
             sl        = ob['bottom'] - _atr_buf if direction == 'BUY' else ob['top'] + _atr_buf
 
-            if direction == 'BUY'  and entry >= current_price: htf_ob_rejected['direction'] += 1; continue
-            if direction == 'SELL' and entry <= current_price: htf_ob_rejected['direction'] += 1; continue
+            # Bullish OB must sit BELOW current price (price pulls back to demand)
+            # Bearish OB must sit ABOVE current price (price rallies into supply)
+            if direction == 'BUY'  and ob['top'] >= current_price: htf_ob_rejected['direction'] += 1; continue
+            if direction == 'SELL' and ob['bottom'] <= current_price: htf_ob_rejected['direction'] += 1; continue
 
             tp_target = (entry + ob['reaction_size'] * 1.5 if direction == 'BUY'
                          else entry - ob['reaction_size'] * 1.5)
@@ -1798,19 +1946,31 @@ class ProductionForexPredictor:
 
             # ── Step 2: 1H confluence (90% of training required 4H+1H) ───────
             h1_conf = self._check_1h_confluence(ob['top'], ob['bottom'], direction, df_1h)
-            if tf == '4h' and not h1_conf['confirmed']:
-                htf_ob_rejected['confs'] += 1
-                if self.debug:
-                    print(f"     ⛔ OB skipped — no 1H confluence "
-                          f"(trend={h1_conf['h1_trend_alignment']} "
-                          f"struct={h1_conf['h1_structure_shift']})")
-                continue
+            # Only hard-reject if 1H trend is CONFIRMED OPPOSITE (not merely neutral/flat).
+            # trend_alignment=0 + structure_shift=0 in a quiet session = neutral, not opposing.
+            # We still pass the h1 features to the model — it will discount them appropriately.
+            h1_trend_str = htf_context.get('h1_trend', 'neutral') if htf_context else 'neutral'
+            # 1H confirmed-opposite hard reject REMOVED — training never filtered
+            # counter-trend zones; h1_trend_alignment=-1 already discounts them
+            # via the model's learned weights. Hard-rejecting here shrinks the
+            # input population away from the distribution the model was trained on.
+            if self.debug and not h1_conf['confirmed']:
+                print(f"     ℹ️  OB passing with neutral 1H (trend={h1_conf['h1_trend_alignment']} "
+                      f"struct={h1_conf['h1_structure_shift']}) — letting model decide")
 
             # ── Step 3: 15min approach features ──────────────────────────────
             approach = self._get_15min_approach(ob['top'], ob['bottom'], direction, df_15m)
 
-            # ── Step 4: 5min entry trigger ────────────────────────────────────
-            m5_conf = self._check_5min_entry(ob['top'], ob['bottom'], direction, df_5m)
+            # ── Step 4: 5min entry trigger (HARD GATE) ───────────────────────
+            # Price must have shown a reaction INSIDE the zone on 5min before
+            # we score or emit. This is the ICT Step 5 requirement:
+            # displacement or sweep confirmation inside the OB/FVG.
+            # Without this, signals fire on zones price hasn't entered yet.
+            # Fallback: if 5min data unavailable, gate is skipped (soft mode).
+            m5_conf      = self._check_5min_entry(ob['top'], ob['bottom'], direction, df_5m)
+            # 5M hard gate REMOVED — training labeled every zone touch regardless
+            # of 5M state. m5_micro_bos / m5_sweep_confirmation flow to the model
+            # as soft features; the 0.65 probability threshold does the filtering.
 
             # ── Step 5: Build full zone dict matching training schema exactly ─
             # Injects pre-computed MTF features so build_feature_row receives
@@ -1838,6 +1998,9 @@ class ProductionForexPredictor:
                 'approach_momentum':       approach['approach_momentum'],
                 'candle_body_ratio':       approach['candle_body_ratio'],
                 'tf_source':               tf,
+                # Estimate touch count from 4H bars — price revisits inside OB zone
+                'touch_count':             sum(1 for _, row in df.tail(50).iterrows()
+                                               if ob['bottom'] <= row['close'] <= ob['top']),
             }
 
             base_prob = self._ml_score_htf_zone(
@@ -1860,13 +2023,22 @@ class ProductionForexPredictor:
             print(f"         OB  rejects → {htf_ob_rejected}")
             print(f"         HTF passing before bias filter: {len(htf_setups)}")
 
-        # Bias filter
+        # ── Bias filter ──────────────────────────────────────────────────────────
+        # HTF bias must agree with zone SIDE relative to price, not just direction.
+        # Bullish H1 → only BUY zones that are BELOW current price (demand support)
+        # Bearish H1 → only SELL zones that are ABOVE current price (supply resistance)
+        # This is the core ICT/SMC continuation rule: trade WITH bias into the
+        # nearest same-direction zone on the correct side of price.
         if htf_context:
             h1 = htf_context.get('h1_trend', 'neutral')
             if h1 == 'bullish':
-                htf_setups = [s for s in htf_setups if s['direction'] == 'BUY']
+                # Only keep BUY setups where the zone entry is below current price
+                htf_setups = [s for s in htf_setups
+                              if s['direction'] == 'BUY' and s['entry'] < current_price]
             elif h1 == 'bearish':
-                htf_setups = [s for s in htf_setups if s['direction'] == 'SELL']
+                # Only keep SELL setups where the zone entry is above current price
+                htf_setups = [s for s in htf_setups
+                              if s['direction'] == 'SELL' and s['entry'] > current_price]
 
         if self.debug:
             print(f"         HTF after bias filter: {len(htf_setups)}")
@@ -1991,8 +2163,9 @@ class ProductionForexPredictor:
                 'expired': expired_count, 'active_zones': self.zone_tracker.get_active_count()
             }}
 
-        # HTF signals found — skip 15min ML scoring entirely
-        all_zones = []  # 15min zones not scored — model not trained on them
+        # HTF signals found — 15min zones not ML-scored (model trained on 4H OBs only)
+        # all_zones is empty so all downstream loops over it are no-ops.
+        all_zones = []
 
         # HTF confluence — BUGFIX-1
         # zone['confluence'] must be a raw integer overlap count for feature_builder
@@ -2191,13 +2364,15 @@ class ProductionForexPredictor:
 
             # ── Update zone history for prev_zone_outcome / time_since_last_touch ──
         # These were constant (0.5 / 0.0) in live prediction — now tracked properly
-        zone_key = f"{self.symbol}_{zone.get('type','')}_{round(zone.get('price_mid', 0), 4)}"
-        history  = self.zone_history.get(zone_key, {})
-        if 'last_outcome' in history:
-            zone['prev_zone_outcome']    = history['last_outcome']
-            zone['time_since_last_touch'] = min(
-                (datetime.utcnow() - history['last_touch']).total_seconds() / 3600,
-                2000)
+            # ── Update zone history for prev_zone_outcome / time_since_last_touch ──
+            # These were constant (0.5 / 0.0) in live prediction — now tracked properly
+            zone_key = f"{self.symbol}_{zone.get('type','')}_{round(zone.get('price_mid', 0), 4)}"
+            history  = self.zone_history.get(zone_key, {})
+            if 'last_outcome' in history:
+                zone['prev_zone_outcome']    = history['last_outcome']
+                zone['time_since_last_touch'] = min(
+                    (datetime.utcnow() - history['last_touch']).total_seconds() / 3600,
+                    2000)
         # Zone freshness penalty: older zones get a probability haircut
             # A zone formed 40+ bars ago (10 hours on 15min) is stale
             zone_age_bars = len(df) - zone.get('index', len(df) - 1)
@@ -2520,14 +2695,29 @@ class PriceZoneMonitor:
                 continue
 
             current_price = df['close'].iloc[-1]
-            entry         = float(sig['entry'])
+            bar_low       = df['low'].iloc[-1]
+            bar_high      = df['high'].iloc[-1]
             direction     = sig.get('direction', 'BUY')
-            tolerance     = pred.pip_size * 3  # 3-pip touch zone
 
-            touched = (direction == 'BUY'  and current_price <= entry + tolerance) or \
-                      (direction == 'SELL' and current_price >= entry - tolerance)
+            # ── Step 3: Price must be INSIDE the zone body ───────────────────
+            # Use zone_top/zone_bottom stored in the signal (added in _build_setup).
+            # Fall back to entry ± 1 pip if zone boundaries are missing (legacy signals).
+            zone_top = float(sig.get('zone_top',  sig.get('entry', 0) + pred.pip_size))
+            zone_bot = float(sig.get('zone_bottom', sig.get('entry', 0) - pred.pip_size))
 
-            if touched:
+            # For a BUY zone (demand): price has entered when the bar's LOW traded
+            # at or below zone_top (touched into the zone body from above).
+            # For a SELL zone (supply): price has entered when the bar's HIGH traded
+            # at or above zone_bot (touched into the zone body from below).
+            # We also require the CLOSE to still be inside (not blown straight through).
+            if direction == 'BUY':
+                in_zone = (bar_low  <= zone_top and
+                           current_price >= zone_bot - pred.pip_size * 2)
+            else:
+                in_zone = (bar_high >= zone_bot and
+                           current_price <= zone_top + pred.pip_size * 2)
+
+            if in_zone:
                 self.alerted_signals.add(sig_id)
                 self.alert_callback(sig)
 
@@ -2552,51 +2742,75 @@ def run_dual_strategy(symbols: Optional[List[str]] = None):
     IMPROVE-10: multi-pair support via symbols list.
     IMPROVE-8: daily + weekly scheduler with price-monitor 15-min loop.
     """
-    # IMPORTANT: replace with your actual API keys
-    API_KEY_REVERSION     = "ea3e4fce074e403f8cd4c83dd0035643"
-    API_KEY_CONTINUATION  = "2522b470eba249f88d2e29575035914e"
+    # One API key per pair — each key handles ~480 calls/day (well under 800 free limit).
+    # REV and CONT for the same pair share a key because the shared bar cache means
+    # they never double-fetch; the per-key rate limiter still enforces 7 calls/min.
+    PAIR_API_KEYS = {
+        "EUR/USD": "ea3e4fce074e403f8cd4c83dd0035643",
+        "GBP/USD": "2522b470eba249f88d2e29575035914e",
+        "USD/JPY": "5bb48b4211144b92a4487ce7c63d1b7a",
+        "XAU/USD": "63a513bb7eb848748d28d3deb64c1b59",
+    }
+    # Fallback key if a symbol not in the dict above is passed
+    _FALLBACK_KEY = "ea3e4fce074e403f8cd4c83dd0035643"
 
-    # IMPROVE-10: default to EUR/USD; pass multiple symbols to go multi-pair
+    # IMPROVE-10: default to all four pairs
     if symbols is None:
-        symbols = ["EUR/USD"]
+        symbols = ["EUR/USD", "GBP/USD", "USD/JPY", "XAU/USD"]
+
+    # Per-symbol tuning — pip distances and zone thresholds differ significantly
+    # between standard FX pairs and Gold.
+    #   EUR/USD, GBP/USD : standard 4-decimal pairs, 25 pip distance fine
+    #   USD/JPY          : 2-decimal pair, pip = 0.01, same numeric distance works
+    #   XAU/USD (Gold)   : 1 pip = $1; ATR is $15–$40 so distances need to be larger
+    SYMBOL_PARAMS = {
+        "EUR/USD": dict(max_distance_pips_rev=25.0, max_distance_pips_cont=15.0, zone_distance_threshold=50.0,  min_strength_atr=0.35),
+        "GBP/USD": dict(max_distance_pips_rev=25.0, max_distance_pips_cont=15.0, zone_distance_threshold=50.0,  min_strength_atr=0.35),
+        "USD/JPY": dict(max_distance_pips_rev=25.0, max_distance_pips_cont=15.0, zone_distance_threshold=50.0,  min_strength_atr=0.35),
+        "XAU/USD": dict(max_distance_pips_rev=80.0, max_distance_pips_cont=50.0, zone_distance_threshold=150.0, min_strength_atr=0.40),
+    }
+    # Fallback for any symbol not listed above
+    DEFAULT_PARAMS = dict(max_distance_pips_rev=25.0, max_distance_pips_cont=15.0, zone_distance_threshold=50.0, min_strength_atr=0.35)
 
     print("\n╔════════════════════════════════════════════════════════════════╗")
     print("║   DUAL STRATEGY MONITOR V7 — SCHEDULED + MULTI-PAIR          ║")
+    print(f"║   Pairs: {', '.join(symbols):<52}║")
     print("╚════════════════════════════════════════════════════════════════╝\n")
 
     all_predictors: List[ProductionForexPredictor] = []
 
     for sym in symbols:
-        safe = sym.replace('/', '_').lower()
+        p   = SYMBOL_PARAMS.get(sym, DEFAULT_PARAMS)
+        key = PAIR_API_KEYS.get(sym, _FALLBACK_KEY)
         rev  = ProductionForexPredictor(
-            api_key=API_KEY_REVERSION,
+            api_key=key,
             model_path="models/model_v5_reversion.pkl",
             scaler_path="models/scaler_v5_reversion.pkl",
             encoders_path="models/encoders_v5_reversion.pkl",
             stats_path="models/training_stats_v5_reversion.pkl",
             symbol=sym,
             prob_threshold=0.65,
-            max_rr=3.5, min_risk_atr=0.8, max_distance_pips=25.0,
-            min_strength_atr=0.35, use_5min_refinement=True,
+            max_rr=3.5, min_risk_atr=0.8, max_distance_pips=p['max_distance_pips_rev'],
+            min_strength_atr=p['min_strength_atr'], use_5min_refinement=True,
             refine_max_dist_multiplier=2.0, enable_continuation=False,
             use_htf_analysis=True, min_confluence_score=1,
-            zone_ttl_hours=5.8, zone_distance_threshold=50.0,
+            zone_ttl_hours=5.8, zone_distance_threshold=p['zone_distance_threshold'],
             htf_fvg_min_gap_atr=0.5, htf_ob_min_reaction_atr=2.5,
             is_continuation_strategy=False, debug=True
         )
         cont = ProductionForexPredictor(
-            api_key=API_KEY_CONTINUATION,
+            api_key=key,
             model_path="models/model_v5_continuation.pkl",
             scaler_path="models/scaler_v5_continuation.pkl",
             encoders_path="models/encoders_v5_continuation.pkl",
             stats_path="models/training_stats_v5_continuation.pkl",
             symbol=sym,
             prob_threshold=0.65,
-            max_rr=5.0, min_risk_atr=0.8, max_distance_pips=15.0,
-            min_strength_atr=0.35, use_5min_refinement=True,
+            max_rr=5.0, min_risk_atr=0.8, max_distance_pips=p['max_distance_pips_cont'],
+            min_strength_atr=p['min_strength_atr'], use_5min_refinement=True,
             refine_max_dist_multiplier=2.0, enable_continuation=True,
             use_htf_analysis=True, min_confluence_score=1,
-            zone_ttl_hours=5.8, zone_distance_threshold=50.0,
+            zone_ttl_hours=5.8, zone_distance_threshold=p['zone_distance_threshold'],
             htf_fvg_min_gap_atr=0.5, htf_ob_min_reaction_atr=2.5,
             is_continuation_strategy=True, debug=True
         )
@@ -2735,8 +2949,7 @@ def run_dual_strategy(symbols: Optional[List[str]] = None):
 
 
 if __name__ == "__main__":
-    # Single pair (default)
+    # Runs all four pairs by default.
+    # To restrict to a subset, pass an explicit list, e.g.:
+    #   run_dual_strategy(symbols=["EUR/USD", "GBP/USD"])
     run_dual_strategy()
-
-    # Multi-pair example:
-    # run_dual_strategy(symbols=["EUR/USD", "GBP/USD", "USD/JPY", "XAU/USD"])

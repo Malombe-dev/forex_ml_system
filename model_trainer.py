@@ -179,11 +179,13 @@ class DualTaskTrainer:
                        y_val: Optional[pd.Series] = None,
                        pre_fitted_scaler: Optional[StandardScaler] = None) -> Dict:
         """
-        Train ensemble (XGBoost + RF + LogisticRegression) as CLASSIFIERS.
+        Train ensemble (XGBoost + RF + LogisticRegression) with PROBABILITY CALIBRATION.
         """
         logger.info("=" * 70)
-        logger.info("TRAINING ENSEMBLE  [classification]")
+        logger.info("TRAINING CALIBRATED ENSEMBLE  [classification]")
         logger.info("=" * 70)
+
+        from sklearn.calibration import CalibratedClassifierCV
 
         if pre_fitted_scaler is not None:
             self.scaler    = pre_fitted_scaler
@@ -207,11 +209,9 @@ class DualTaskTrainer:
         if X_val is not None and y_val is not None:
             X_val_scaled = self.scaler.transform(X_val)
 
-        # Recency sample weights — recent data (2020+) weighted 3×
+        # Recency sample weights
         y_arr  = np.asarray(y_train, dtype=float)
-        recency_w = np.ones(len(y_arr))   # default: uniform
-        # (zone_time not in X after feature prep, so we can't filter by date here;
-        #  apply uniform weights — the date-based split already handles recency bias)
+        recency_w = np.ones(len(y_arr))  
         recency_w = recency_w / recency_w.mean()
 
         n_pos = max(int(y_arr.sum()), 1)
@@ -221,9 +221,10 @@ class DualTaskTrainer:
 
         metrics = {}
 
-        # ── 1. XGBoost Classifier ─────────────────────────────────────────────
-        logger.info("\n1️⃣  Training XGBoost (classifier)...")
-        self.xgb_model = xgb.XGBClassifier(
+        # ── 1. Calibrated XGBoost Classifier ───────────────────────────────────
+        logger.info("\n1️⃣  Training Calibrated XGBoost...")
+        # Define the base uncalibrated structure
+        raw_xgb = xgb.XGBClassifier(
             n_estimators=300,
             max_depth=4,
             learning_rate=0.03,
@@ -238,19 +239,10 @@ class DualTaskTrainer:
             objective='binary:logistic',
             eval_metric='logloss',
         )
-
-        if X_val is not None:
-            eval_set = [(X_train_scaled, y_train), (X_val_scaled, y_val)]
-            self.xgb_model.fit(
-                X_train_scaled, y_train.astype(int),
-                sample_weight=recency_w,
-                eval_set=eval_set, verbose=False,
-            )
-        else:
-            self.xgb_model.fit(
-                X_train_scaled, y_train.astype(int),
-                sample_weight=recency_w,
-            )
+        
+        # Wrap it with Sigmoid/Platt Scaling calibration using 3-fold internal CV
+        self.xgb_model = CalibratedClassifierCV(estimator=raw_xgb, method='sigmoid', cv=3)
+        self.xgb_model.fit(X_train_scaled, y_train.astype(int), sample_weight=recency_w)
 
         p_xgb = self.xgb_model.predict_proba(X_train_scaled)[:, 1].astype(np.float32)
         y_int = y_arr.astype(int)
@@ -258,12 +250,12 @@ class DualTaskTrainer:
             'log_loss': log_loss(y_int, p_xgb),
             'roc_auc':  roc_auc_score(y_int, p_xgb),
         }
-        logger.info(f"  XGB train  log_loss={metrics['xgb']['log_loss']:.4f}  "
+        logger.info(f"  XGB train  calibrated_log_loss={metrics['xgb']['log_loss']:.4f}  "
                     f"auc={metrics['xgb']['roc_auc']:.4f}")
 
-        # ── 2. Random Forest Classifier ───────────────────────────────────────
-        logger.info("\n2️⃣  Training Random Forest (classifier)...")
-        self.rf_model = RandomForestClassifier(
+        # ── 2. Calibrated Random Forest Classifier ────────────────────────────
+        logger.info("\n2️⃣  Training Calibrated Random Forest...")
+        raw_rf = RandomForestClassifier(
             n_estimators=200,
             max_depth=6,
             min_samples_split=20,
@@ -273,6 +265,9 @@ class DualTaskTrainer:
             random_state=42,
             n_jobs=1,
         )
+        
+        # Wrap the Random Forest to expand its uncalibrated "squished" probability profile
+        self.rf_model = CalibratedClassifierCV(estimator=raw_rf, method='sigmoid', cv=3)
         self.rf_model.fit(X_train_scaled, y_train.astype(int), sample_weight=recency_w)
 
         p_rf = self.rf_model.predict_proba(X_train_scaled)[:, 1].astype(np.float32)
@@ -280,11 +275,12 @@ class DualTaskTrainer:
             'log_loss': log_loss(y_int, p_rf),
             'roc_auc':  roc_auc_score(y_int, p_rf),
         }
-        logger.info(f"  RF  train  log_loss={metrics['rf']['log_loss']:.4f}  "
+        logger.info(f"  RF  train  calibrated_log_loss={metrics['rf']['log_loss']:.4f}  "
                     f"auc={metrics['rf']['roc_auc']:.4f}")
 
         # ── 3. Logistic Regression ────────────────────────────────────────────
         logger.info("\n3️⃣  Training Logistic Regression...")
+        # Note: Logistic Regression is inherently calibrated by default due to its sigmoid mathematical loss
         self.ridge_model = LogisticRegression(
             C=1.0,
             class_weight='balanced',
@@ -304,6 +300,7 @@ class DualTaskTrainer:
 
         return metrics
 
+        
     def evaluate_ensemble(self, X_test: pd.DataFrame, y_test: pd.Series) -> Dict:
         """
         Evaluate ensemble on held-out test set.
