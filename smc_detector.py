@@ -774,11 +774,15 @@ class SMCDetector:
             bodies = (r20['close'] - r20['open']).abs()
             h1_disp = float(min(bodies.max() / atr_1h, 10.0))
 
-            # liquidity sweep in last 30 bars
+            # liquidity sweep — full available history up to zone_time
+            # BUG FIX (Bug 2 — training counterpart): using tail(30) here produced
+            # a 97% hit rate because historical zones always had prior sweeps in their
+            # 30-bar window. The live fix widens _check_1h_confluence to use the full
+            # sub. Keep these two functions consistent so re-training matches live.
             h1_sweep = 0
-            cw = sub.tail(30).reset_index(drop=True)
+            cw = sub.reset_index(drop=True)
             sp2 = 4
-            for i in range(sp2, len(cw) - 1):
+            for i in range(sp2, len(cw)):
                 bar     = cw.iloc[i]
                 prev_lo = cw.iloc[max(0, i-sp2):i]['low'].min()
                 prev_hi = cw.iloc[max(0, i-sp2):i]['high'].max()

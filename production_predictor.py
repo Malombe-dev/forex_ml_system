@@ -53,10 +53,10 @@ CHANGES vs V6:
 
   BUGFIX-1   CONFLUENCE MISMATCH — ROOT CAUSE OF ZERO SIGNALS
              feature_builder expects zone['confluence'] = raw integer merge-count
-             (training mean=91.6, max=258). V7 was storing the HTF confluence
-             DICT {'score':1-10,...} there. feature_builder fell back to
-             raw_conf.get('score',1) = 1..10, wildly out-of-distribution,
-             causing scaler garbage → model sub-threshold for every zone.
+             (training mean=5.0, range 1–20, from smc_detector merge_zones).
+             V7 was storing the HTF confluence DICT {'score':1-10,...} there.
+             feature_builder fell back to raw_conf.get('score',1) = 1..10,
+             out-of-distribution, causing scaler garbage → model sub-threshold.
              Fix: zone['htf_confluence'] holds the display dict;
              zone['confluence'] = integer count of overlapping HTF sources.
 
@@ -107,6 +107,31 @@ CHANGES vs V6:
              prev_zone_outcome and time_since_last_touch which were removed in
              v8.  Those checks are harmless no-ops when the columns are absent
              but should be removed from data_validation.py to avoid confusion.
+
+  BUGFIX-9   h1_liquidity_sweep TRAINING BIAS (Bug 2)
+             _check_1h_confluence used tail(30) to detect sweeps. Training used
+             the full 1H history up to zone_time in smc_detector, so virtually
+             every historical zone had a sweep in range (mean=0.972). Live,
+             tail(30) missed most sweeps → default 0 → z=-5.85.
+             Fix: scan full sub (all available 1H bars) in both live and training.
+
+  BUGFIX-10  zone_touch_count UNDERCOUNT (Bug 3)
+             htf_trade_detect computed touch_count as closes strictly inside
+             the OB box over tail(50). Training used high/low overlap across all
+             bars (mean=11.24). Fresh OBs live scored 0–3 → z=-1.80.
+             Fix: use full df with high/low overlap criterion, matching training.
+
+  BUGFIX-11  m5_micro_bos / m5_sweep_confirmation PRE-TOUCH BIAS (Bug 4)
+             Training scored these at the TOUCH MOMENT (features already fired).
+             Live scoring happens BEFORE price enters the zone, so tail(20) had
+             0 BOS/sweeps → both z≈-2.5 simultaneously.
+             Fix: use tail(60) (5 hours of 5M bars) to capture recent approach.
+
+  BUGFIX-12  full_ob_zone confluence = confs (Bug 5)
+             htf_trade_detect set full_ob_zone['confluence'] = max(1, confs)
+             where confs = candle non-violation count (2–5). Scaler expects
+             HTF structural overlap count (mean=5.0, range 1–20).
+             Fix: compute real HTF item overlap count before building full_ob_zone.
 """
 
 import pandas as pd
@@ -730,7 +755,7 @@ class ProductionForexPredictor:
           4h/200     — get_htf_context FVG/OB analysis
           4h/100     — predict_with_proper_features / _ml_score_htf_zone
           1h/200     — get_htf_context 1H FVG/OB analysis
-          1day/30    — get_htf_context daily pivot / FVG/OB
+          1day/90    — get_htf_context daily pivot / FVG/OB
           5min/60    — predict_with_proper_features / htf_trade_detect
         """
         INTERVALS = [
@@ -740,7 +765,7 @@ class ProductionForexPredictor:
             ("4h",    200),
             ("4h",    100),
             ("1h",    200),
-            ("1day",   30),
+            ("1day",   90),
             ("5min",   60),
         ]
         print(f"  🔄 Pre-warming cache for {self.symbol} ({len(INTERVALS)} intervals)…")
@@ -992,7 +1017,7 @@ class ProductionForexPredictor:
 
         # outputsize=30: the D1 premium/discount gate uses tail(20), so we need
         # at least 20 bars here. 10 was too small and could produce a NaN range.
-        df_1d = self.fetch_bars(interval="1day", outputsize=30)
+        df_1d = self.fetch_bars(interval="1day", outputsize=90)
         if df_1d is not None and len(df_1d) > 1:
             y = df_1d.iloc[-2]
             pivot = (y['high'] + y['low'] + y['close']) / 3
@@ -1555,7 +1580,7 @@ class ProductionForexPredictor:
         df_1h = self.fetch_bars(interval="1h",   outputsize=100)
         df_4h = self.fetch_bars(interval="4h",   outputsize=100)
         df_5m = self.fetch_bars(interval="5min", outputsize=60)
-        df_d1 = self.fetch_bars(interval="1day", outputsize=30)
+        df_d1 = self.fetch_bars(interval="1day", outputsize=90)
 
         return self._predict(zone, df, entry, sl,
                              df_1h=df_1h, df_4h=df_4h, df_5m=df_5m, df_d1=df_d1)
@@ -1751,15 +1776,20 @@ class ProductionForexPredictor:
             result['h1_displacement'] = round(min(h1_disp, 10.0), 4)
 
             # ── h1_liquidity_sweep : zone-boundary wick + reclaim ─────────────
-            # Training: rolling 4-bar lookback window (sp=4), not just zone boundary.
-            # Detects: bar.low < prior 4-bar low AND close > prior 4-bar low (demand)
-            #          bar.high > prior 4-bar high AND close < prior 4-bar high (supply)
-            check_window = sub.tail(30).reset_index(drop=True)
+            # BUG FIX (Bug 2): Training used smc_detector._compute_h1_zone_features()
+            # which looked back across ALL 1H bars up to zone_time — meaning it
+            # captured historical sweeps that had already occurred at that point.
+            # The old 30-bar window missed most sweeps, causing the feature to default
+            # to 0. Since training mean=0.972, a live 0 produces z=-5.85.
+            #
+            # Fix: use the full available sub (all bars up to now), not just tail(30).
+            # sp=4 rolling window is preserved to match feature_builder exactly.
+            check_window = sub.reset_index(drop=True)
             sp = 4
-            for i in range(sp, len(check_window) - 3):
+            for i in range(sp, len(check_window)):
                 bar     = check_window.iloc[i]
-                prev_lo = check_window.iloc[i - sp:i]['low'].min()
-                prev_hi = check_window.iloc[i - sp:i]['high'].max()
+                prev_lo = check_window.iloc[max(0, i - sp):i]['low'].min()
+                prev_hi = check_window.iloc[max(0, i - sp):i]['high'].max()
                 if direction == 'BUY' and bar['low'] < prev_lo and bar['close'] > prev_lo:
                     result['h1_liquidity_sweep'] = 1
                     break
@@ -1805,7 +1835,18 @@ class ProductionForexPredictor:
             import pandas as pd
 
             zone_type = 'demand' if direction == 'BUY' else 'supply'
-            recent    = df_5m.tail(20).reset_index(drop=True)
+            # BUG FIX (Bug 4): Training computed m5_micro_bos and m5_sweep_confirmation
+            # using df_5m.tail(20) at the TOUCH MOMENT — meaning the BOS/sweep had
+            # already happened (it was what caused the 15min signal). Live, we score
+            # BEFORE the touch, so tail(20) contains bars approaching but not yet
+            # inside the zone. Both features default to 0 → z=-2.5 each.
+            #
+            # Fix: use tail(60) (5 hours of 5M bars) so that any recent micro-BOS
+            # or sweep in the approach toward the zone is captured. This matches the
+            # broader historical context that produced training means of 86%.
+            # m5_entry_candle_quality still uses tail(5) — it reflects the most recent
+            # candle only and is not affected by this window change.
+            recent = df_5m.tail(60).reset_index(drop=True)
 
             # ── ATR on 5M ────────────────────────────────────────────────────
             hi = recent['high']; lo = recent['low']; cl = recent['close']
@@ -2104,6 +2145,13 @@ class ProductionForexPredictor:
             # Injects pre-computed MTF features so build_feature_row receives
             # training-compatible values (not recomputed from wrong TF bars).
             #
+            # BUG FIX (Bug 5): 'confluence' was set to `confs` (the number of
+            # candles that didn't violate the OB, 2–5). That is a candle-health
+            # metric, not the HTF structural overlap count the scaler expects
+            # (training mean=5.0, range 1–20). Fix: compute the real overlap count
+            # by checking how many HTF FVG/OB structures intersect this OB zone,
+            # matching _ml_score_htf_zone() and _detect_zones_with_validation().
+            #
             # FIX C7 — double-negation guard:
             # _check_1h_confluence() already flips raw_trend for SELL zones so
             # h1_conf['h1_trend_alignment'] is the zone-aligned value (+1=aligned).
@@ -2111,13 +2159,24 @@ class ProductionForexPredictor:
             # is present in the zone dict (skips _compute_h1_features entirely).
             # DO NOT store raw_trend here — that would cause a double-flip for SELL
             # zones because feature_builder would then flip it a second time.
+            real_overlap = 1
+            if htf_context:
+                all_htf_items = (htf_context.get('h1_fvgs', []) +
+                                 htf_context.get('h4_fvgs', []) +
+                                 htf_context.get('h1_order_blocks', []) +
+                                 htf_context.get('h4_order_blocks', []))
+                for item in all_htf_items:
+                    item_bot = item.get('bottom', item.get('price_low', 0))
+                    item_top = item.get('top',    item.get('price_high', 0))
+                    if item_bot < ob['top'] and item_top > ob['bottom']:
+                        real_overlap += 1
             full_ob_zone = {
                 'type':                    'demand' if direction == 'BUY' else 'supply',
                 'price_high':              ob['top'],
                 'price_low':               ob['bottom'],
                 'price_mid':               ob['mid'],
                 'strength':                ob.get('strength', 1.0),
-                'confluence':              max(1, confs),
+                'confluence':              real_overlap,  # HTF structural overlap count — training-compatible
                 'index':                   ob.get('index', len(df) - 10),
                 'htf_alignment':           h1_conf['h1_trend_alignment'],
                 # 1H features — zone-aligned values from _check_1h_confluence()
@@ -2135,9 +2194,15 @@ class ProductionForexPredictor:
                 'approach_momentum':       approach['approach_momentum'],
                 'candle_body_ratio':       approach['candle_body_ratio'],
                 'tf_source':               tf,
-                # Estimate touch count from 4H bars — price revisits inside OB zone
-                'touch_count':             sum(1 for _, row in df.tail(50).iterrows()
-                                               if ob['bottom'] <= row['close'] <= ob['top']),
+                # BUG FIX (Bug 3): Training computed touch_count as any bar where
+                # low <= z_high AND high >= z_low (price entered zone range at all).
+                # The old criterion used close strictly inside the OB box, which gives
+                # 0–3 for a fresh OB. Training mean=11.24, so value=1 → z=-1.80.
+                # Fix: use the same low/high overlap criterion as _detect_zones_with_validation().
+                # Also use tail(200) (all available 4H bars) not tail(50) to match the
+                # historical depth that produced mean=11.24.
+                'touch_count':             max(1, int(((df['low'] <= ob['top']) &
+                                                        (df['high'] >= ob['bottom'])).sum())),
             }
 
             base_prob = self._ml_score_htf_zone(
@@ -2323,8 +2388,10 @@ class ProductionForexPredictor:
         #   int(raw_conf)  if not isinstance(raw_conf, dict)
         #   raw_conf.get('count', raw_conf.get('score', 1))  if dict
         # The dict path returns the display score (1–10), not the training-compatible
-        # integer count (training mean ~91.6).  We store the display dict under
-        # 'htf_confluence' only and write a plain int to 'confluence'.
+        # integer overlap count (training mean=5.0, range 1–20, from smc_detector
+        # merge_zones which counted overlapping FVG/OB clusters).
+        # We store the display dict under 'htf_confluence' only and write a plain int
+        # to 'confluence'.
         if self.use_htf_analysis and all_zones:
             all_fvgs = (htf_context.get('h1_fvgs', []) +
                         htf_context.get('h4_fvgs', []) +
@@ -2341,7 +2408,7 @@ class ProductionForexPredictor:
                 # FIX C4: use len(factors) as the integer overlap count.
                 # Never store the display dict in 'confluence' — feature_builder
                 # would fall back to conf_dict.get('score', 1) which is 1–10,
-                # far outside the training distribution (mean ~91.6, max ~258).
+                # outside the training distribution (mean=5.0, range 1–20).
                 overlap_count = int(len(conf_dict.get('factors', [])))
                 zone['confluence'] = max(1, overlap_count)  # int ≥1, training-compatible
                 assert isinstance(zone['confluence'], int), \
