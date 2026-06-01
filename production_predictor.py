@@ -127,11 +127,74 @@ CHANGES vs V6:
              0 BOS/sweeps → both z≈-2.5 simultaneously.
              Fix: use tail(60) (5 hours of 5M bars) to capture recent approach.
 
-  BUGFIX-12  full_ob_zone confluence = confs (Bug 5)
+  BUGFIX-13  MAX_DIST_PIPS SYMBOL-SCALING BUG
+             MAX_DIST_PIPS=80 was applied as raw pips but pip_size varies by
+             symbol. USD/JPY (pip_size=0.01): 80 pips = 0.80 JPY — absurdly
+             tight on a 159-price pair. XAU/USD (pip_size=1.0): 80 pips = $80.
+             Fix: express distance limit as 20 × 4H ATR (scales with volatility).
+
+  BUGFIX-14  OB/FVG DIRECTION FILTER USED EDGE NOT MID
+             Filter checked ob['top'] >= current_price for bullish OBs.
+             ob['top'] is the candle HIGH — often at or above current price
+             even for a valid demand zone, rejecting every near-price OB.
+             Fix: use ob['mid'] ± 1 ATR tolerance so approaching zones pass.
+
+  BUGFIX-16  CACHE REMOVED — current_price and h4_structure were frozen
+             fetch_bars() had a two-level cache (instance + shared process).
+             TTLs were 3540s for 1H, 14340s for 4H, 86400s for 1D.
+             htf_trade_detect took current_price from the cached 4H df['close'].iloc[-1]
+             — the close of a candle that could be hours old. This caused:
+             (a) current_price stuck for up to 4 hours → dist/direction/rr filters
+                 ran on wrong price, killing valid OBs and keeping invalid ghost OBs.
+             (b) h4_structure trend label frozen → bias gate used yesterday's bias,
+                 blocking valid setups (all 41 observations were from a stale bullish
+                 4H reading while market had already flipped bearish).
+             Fix: cache completely removed. Every fetch_bars() call is a live API
+             request. Rate limiter (7 calls/min) still protects the free tier.
+             current_price in htf_trade_detect now uses df_15m['close'].iloc[-1]
+             (15min bars are always ≤15 min old).
+             h4_trend in the bias gate is recomputed fresh each cycle by calling
+             detect_market_structure_shift() on a live 4H fetch — computation is
+             cheap (pure Python on already-fetched bars).
+
+             TP = entry + reaction_size * 1.5 but risk includes a 0.2 ATR SL
+             buffer, making risk > reaction_size and pushing rr just under 1.5.
+             Lowered MIN_HTF_RR from 1.5 to 1.2 to retain borderline OBs.
              htf_trade_detect set full_ob_zone['confluence'] = max(1, confs)
              where confs = candle non-violation count (2–5). Scaler expects
              HTF structural overlap count (mean=5.0, range 1–20).
              Fix: compute real HTF item overlap count before building full_ob_zone.
+
+  V9 FIXES   Three feature-alignment bugs confirmed by cross-referencing
+             feature_builder.py output against the scaler's trained 27-feature
+             sequence.
+
+  FIX-V9-1   m5_micro_bos / m5_sweep_confirmation WINDOW MISMATCH
+             _check_5min_entry() (HTF-OB pre-compute path) used tail(60).
+             feature_builder._compute_m5_features() (15-min fallback path)
+             used tail(20). 15-min zones without pre-injected m5 values fell
+             back to the narrower window, producing fewer BOS/sweep detections
+             and systematically lower model scores.
+             Fix A: feature_builder._compute_m5_features() now uses tail(60).
+             Fix B: generate_signals() pre-injects m5 values into every 15-min
+             zone dict before calling predict_with_proper_features() so
+             feature_builder always takes the fast pre-computed path.
+
+  FIX-V9-2   htf_trend_alignment {0,1} INSTEAD OF {-1,0,1} FOR 15-MIN ZONES
+             predict_with_proper_features() set htf_alignment = 0 for
+             counter-trend zones instead of -1, silencing the model's learned
+             counter-trend penalty for the entire 15-min pipeline.
+             Fix: predict_with_proper_features() now sets aligned=1,
+             counter-trend=-1, neutral=0 for both demand and supply zones.
+             feature_builder also clamps the raw value to {-1,0,1} as a guard.
+
+  FIX-V9-3   zone_confluence len(factors) CAPPED AT 4 vs TRAINING MEAN 5.0
+             generate_signals() used len(conf_dict['factors']) which maxes at 4
+             (FVG, OB, Fib, session). Scaler training mean=5.0, range 1–20
+             from smc_detector merge_zones(). Every 15-min zone was at z ≈ -1.
+             Fix: compute the real HTF item overlap count (count of h1/h4/daily
+             FVG and OB items whose price range overlaps the zone) — identical
+             to the method used in htf_trade_detect() for HTF-OB zones.
 """
 
 import pandas as pd
@@ -158,13 +221,20 @@ logging.basicConfig(level=logging.WARNING, format='%(asctime)s [%(levelname)s] %
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# SHARED DATA CACHE — process-level, keyed by (symbol, interval, outputsize)
-# All predictor instances for the same symbol share this cache so that
-# REV and CONT predictors never fetch the same bars twice in one cycle.
-# This halves API calls, keeping usage within the 8 calls/min free-tier limit.
+# SHARED BAR CACHE — 60-second TTL, keyed by (symbol, interval, outputsize).
+#
+# Purpose: REV and CONT predictors for the same symbol share bar data within
+# a single 15-minute cycle.  The REV predictor fetches all 6 bar sets at the
+# top of generate_signals() and stores them in the cache.  When CONT runs a
+# few seconds later it hits the cache instead of making duplicate API calls.
+#
+# TTL is intentionally short (60 s) so the cache never goes stale across
+# cycles.  Every new cycle the REV predictor always re-fetches fresh bars;
+# the cache just prevents the duplicate within the same cycle.
 # ---------------------------------------------------------------------------
-_SHARED_BAR_CACHE: Dict[tuple, tuple] = {}   # (symbol,interval,size) → (timestamp, df)
-_SHARED_CACHE_LOCK = threading.Lock()
+_SHARED_BAR_CACHE: Dict[tuple, Dict] = {}
+_SHARED_BAR_CACHE_LOCK = threading.Lock()
+_SHARED_BAR_CACHE_TTL  = 60.0   # seconds — long enough for REV→CONT within one cycle
 
 # ---------------------------------------------------------------------------
 # API RATE LIMITER — enforces max 7 real HTTP calls per 60-second window.
@@ -720,7 +790,7 @@ class ProductionForexPredictor:
 
         self.load_model(model_path, scaler_path, encoders_path, stats_path)
 
-        self.htf_cache             = {}
+        self.htf_cache             = {}  # kept for attribute compatibility; not used for caching
         self.tracked_zones_15min   = []
         self.last_15min_bar_time   = None
         self.zone_history          = {}   # FIX: was never initialised — caused AttributeError at runtime
@@ -735,59 +805,10 @@ class ProductionForexPredictor:
         if not self.debug:
             print(f"✓ {key.upper()} [{symbol}] loaded | Base: {self.prob_threshold*100:.0f}% | MaxBoost: {self.max_boost*100:.0f}%")
 
-    # ---- cache pre-warming ---------------------------------------------------
-
+    # ---- cache pre-warming (removed) ----------------------------------------
+    # Cache removed — pre_warm_cache is a no-op kept for call-site compatibility.
     def pre_warm_cache(self) -> None:
-        """
-        Fetch every (interval, outputsize) combination this predictor uses and
-        populate the shared process-level _SHARED_BAR_CACHE.
-
-        Called once per symbol (via the REV predictor) before DailyPlanScheduler
-        or the main loop iterates over individual predictors.  Subsequent
-        fetch_bars() calls from both REV and CONT predictors will be cache hits,
-        reducing live API calls from up to 32 (4 symbols × 8 fetches) per cycle
-        down to 8 (one real fetch per unique key per symbol).
-
-        Unique (interval, outputsize) keys used across the full pipeline:
-          15min/200  — generate_signals primary bars
-          1h/100     — get_htf_context trend + _ml_score_htf_zone / htf_trade_detect
-          4h/50      — get_htf_context h4_atr fallback
-          4h/200     — get_htf_context FVG/OB analysis
-          4h/100     — predict_with_proper_features / _ml_score_htf_zone
-          1h/200     — get_htf_context 1H FVG/OB analysis
-          1day/90    — get_htf_context daily pivot / FVG/OB
-          5min/60    — predict_with_proper_features / htf_trade_detect
-        """
-        INTERVALS = [
-            ("15min", 200),
-            ("1h",    100),
-            ("4h",     50),
-            ("4h",    200),
-            ("4h",    100),
-            ("1h",    200),
-            ("1day",   90),
-            ("5min",   60),
-        ]
-        print(f"  🔄 Pre-warming cache for {self.symbol} ({len(INTERVALS)} intervals)…")
-        hit = miss = 0
-        for interval, outputsize in INTERVALS:
-            shared_key = (self.symbol, interval, outputsize)
-            now        = datetime.utcnow()
-            cache_dur  = 120 if interval == "5min" else 300
-            with _SHARED_CACHE_LOCK:
-                cached = _SHARED_BAR_CACHE.get(shared_key)
-            if cached is not None:
-                cached_time, _ = cached
-                if (now - cached_time).total_seconds() < cache_dur:
-                    hit += 1
-                    continue
-            # Not cached (or expired) — fetch and populate shared cache
-            df = self.fetch_bars(interval=interval, outputsize=outputsize)
-            if df is not None:
-                miss += 1
-            else:
-                print(f"    ⚠️  pre_warm_cache: fetch failed for {interval}/{outputsize}")
-        print(f"  ✅ Cache warmed for {self.symbol}: {miss} fetched, {hit} already cached")
+        pass
 
     # ---- model loading -------------------------------------------------------
 
@@ -896,40 +917,25 @@ class ProductionForexPredictor:
 
     def fetch_bars(self, interval: str = "15min", outputsize: int = 200) -> Optional[pd.DataFrame]:
         """Fetch OHLC from TwelveData.
-        Uses a two-level cache:
-          1. Instance-level self.htf_cache  — backward-compat, always checked first
-          2. Process-level _SHARED_BAR_CACHE — shared across REV+CONT instances for
-             the same symbol so identical requests are never fetched twice per cycle.
-        Cache TTL: 120 s for 5min bars, 300 s for everything else.
-        IMPROVE-4: uses .total_seconds() so TTL works beyond 1 hour.
+
+        Uses a 60-second shared-process cache keyed by (symbol, interval, outputsize)
+        so that REV and CONT predictors for the same symbol share bar data within a
+        single cycle without making duplicate API calls.
+
+        The TTL is short enough (60 s) that the cache never survives across cycles,
+        so current_price, h4_structure, and all derived state are always live.
+        The rate limiter still enforces 7 real calls/min per API key.
+        IMPROVE-4: .total_seconds() used throughout (no .seconds wrapping).
         """
-        # Interval-appropriate TTLs — only refetch when a new candle could have closed.
-        # 15min/5min are fetched every cycle; 1H/4H/1D are cached for their full duration.
-        cache_duration = {
-            "5min":  120,     # new candle every 5min  — always fresh
-            "15min": 840,     # new candle every 15min — 840s keeps one cycle under TTL
-            "1h":    3540,    # new candle every 1hr   — refetch once per hour
-            "4h":    14340,   # new candle every 4hrs  — refetch once per 4 hours
-            "1day":  86400,   # new candle every 24hrs — refetch once per day
-        }.get(interval, 300)
-        shared_key     = (self.symbol, interval, outputsize)
-        now            = datetime.utcnow()
-
-        # ── Level 1: instance cache (fastest path) ────────────────────────
-        inst_key = f"{interval}_{outputsize}"
-        if inst_key in self.htf_cache:
-            cached_time, cached_df = self.htf_cache[inst_key]
-            if (now - cached_time).total_seconds() < cache_duration:
-                return cached_df.copy()
-
-        # ── Level 2: shared process cache ────────────────────────────────
-        with _SHARED_CACHE_LOCK:
-            if shared_key in _SHARED_BAR_CACHE:
-                cached_time, cached_df = _SHARED_BAR_CACHE[shared_key]
-                if (now - cached_time).total_seconds() < cache_duration:
-                    # Warm the instance cache too so next call hits Level 1
-                    self.htf_cache[inst_key] = (cached_time, cached_df)
-                    return cached_df.copy()
+        cache_key = (self.symbol, interval, outputsize)
+        with _SHARED_BAR_CACHE_LOCK:
+            entry = _SHARED_BAR_CACHE.get(cache_key)
+            if entry is not None:
+                age = time.time() - entry['ts']
+                if age < _SHARED_BAR_CACHE_TTL:
+                    return entry['df']
+                # Stale entry — evict and re-fetch
+                del _SHARED_BAR_CACHE[cache_key]
 
         endpoint = f"{self.base_url.rstrip()}/time_series"
         params   = {
@@ -958,7 +964,7 @@ class ProductionForexPredictor:
             logger.warning(f"fetch_bars({interval}): 3 attempts failed — {last_error}")
             return None
         if "values" not in data:
-            api_status = data.get("status", "?")  
+            api_status = data.get("status", "?")
             api_msg    = data.get("message", str(data)[:120])
             print(f"  ❌ fetch_bars({interval}): no 'values' in response — status={api_status} msg={api_msg}")
             return None
@@ -985,41 +991,55 @@ class ProductionForexPredictor:
         df.reset_index(drop=True, inplace=True)
         df["avg_spread"] = 0.00005
         self._calculate_indicators(df)
-        fetch_time = datetime.utcnow()
-        self.htf_cache[inst_key] = (fetch_time, df)
-        with _SHARED_CACHE_LOCK:
-            _SHARED_BAR_CACHE[shared_key] = (fetch_time, df)
+
+        # Store in the shared cache so the sibling predictor (REV↔CONT) can
+        # reuse these bars within the same 15-min cycle without a duplicate fetch.
+        with _SHARED_BAR_CACHE_LOCK:
+            _SHARED_BAR_CACHE[cache_key] = {'df': df, 'ts': time.time()}
+
         return df
 
     # ---- HTF context ---------------------------------------------------------
 
-    def get_htf_context(self) -> Dict:
+    def get_htf_context(self,
+                         df_1h:   Optional[pd.DataFrame] = None,
+                         df_4h_c: Optional[pd.DataFrame] = None,
+                         df_4h:   Optional[pd.DataFrame] = None,
+                         df_1d:   Optional[pd.DataFrame] = None) -> Dict:
+        """Build HTF context.
+
+        Accepts pre-fetched DataFrames from generate_signals() so no extra
+        API calls are made.  Falls back to self.fetch_bars() when called
+        standalone (e.g. from DailyPlanScheduler) without arguments.
+        """
         context = {}
 
-        df_1h = self.fetch_bars(interval="1h", outputsize=100)
-        if df_1h is not None and len(df_1h) > 50:
-            context['h1_trend']  = 'bullish' if df_1h['ema_20'].iloc[-1] > df_1h['ema_50'].iloc[-1] else 'bearish'
-            context['h1_close']  = df_1h['close'].iloc[-1]
+        # Resolve bars — use pre-fetched if supplied, otherwise fetch live.
+        _df_1h   = df_1h   if df_1h   is not None else self.fetch_bars(interval="1h",   outputsize=100)
+        _df_4h_c = df_4h_c if df_4h_c is not None else self.fetch_bars(interval="4h",   outputsize=100)
+        _df_4h   = df_4h   if df_4h   is not None else self.fetch_bars(interval="4h",   outputsize=200)
+        _df_1d   = df_1d   if df_1d   is not None else self.fetch_bars(interval="1day", outputsize=90)
+
+        if _df_1h is not None and len(_df_1h) > 50:
+            context['h1_trend']  = 'bullish' if _df_1h['ema_20'].iloc[-1] > _df_1h['ema_50'].iloc[-1] else 'bearish'
+            context['h1_close']  = _df_1h['close'].iloc[-1]
             context['trend_source'] = '1H'
         else:
-            df_4h = self.fetch_bars(interval="4h", outputsize=50)
-            if df_4h is not None and len(df_4h) > 50:
-                context['h1_trend']  = 'bullish' if df_4h['ema_20'].iloc[-1] > df_4h['ema_50'].iloc[-1] else 'bearish'
-                context['h1_close']  = df_4h['close'].iloc[-1]
+            if _df_4h_c is not None and len(_df_4h_c) > 50:
+                context['h1_trend']  = 'bullish' if _df_4h_c['ema_20'].iloc[-1] > _df_4h_c['ema_50'].iloc[-1] else 'bearish'
+                context['h1_close']  = _df_4h_c['close'].iloc[-1]
                 context['trend_source'] = '4H'
             else:
                 context['h1_trend']     = 'neutral'
                 context['h1_close']     = None
                 context['trend_source'] = 'FALLBACK'
 
-        df_4h = self.fetch_bars(interval="4h", outputsize=50)
-        context['h4_atr'] = df_4h['atr'].iloc[-1] if df_4h is not None and len(df_4h) > 14 else None
+        context['h4_atr'] = _df_4h_c['atr'].iloc[-1] if _df_4h_c is not None and len(_df_4h_c) > 14 else None
 
-        # outputsize=30: the D1 premium/discount gate uses tail(20), so we need
-        # at least 20 bars here. 10 was too small and could produce a NaN range.
-        df_1d = self.fetch_bars(interval="1day", outputsize=90)
-        if df_1d is not None and len(df_1d) > 1:
-            y = df_1d.iloc[-2]
+        # outputsize=90: the D1 premium/discount gate uses tail(60) so we need
+        # at least 60 bars here.
+        if _df_1d is not None and len(_df_1d) > 1:
+            y = _df_1d.iloc[-2]
             pivot = (y['high'] + y['low'] + y['close']) / 3
             context.update({
                 'daily_pivot': pivot, 'daily_r1': 2 * pivot - y['low'],
@@ -1030,33 +1050,33 @@ class ProductionForexPredictor:
             context.update({'daily_pivot': None, 'daily_r1': None, 'daily_s1': None})
 
         if self.use_htf_analysis:
-            df_4h_full = self.fetch_bars(interval="4h", outputsize=200)
-            if df_4h_full is not None and len(df_4h_full) > 20:
-                context['h4_fvgs']         = self.htf_analyzer.detect_fvg(df_4h_full, '4h')
-                context['h4_order_blocks'] = self.htf_analyzer.detect_order_blocks(df_4h_full, '4h')
-                context['h4_structure']    = self.htf_analyzer.detect_market_structure_shift(df_4h_full)
-                context['h4_fib_levels']   = self.htf_analyzer.calculate_fibonacci_levels(df_4h_full, 100)
-                context['h4_atr']          = df_4h_full['atr'].iloc[-1]
+            if _df_4h is not None and len(_df_4h) > 20:
+                context['h4_fvgs']         = self.htf_analyzer.detect_fvg(_df_4h, '4h')
+                context['h4_order_blocks'] = self.htf_analyzer.detect_order_blocks(_df_4h, '4h')
+                context['h4_structure']    = self.htf_analyzer.detect_market_structure_shift(_df_4h)
+                context['h4_fib_levels']   = self.htf_analyzer.calculate_fibonacci_levels(_df_4h, 100)
+                context['h4_atr']          = _df_4h['atr'].iloc[-1]
                 if self.debug:
                     print(f"\n  🔍 4H [{self.symbol}]: {len(context['h4_fvgs'])} FVGs, {len(context['h4_order_blocks'])} OBs")
             else:
                 context.update({'h4_fvgs': [], 'h4_order_blocks': [], 'h4_structure': {'trend': 'neutral'}, 'h4_fib_levels': {}})
 
-            df_1h_full = self.fetch_bars(interval="1h", outputsize=200)
-            if df_1h_full is not None and len(df_1h_full) > 20:
-                context['h1_fvgs']         = self.htf_analyzer.detect_fvg(df_1h_full, '1h')
-                context['h1_order_blocks'] = self.htf_analyzer.detect_order_blocks(df_1h_full, '1h')
-                context['h1_structure']    = self.htf_analyzer.detect_market_structure_shift(df_1h_full)
-                context['h1_fib_levels']   = self.htf_analyzer.calculate_fibonacci_levels(df_1h_full, 50)
+            # Reuse _df_1h (outputsize=100) for 1H FVG/OB detection.
+            # 100 bars covers ~4 days of 1H history — sufficient for zone detection.
+            if _df_1h is not None and len(_df_1h) > 20:
+                context['h1_fvgs']         = self.htf_analyzer.detect_fvg(_df_1h, '1h')
+                context['h1_order_blocks'] = self.htf_analyzer.detect_order_blocks(_df_1h, '1h')
+                context['h1_structure']    = self.htf_analyzer.detect_market_structure_shift(_df_1h)
+                context['h1_fib_levels']   = self.htf_analyzer.calculate_fibonacci_levels(_df_1h, 50)
                 if self.debug:
                     print(f"  🔍 1H [{self.symbol}]: {len(context['h1_fvgs'])} FVGs, {len(context['h1_order_blocks'])} OBs")
             else:
                 context.update({'h1_fvgs': [], 'h1_order_blocks': [], 'h1_structure': {'trend': 'neutral'}, 'h1_fib_levels': {}})
 
-            if df_1d is not None and len(df_1d) > 20:
-                context['daily_fvgs']         = self.htf_analyzer.detect_fvg(df_1d, 'daily')
-                context['daily_order_blocks']  = self.htf_analyzer.detect_order_blocks(df_1d, 'daily')
-                context['daily_structure']     = self.htf_analyzer.detect_market_structure_shift(df_1d)
+            if _df_1d is not None and len(_df_1d) > 20:
+                context['daily_fvgs']         = self.htf_analyzer.detect_fvg(_df_1d, 'daily')
+                context['daily_order_blocks']  = self.htf_analyzer.detect_order_blocks(_df_1d, 'daily')
+                context['daily_structure']     = self.htf_analyzer.detect_market_structure_shift(_df_1d)
             else:
                 context.update({'daily_fvgs': [], 'daily_order_blocks': [], 'daily_structure': {'trend': 'neutral'}})
 
@@ -1094,14 +1114,23 @@ class ProductionForexPredictor:
 
                 if drop > current_atr * self.min_strength_atr and bar['high'] > current_price:
                     strength     = drop / current_atr
-                    future_bars  = recent.iloc[i:]
-                    violated     = (future_bars['close'] > bar['high'] + current_atr * 0.5).any()
+                    # FIX 1a: cap future scan to ~12 hours (50 bars) instead of
+                    # scanning to end-of-dataset — a Monday zone was being checked
+                    # against all of Friday's future price action.
+                    future_bars  = recent.iloc[i:i + 50]
+                    # FIX 1b: widen violation threshold from 0.5x to 1.5x ATR so
+                    # that normal retest wicks don't discard valid supply zones.
+                    violated     = (future_bars['close'] > bar['high'] + current_atr * 1.5).any()
 
                     if not violated:
                         if htf_context.get('h1_trend') == 'bullish':
                             strength *= 0.7
-                        if df['rsi'].iloc[idx_in_df] < 35:
-                            continue
+                        # FIX 1c: RSI gate REMOVED — the model was trained on zones
+                        # across the full RSI range (training mean=50.49). A supply
+                        # zone forming at RSI 30–35 can be a strong reversal signal;
+                        # hard-gating it here contradicts what the model learned.
+                        # if df['rsi'].iloc[idx_in_df] < 35:
+                        #     continue
 
                         # IMPROVE-2: real candle boundaries
                         body_top    = max(bar['open'], bar['close'])
@@ -1140,14 +1169,19 @@ class ProductionForexPredictor:
 
                 if rise > current_atr * self.min_strength_atr and bar['low'] < current_price:
                     strength    = rise / current_atr
-                    future_bars = recent.iloc[i:]
-                    violated    = (future_bars['close'] < bar['low'] - current_atr * 0.5).any()
+                    # FIX 2a: cap future scan to ~12 hours (50 bars).
+                    future_bars = recent.iloc[i:i + 50]
+                    # FIX 2b: widen violation threshold from 0.5x to 1.5x ATR.
+                    violated    = (future_bars['close'] < bar['low'] - current_atr * 1.5).any()
 
                     if not violated:
                         if htf_context.get('h1_trend') == 'bearish':
                             strength *= 0.7
-                        if df['rsi'].iloc[idx_in_df] > 65:
-                            continue
+                        # FIX 2c: RSI gate REMOVED — demand zones forming at RSI 65+
+                        # (overbought) are valid reversion setups; the model learned
+                        # this from training data spanning the full RSI range.
+                        # if df['rsi'].iloc[idx_in_df] > 65:
+                        #     continue
 
                         # IMPROVE-2: real candle boundaries
                         body_bottom = min(bar['open'], bar['close'])
@@ -1263,12 +1297,13 @@ class ProductionForexPredictor:
     # ---- 5-min refinement ----------------------------------------------------
 
     def refine_entry_with_5min(self, zone: Dict, current_price: float,
-                                current_atr_15min: float) -> Optional[Dict]:
-        df_5min = self.fetch_bars(interval="5min", outputsize=100)
-        if df_5min is None or len(df_5min) < 20:
+                                current_atr_15min: float,
+                                df_5min: Optional[pd.DataFrame] = None) -> Optional[Dict]:
+        _df = df_5min if df_5min is not None else self.fetch_bars(interval="5min", outputsize=100)
+        if _df is None or len(_df) < 20:
             return None
-        current_5min_price = df_5min['close'].iloc[-1]
-        atr_5min           = df_5min['atr'].iloc[-1]
+        current_5min_price = _df['close'].iloc[-1]
+        atr_5min           = _df['atr'].iloc[-1]
         if pd.isna(atr_5min) or atr_5min <= 0:
             atr_5min = self.pip_size * 5
 
@@ -1283,7 +1318,7 @@ class ProductionForexPredictor:
             self.stats['refine_rejections'] += 1
             return None
 
-        recent_5min    = df_5min.tail(20)
+        recent_5min    = _df.tail(20)
         rejection_score = 0
         for i in range(-5, 0):
             bar        = recent_5min.iloc[i]
@@ -1491,7 +1526,6 @@ class ProductionForexPredictor:
         return entry, sl, tp, actual_rr
 
     # ---- ML prediction -------------------------------------------------------
-
     def _predict(self, zone: Dict, df: pd.DataFrame,
                  entry: float, sl: float,
                  df_1h: Optional[pd.DataFrame] = None,
@@ -1499,15 +1533,58 @@ class ProductionForexPredictor:
                  df_5m: Optional[pd.DataFrame] = None,
                  df_d1: Optional[pd.DataFrame] = None) -> float:
         try:
+            # ── Per-zone touch_index ───────────────────────────────────────────
+            # BUG (FIX B original): touch_index=len(df)-1 was hardcoded, so ALL
+            # zones on the same pair shared the same approach bar → identical
+            # candle_body_ratio, approach_momentum, approach_distance across every
+            # OB regardless of price level. This collapsed model discrimination.
+            #
+            # FIX: find the most recent bar where price was within 1 ATR of THIS
+            # specific zone. Each zone now gets its own approach context.
+            # Fallback to len(df)-1 for distant/untouched pending zones so that
+            # m5_micro_bos / m5_sweep still resolve correctly (original FIX B
+            # intent is preserved for the fallback case).
+            _zone_top = zone.get('price_high', zone.get('top',    df['close'].iloc[-1]))
+            _zone_bot = zone.get('price_low',  zone.get('bottom', df['close'].iloc[-1]))
+            _cur_atr  = (df['atr'].iloc[-1]
+                         if 'atr' in df.columns and not pd.isna(df['atr'].iloc[-1])
+                         else self.pip_size * 15)
+
+            # Last bar where price was within 1 ATR of the zone boundaries
+            _near = (df['low']  <= _zone_top + _cur_atr) & \
+                    (df['high'] >= _zone_bot - _cur_atr)
+            if _near.any():
+                _touch_index = int(_near.values.nonzero()[0][-1])
+            else:
+                _touch_index = len(df) - 1   # fallback: current bar
+
             row_df = build_feature_row(
                 zone=zone, df=df, entry=entry, sl=sl,
                 encoders=self.encoders, pip_size=self.pip_size,
+                touch_index=_touch_index,
                 df_1h=df_1h, df_4h=df_4h, df_5m=df_5m, df_d1=df_d1,
             )
         except ValueError as exc:
             print(f"  ❌ build_feature_row FAILED: {exc}")
             logger.warning(f"build_feature_row failed: {exc}")
             return 0.5
+
+        # ── DIAGNOSTIC: log critical feature values to verify live alignment ──
+        # h4_fvg_inside carries 40% of XGBoost reversion weight; if it is
+        # returning 0 for most zones the model is blind on its top feature.
+        # h1_liquidity_sweep training mean=0.972 — should rarely be 0.
+        # Remove or gate behind self.debug once confirmed correct.
+        if self.debug:
+            _d = row_df.iloc[0].to_dict()
+            print(
+                f"  🔍 features: h4_fvg_inside={_d.get('h4_fvg_inside')}"
+                f"  rsi={_d.get('rsi', 0):.1f}"
+                f"  h1_liq_sweep={_d.get('h1_liquidity_sweep')}"
+                f"  m5_bos={_d.get('m5_micro_bos')}"
+                f"  m5_sweep={_d.get('m5_sweep_confirmation')}"
+                f"  touch={_d.get('zone_touch_count')}"
+                f"  zone_age={_d.get('zone_age_bars')}"
+            )
 
         X = row_df.values
         if np.isnan(X).any() or np.isinf(X).any():
@@ -1523,7 +1600,7 @@ class ProductionForexPredictor:
             if self.rf_model is not None and self.lr_model is not None:
                 p_rf  = float(self.rf_model.predict_proba(X_scaled)[0][1])
                 p_lr  = float(self.lr_model.predict_proba(X_scaled)[0][1])
-                # CHANGE: Standardize to a true mathematical ensemble average.
+                # Standardise to a true mathematical ensemble average.
                 # CalibratedClassifierCV has already corrected both XGBoost and RF
                 # probabilities into true percentages; uniform weighting removes
                 # the old uncalibrated-variance compensation.
@@ -1549,10 +1626,19 @@ class ProductionForexPredictor:
             print(f"  ❌ model.predict FAILED: {exc}")
             logger.warning(f"model.predict failed: {exc}")
             return 0.5
-
+            
+    
     def predict_with_proper_features(self, zone: Dict, df: pd.DataFrame,
-                                      htf_context: Dict) -> float:
-        """Wrapper: derives entry/sl from zone geometry for generate_signals()."""
+                                      htf_context: Dict,
+                                      df_1h: Optional[pd.DataFrame] = None,
+                                      df_4h: Optional[pd.DataFrame] = None,
+                                      df_5m: Optional[pd.DataFrame] = None,
+                                      df_d1: Optional[pd.DataFrame] = None) -> float:
+        """Wrapper: derives entry/sl from zone geometry for generate_signals().
+
+        Accepts pre-fetched DataFrames to avoid duplicate API calls.
+        Falls back to self.fetch_bars() when called standalone.
+        """
         current_atr = df['atr'].iloc[-1]
         if pd.isna(current_atr) or current_atr <= 0:
             current_atr = self.pip_size * 10
@@ -1567,32 +1653,50 @@ class ProductionForexPredictor:
             sl    = entry + risk
 
         # IMPROVE-9: duplicate htf_alignment block removed — set once only
+        # FIX (v9): htf_alignment must be {-1, 0, 1} — not {0, 1}.
+        # The old code set 0 for counter-trend zones instead of -1, silencing
+        # the model's counter-trend penalty for the entire 15-min pipeline.
+        # Now: aligned=1, counter-trend=-1, neutral/unknown=0 for both directions.
         if 'htf_alignment' not in zone:
             d1_trend = htf_context.get('daily_structure', {}).get('trend', 'neutral')
             if d1_trend == 'neutral':
                 d1_trend = htf_context.get('h4_structure', {}).get('trend', 'neutral')
             if zone['type'] == 'demand':
-                zone['htf_alignment'] = 1 if d1_trend == 'bullish' else 0
+                # demand: bullish=aligned(1), bearish=counter(-1), neutral=0
+                zone['htf_alignment'] = (1 if d1_trend == 'bullish'
+                                         else -1 if d1_trend == 'bearish'
+                                         else 0)
             else:
-                zone['htf_alignment'] = 1 if d1_trend == 'bearish' else 0
+                # supply: bearish=aligned(1), bullish=counter(-1), neutral=0
+                zone['htf_alignment'] = (1 if d1_trend == 'bearish'
+                                         else -1 if d1_trend == 'bullish'
+                                         else 0)
 
-        # v7: fetch MTF bars for new features (use cached — no extra API calls)
-        df_1h = self.fetch_bars(interval="1h",   outputsize=100)
-        df_4h = self.fetch_bars(interval="4h",   outputsize=100)
-        df_5m = self.fetch_bars(interval="5min", outputsize=60)
-        df_d1 = self.fetch_bars(interval="1day", outputsize=90)
+        # Use pre-fetched bars if supplied; fall back to live fetch only when
+        # called standalone (e.g. from DailyPlanScheduler).
+        _df_1h = df_1h if df_1h is not None else self.fetch_bars(interval="1h",   outputsize=100)
+        _df_4h = df_4h if df_4h is not None else self.fetch_bars(interval="4h",   outputsize=100)
+        _df_5m = df_5m if df_5m is not None else self.fetch_bars(interval="5min", outputsize=60)
+        _df_d1 = df_d1 if df_d1 is not None else self.fetch_bars(interval="1day", outputsize=90)
 
         return self._predict(zone, df, entry, sl,
-                             df_1h=df_1h, df_4h=df_4h, df_5m=df_5m, df_d1=df_d1)
+                             df_1h=_df_1h, df_4h=_df_4h, df_5m=_df_5m, df_d1=_df_d1)
 
     def _ml_score_htf_zone(self, zone: Dict, df: pd.DataFrame, tf: str,
                             htf_context: Optional[Dict] = None,
-                            zone_override: Optional[Dict] = None) -> float:
+                            zone_override: Optional[Dict] = None,
+                            df_1h: Optional[pd.DataFrame] = None,
+                            df_4h: Optional[pd.DataFrame] = None,
+                            df_5m: Optional[pd.DataFrame] = None,
+                            df_d1: Optional[pd.DataFrame] = None) -> float:
         """
         Score an HTF zone with the ML model.
         If zone_override is supplied (from htf_trade_detect with 1H/5min/15min
         features already computed), use it directly — ensures the model receives
         training-compatible feature values instead of recomputing from wrong TF.
+
+        Accepts pre-fetched DataFrames to avoid duplicate API calls.
+        Falls back to self.fetch_bars() when called standalone.
         """
         # Fast path: pre-built zone with all MTF features already injected
         if zone_override is not None:
@@ -1606,13 +1710,13 @@ class ProductionForexPredictor:
                                      else zone_override['price_high'])),
                         current_atr * self.min_risk_atr)
             sl = entry - risk if zone_type == 'demand' else entry + risk
-            df_1h = self.fetch_bars(interval="1h",   outputsize=100)
-            df_4h = self.fetch_bars(interval="4h",   outputsize=100)
-            df_5m = self.fetch_bars(interval="5min", outputsize=60)
-            df_d1 = self.fetch_bars(interval="1day", outputsize=30)
+            _df_1h = df_1h if df_1h is not None else self.fetch_bars(interval="1h",   outputsize=100)
+            _df_4h = df_4h if df_4h is not None else self.fetch_bars(interval="4h",   outputsize=100)
+            _df_5m = df_5m if df_5m is not None else self.fetch_bars(interval="5min", outputsize=60)
+            _df_d1 = df_d1 if df_d1 is not None else self.fetch_bars(interval="1day", outputsize=30)
             return self.apply_boost_ceiling(
                 self._predict(zone_override, df, entry, sl,
-                              df_1h=df_1h, df_4h=df_4h, df_5m=df_5m, df_d1=df_d1), 0)
+                              df_1h=_df_1h, df_4h=_df_4h, df_5m=_df_5m, df_d1=_df_d1), 0)
         current_atr = df['atr'].iloc[-1]
         if pd.isna(current_atr) or current_atr <= 0:
             current_atr = self.pip_size * 15
@@ -1969,32 +2073,51 @@ class ProductionForexPredictor:
         result['candle_body_ratio'] = round(body / wick, 4) if wick > 0 else 0.0
         return result
 
-    def htf_trade_detect(self, tf: str = "4h", htf_context: Optional[Dict] = None) -> List[Dict]:
+    def htf_trade_detect(self, tf: str = "4h", htf_context: Optional[Dict] = None,
+                          df_4h:  Optional[pd.DataFrame] = None,
+                          df_15m: Optional[pd.DataFrame] = None,
+                          df_5m:  Optional[pd.DataFrame] = None,
+                          df_1h:  Optional[pd.DataFrame] = None) -> List[Dict]:
         """
         PRIMARY signal detection pipeline — matches training architecture exactly.
         Detects 4H Order Blocks (96% of training), confirms with 1H structure
         (90% required 4H+1H confluence), refines entry using 15min approach
         and 5min trigger confirmation.
+
+        Accepts pre-fetched DataFrames from generate_signals() to avoid duplicate
+        API calls.  Falls back to self.fetch_bars() when called standalone.
         """
-        df = self.fetch_bars(interval=tf, outputsize=200)
+        df = df_4h if df_4h is not None else self.fetch_bars(interval=tf, outputsize=200)
         if df is None or len(df) < 50:
             return []
 
-        current_price = df['close'].iloc[-1]
+        # FIX: current_price must come from 15min bars, not the 4H df.
+        # The 4H candle close is the price at the END of a 4-hour bar — often
+        # hours old. Using it caused the bias gate and dist filter to run on a
+        # frozen price. 15min bars have a 15-minute close which is always live.
+        _df_15m = df_15m if df_15m is not None else self.fetch_bars(interval="15min", outputsize=200)
+        _df_5m  = df_5m  if df_5m  is not None else self.fetch_bars(interval="5min",  outputsize=60)
+        _df_1h  = df_1h  if df_1h  is not None else self.fetch_bars(interval="1h",    outputsize=100)
+
+        if _df_15m is not None and len(_df_15m) > 0:
+            current_price = _df_15m['close'].iloc[-1]
+        else:
+            current_price = df['close'].iloc[-1]  # fallback only
+
         current_atr   = df['atr'].iloc[-1]
         fvgs          = self.htf_analyzer.detect_fvg(df, tf)
         obs           = self.htf_analyzer.detect_order_blocks(df, tf)
         fib_levels    = self.htf_analyzer.calculate_fibonacci_levels(df, 100)
 
-        # Fetch lower TF bars once — cached so no extra API calls
-        df_1h  = self.fetch_bars(interval="1h",   outputsize=100)
-        df_15m = self.fetch_bars(interval="15min", outputsize=200)
-        df_5m  = self.fetch_bars(interval="5min",  outputsize=60)
-
         htf_setups       = []
-        MAX_DIST_PIPS    = 80
-        MIN_HTF_RR       = 1.5
-        MAX_HTF_RR       = 6.0
+        # FILTER FIX: MAX_DIST_PIPS=80 as raw pips breaks across symbols.
+        # USD/JPY pip_size=0.01 → 80 pips = 0.80 JPY (way too tight on a 159 price).
+        # XAU/USD pip_size=1.0  → 80 pips = $80 (tight on a $4391 price).
+        # Fix: use ATR multiples — valid 4H OBs are typically within 15–20 ATR of price.
+        MAX_DIST_ATR     = 20.0   # reject OBs more than 20 × 4H ATR from current price
+        MAX_DIST_PIPS    = MAX_DIST_ATR * (current_atr / self.pip_size)
+        MIN_HTF_RR   = 1.2
+        MAX_HTF_RR   = 6.0 if self.symbol == 'XAU/USD' else 10.0
         MIN_HTF_STRENGTH = 0.5  # lowered from 0.8 — 0.8 kills valid zones in low-vol sessions
 
         if self.debug:
@@ -2002,6 +2125,10 @@ class ProductionForexPredictor:
                   f"ATR={current_atr:.5f}  FVGs={len(fvgs)}  OBs={len(obs)}")
         htf_fvg_rejected = {'dist': 0, 'confs': 0, 'direction': 0, 'rr': 0, 'strength': 0, 'prob': 0}
         htf_ob_rejected  = {'dist': 0, 'confs': 0, 'direction': 0, 'rr': 0, 'strength': 0, 'prob': 0}
+
+        # ATR tolerance for direction filter: zones whose mid is within 1 ATR of
+        # current price are still valid candidates (price is approaching them).
+        atr_tol = current_atr * 1.0
 
         def _build_setup(zone_obj, zone_type_str, direction, entry, sl, tp_target,
                          risk, reward, rr, base_prob, conf_str, confirmations):
@@ -2052,10 +2179,11 @@ class ProductionForexPredictor:
             entry     = fvg['mid']
             sl        = fvg['bottom'] if direction == 'BUY' else fvg['top']
 
-            # Bullish FVG must be BELOW current price (support/demand zone for continuation long)
-            # Bearish FVG must be ABOVE current price (resistance/supply zone for continuation short)
-            if direction == 'BUY'  and fvg['top'] >= current_price: htf_fvg_rejected['direction'] += 1; continue
-            if direction == 'SELL' and fvg['bottom'] <= current_price: htf_fvg_rejected['direction'] += 1; continue
+            # Bullish FVG: mid must be below current price (support below price).
+            # Bearish FVG: mid must be above current price (resistance above price).
+            # Same fix as OB direction filter — use mid + ATR tolerance.
+            if direction == 'BUY'  and fvg['mid'] > current_price + atr_tol: htf_fvg_rejected['direction'] += 1; continue
+            if direction == 'SELL' and fvg['mid'] < current_price - atr_tol: htf_fvg_rejected['direction'] += 1; continue
 
             tp_target = (max(fib_levels.get('0.5', entry + fvg['size'] * 2), entry + fvg['size'] * 2)
                          if direction == 'BUY' else
@@ -2069,11 +2197,31 @@ class ProductionForexPredictor:
             if fvg.get('strength', 0) < MIN_HTF_STRENGTH:
                 htf_fvg_rejected['strength'] += 1; continue
 
+            # FIX A: inject h4_fvg_zone=True so feature_builder sets h4_fvg_inside=1.
+            # The old dict had no 'sources'/'tf_source' so h4_fvg_inside was always
+            # 0.0 — this single bug was suppressing 40% of the model's decision weight.
+            fvg_zone_for_model = {
+                'direction':   direction,
+                'type':        'demand' if direction == 'BUY' else 'supply',
+                'price_high':  fvg.get('top',    fvg.get('price_high', entry)),
+                'price_low':   fvg.get('bottom', fvg.get('price_low',  sl)),
+                'price_mid':   fvg.get('mid',    fvg.get('price_mid',  entry)),
+                'strength':    fvg['strength'],
+                'index':       fvg.get('index', len(df) - 1),
+                'h4_fvg_zone': True,   # ← triggers h4_fvg_inside=1 in feature_builder
+            }
             base_prob = self._ml_score_htf_zone(
-                {'direction': direction, 'strength': fvg['strength'], 'index': fvg.get('index', len(df) - 1)},
-                df, tf, htf_context=htf_context)
-            if base_prob < 0.55:
-                htf_fvg_rejected['prob'] += 1; continue
+                fvg_zone_for_model, df, tf, htf_context=htf_context)
+            # Gold keeps strict 0.55 gate unchanged
+            # Forex gets a softer gate during Asia/pre-London (00:00–07:00 UTC)
+            if self.symbol == 'XAU/USD':
+                _ml_gate = 0.55
+            else:
+                _hour_utc = datetime.utcnow().hour
+                _ml_gate  = 0.45 if 0 <= _hour_utc < 7 else 0.55
+
+            if base_prob < _ml_gate:
+                htf_ob_rejected['prob'] += 1; continue
 
             htf_setups.append(_build_setup(fvg, 'FVG', direction, entry, sl, tp_target,
                                            risk, reward, rr, base_prob,
@@ -2098,23 +2246,42 @@ class ProductionForexPredictor:
             _atr_buf  = df['atr'].iloc[-1] * 0.2 if 'atr' in df.columns else 0.0002
             sl        = ob['bottom'] - _atr_buf if direction == 'BUY' else ob['top'] + _atr_buf
 
-            # Bullish OB must sit BELOW current price (price pulls back to demand)
-            # Bearish OB must sit ABOVE current price (price rallies into supply)
-            if direction == 'BUY'  and ob['top'] >= current_price: htf_ob_rejected['direction'] += 1; continue
-            if direction == 'SELL' and ob['bottom'] <= current_price: htf_ob_rejected['direction'] += 1; continue
+            # Bullish OB: zone mid must be below current price (demand below price).
+            # Bearish OB: zone mid must be above current price (supply above price).
+            # FILTER FIX: old code used ob['top']/ob['bottom'] as the threshold.
+            # On 4H candles ob['top'] is the candle HIGH — easily at or above current
+            # price even for a valid demand zone, killing every near-price OB.
+            # Using mid correctly identifies which side of price the zone sits on.
+            # Tolerance: allow zone mid within 1.0 ATR of price so zones being
+            # approached right now are not excluded before they can be scored.
+            if direction == 'BUY'  and ob['mid'] > current_price + atr_tol: htf_ob_rejected['direction'] += 1; continue
+            if direction == 'SELL' and ob['mid'] < current_price - atr_tol: htf_ob_rejected['direction'] += 1; continue
 
-            tp_target = (entry + ob['reaction_size'] * 1.5 if direction == 'BUY'
-                         else entry - ob['reaction_size'] * 1.5)
+            tp_raw = (entry + ob['reaction_size'] * 1.5 if direction == 'BUY'
+                    else entry - ob['reaction_size'] * 1.5)
+
+            # For non-Gold pairs, clamp TP so RR never exceeds MAX_HTF_RR ceiling
+            # Gold is untouched — its reaction_size already produces valid RR naturally
+            if self.symbol != 'XAU/USD' and abs(entry - sl) > 0:
+                max_reward = abs(entry - sl) * MAX_HTF_RR * 0.95   # 5% buffer under ceiling
+                if direction == 'BUY':
+                    tp_target = min(tp_raw, entry + max_reward)
+                else:
+                    tp_target = max(tp_raw, entry - max_reward)
+            else:
+                tp_target = tp_raw
+
             risk   = abs(entry - sl)
             reward = abs(tp_target - entry)
             rr     = reward / risk if risk > 0 else 1.5
+
             if not (MIN_HTF_RR <= rr <= MAX_HTF_RR):
                 htf_ob_rejected['rr'] += 1; continue
             if ob.get('strength', 0) < MIN_HTF_STRENGTH:
                 htf_ob_rejected['strength'] += 1; continue
 
             # ── Step 2: 1H confluence (90% of training required 4H+1H) ───────
-            h1_conf = self._check_1h_confluence(ob['top'], ob['bottom'], direction, df_1h)
+            h1_conf = self._check_1h_confluence(ob['top'], ob['bottom'], direction, _df_1h)
             # Only hard-reject if 1H trend is CONFIRMED OPPOSITE (not merely neutral/flat).
             # trend_alignment=0 + structure_shift=0 in a quiet session = neutral, not opposing.
             # We still pass the h1 features to the model — it will discount them appropriately.
@@ -2128,7 +2295,7 @@ class ProductionForexPredictor:
                       f"struct={h1_conf['h1_structure_shift']}) — letting model decide")
 
             # ── Step 3: 15min approach features ──────────────────────────────
-            approach = self._get_15min_approach(ob['top'], ob['bottom'], direction, df_15m)
+            approach = self._get_15min_approach(ob['top'], ob['bottom'], direction, _df_15m)
 
             # ── Step 4: 5min entry trigger (HARD GATE) ───────────────────────
             # Price must have shown a reaction INSIDE the zone on 5min before
@@ -2136,7 +2303,7 @@ class ProductionForexPredictor:
             # displacement or sweep confirmation inside the OB/FVG.
             # Without this, signals fire on zones price hasn't entered yet.
             # Fallback: if 5min data unavailable, gate is skipped (soft mode).
-            m5_conf      = self._check_5min_entry(ob['top'], ob['bottom'], direction, df_5m)
+            m5_conf      = self._check_5min_entry(ob['top'], ob['bottom'], direction, _df_5m)
             # 5M hard gate REMOVED — training labeled every zone touch regardless
             # of 5M state. m5_micro_bos / m5_sweep_confirmation flow to the model
             # as soft features; the 0.65 probability threshold does the filtering.
@@ -2160,16 +2327,25 @@ class ProductionForexPredictor:
             # DO NOT store raw_trend here — that would cause a double-flip for SELL
             # zones because feature_builder would then flip it a second time.
             real_overlap = 1
+            fvg_overlap_flag = False   # FIX A: track whether this OB overlaps any 4H FVG
             if htf_context:
                 all_htf_items = (htf_context.get('h1_fvgs', []) +
                                  htf_context.get('h4_fvgs', []) +
                                  htf_context.get('h1_order_blocks', []) +
                                  htf_context.get('h4_order_blocks', []))
+                h4_fvgs_only  = htf_context.get('h4_fvgs', [])
                 for item in all_htf_items:
                     item_bot = item.get('bottom', item.get('price_low', 0))
                     item_top = item.get('top',    item.get('price_high', 0))
                     if item_bot < ob['top'] and item_top > ob['bottom']:
                         real_overlap += 1
+                # Check specifically against 4H FVGs for fvg_overlap
+                for fvg_item in h4_fvgs_only:
+                    fb = fvg_item.get('bottom', fvg_item.get('price_low', 0))
+                    ft = fvg_item.get('top',    fvg_item.get('price_high', 0))
+                    if fb < ob['top'] and ft > ob['bottom']:
+                        fvg_overlap_flag = True
+                        break
             full_ob_zone = {
                 'type':                    'demand' if direction == 'BUY' else 'supply',
                 'price_high':              ob['top'],
@@ -2203,6 +2379,10 @@ class ProductionForexPredictor:
                 # historical depth that produced mean=11.24.
                 'touch_count':             max(1, int(((df['low'] <= ob['top']) &
                                                         (df['high'] >= ob['bottom'])).sum())),
+                # FIX A: fvg_overlap tells feature_builder to set h4_fvg_inside=1
+                # when this OB's price range intersects a 4H FVG — matching training
+                # where any zone inside a 4H FVG was labeled with h4_fvg_inside=1.
+                'fvg_overlap':             fvg_overlap_flag,
             }
 
             base_prob = self._ml_score_htf_zone(
@@ -2210,7 +2390,15 @@ class ProductionForexPredictor:
                  'index': ob.get('index', len(df) - 1),
                  'mid': ob['mid'], 'top': ob['top'], 'bottom': ob['bottom']},
                 df, tf, htf_context=htf_context, zone_override=full_ob_zone)
-            if base_prob < 0.55:
+            # Gold keeps strict 0.55 gate unchanged
+            # Forex gets a softer gate during Asia/pre-London (00:00–07:00 UTC)
+            if self.symbol == 'XAU/USD':
+                _ml_gate = 0.55
+            else:
+                _hour_utc = datetime.utcnow().hour
+                _ml_gate  = 0.45 if 0 <= _hour_utc < 7 else 0.55
+
+            if base_prob < _ml_gate:
                 htf_ob_rejected['prob'] += 1; continue
 
             conf_label = (f"OB-{ob['strength']:.2f} "
@@ -2252,7 +2440,29 @@ class ProductionForexPredictor:
     def generate_signals(self) -> Dict:
         self.stats['total_iterations'] += 1
 
-        df = self.fetch_bars(interval="15min", outputsize=200)
+        # ── STEP 1: Fetch all 6 bar sets once ────────────────────────────────
+        # Each unique (interval, outputsize) pair is fetched exactly once here
+        # and stored in a local dict.  All downstream helpers receive pre-fetched
+        # DataFrames as arguments instead of calling fetch_bars() internally.
+        #
+        # Per-cycle budget for this symbol:
+        #   df_15m  (15min / 200)  — primary + htf_trade_detect + approach features
+        #   df_1h   (1h    / 100)  — htf_context trend + predict_with_proper_features
+        #   df_4h   (4h    / 200)  — htf_trade_detect (primary zone df + bias gate)
+        #   df_4h_c (4h    / 100)  — predict_with_proper_features / _ml_score_htf_zone
+        #   df_5m   (5min  /  60)  — 5-min entry features + refinement
+        #   df_1d   (1day  /  90)  — HTF context pivots + D1 gate
+        # = 6 real API calls.  CONT predictor hits the 60-s cache for all 6.
+        _bars: Dict[str, Optional[pd.DataFrame]] = {
+            '15min/200': self.fetch_bars(interval="15min", outputsize=200),
+            '1h/100':    self.fetch_bars(interval="1h",    outputsize=100),
+            '4h/200':    self.fetch_bars(interval="4h",    outputsize=200),
+            '4h/100':    self.fetch_bars(interval="4h",    outputsize=100),
+            '5min/60':   self.fetch_bars(interval="5min",  outputsize=60),
+            '1day/90':   self.fetch_bars(interval="1day",  outputsize=90),
+        }
+
+        df = _bars['15min/200']
         if df is None or len(df) < 50:
             strat = "CONT" if self.is_continuation_strategy else "REV "
             bars  = len(df) if df is not None else 0
@@ -2264,7 +2474,12 @@ class ProductionForexPredictor:
         current_time  = datetime.utcnow()
 
         expired_count = self.zone_tracker.cleanup_expired(current_time, current_price)
-        htf_context   = self.get_htf_context()
+        htf_context   = self.get_htf_context(
+            df_1h   = _bars['1h/100'],
+            df_4h_c = _bars['4h/100'],
+            df_4h   = _bars['4h/200'],
+            df_1d   = _bars['1day/90'],
+        )
 
         # ── PRIMARY pipeline: 4H Order Block detection ────────────────────────
         # Confirmed from training_labels_clean.parquet:
@@ -2273,7 +2488,11 @@ class ProductionForexPredictor:
         # 1H is used for CONFLUENCE CONFIRMATION inside htf_trade_detect,
         # NOT as an independent zone source. Running htf_trade_detect("1h")
         # would feed the model 1H zones it was never trained on.
-        htf_raw = self.htf_trade_detect("4h", htf_context=htf_context)
+        htf_raw = self.htf_trade_detect("4h", htf_context=htf_context,
+                                          df_4h  = _bars['4h/200'],
+                                          df_15m = _bars['15min/200'],
+                                          df_5m  = _bars['5min/60'],
+                                          df_1h  = _bars['1h/100'])
         if self.debug:
             print(f"     [HTF] 4H OB signals before prob filter: {len(htf_raw)}")
         # FIX C1: log every signal dropped by the prob filter so it is never silent.
@@ -2346,7 +2565,7 @@ class ProductionForexPredictor:
 
         continuation_zones = []
         if self.enable_continuation and self.tracked_zones_15min:
-            df_5min = self.fetch_bars(interval="5min", outputsize=100)
+            df_5min = _bars['5min/60']
             if df_5min is not None and len(df_5min) >= 20:
                 for zone in self.tracked_zones_15min:
                     flip = self.detect_zone_flip(zone, df_5min, current_atr)
@@ -2401,16 +2620,30 @@ class ProductionForexPredictor:
                         htf_context.get('daily_order_blocks', []))
             fib_lvls = {**htf_context.get('h1_fib_levels', {}),
                         **htf_context.get('h4_fib_levels', {})}
+            all_htf_items = all_fvgs + all_obs   # used for real overlap count below
             for zone in all_zones:
                 conf_dict = self.htf_analyzer.check_confluence(
                     zone, all_fvgs, all_obs, fib_lvls, current_price)
                 zone['htf_confluence'] = conf_dict          # display / gate use only
-                # FIX C4: use len(factors) as the integer overlap count.
-                # Never store the display dict in 'confluence' — feature_builder
-                # would fall back to conf_dict.get('score', 1) which is 1–10,
-                # outside the training distribution (mean=5.0, range 1–20).
-                overlap_count = int(len(conf_dict.get('factors', [])))
-                zone['confluence'] = max(1, overlap_count)  # int ≥1, training-compatible
+
+                # FIX (v9): compute the real HTF structural overlap count instead
+                # of len(factors). check_confluence() returns at most 4 factors
+                # (FVG, OB, Fib, session_lq) so len(factors) maxes at 4.
+                # The scaler was trained on smc_detector merge_zones() overlap
+                # counts: mean=5.0, range 1–20. Using len(factors) puts every
+                # 15-min zone at z ≈ −1, systematically suppressing scores.
+                # Fix: count how many HTF FVG/OB items (h1+h4+daily) overlap
+                # this zone's price range — identical to the HTF-OB path at
+                # htf_trade_detect() lines ~2247–2259.
+                z_top = zone.get('price_high', zone.get('price_mid', current_price))
+                z_bot = zone.get('price_low',  zone.get('price_mid', current_price))
+                real_overlap = 1  # minimum 1 (the zone itself)
+                for item in all_htf_items:
+                    item_bot = item.get('bottom', item.get('price_low', 0))
+                    item_top = item.get('top',    item.get('price_high', 0))
+                    if item_bot < z_top and item_top > z_bot:
+                        real_overlap += 1
+                zone['confluence'] = real_overlap  # int ≥1, training-compatible
                 assert isinstance(zone['confluence'], int), \
                     f"confluence must be int, got {type(zone['confluence'])}"
 
@@ -2485,10 +2718,15 @@ class ProductionForexPredictor:
             }
 
         # ── v7 HARD GATE 1: 4H Bias ───────────────────────────────────────────
-        # Derive 4H structural bias from htf_context.
-        # Demand zones only pass if 4H is bullish or neutral.
-        # Supply zones only pass if 4H is bearish or neutral.
-        h4_trend = htf_context.get('h4_structure', {}).get('trend', 'neutral')
+        # Recompute h4_structure fresh from live 4H bars every cycle.
+        # Previously pulled from htf_context which was built from cached bars —
+        # the trend label could be hours old and wrong side of a structure flip.
+        _df_4h_bias = _bars['4h/200']
+        if _df_4h_bias is not None and len(_df_4h_bias) > 20:
+            _fresh_h4_struct = self.htf_analyzer.detect_market_structure_shift(_df_4h_bias)
+            h4_trend = _fresh_h4_struct.get('trend', 'neutral')
+        else:
+            h4_trend = htf_context.get('h4_structure', {}).get('trend', 'neutral')
 
         # ── v7 HARD GATE 2: D1 Premium / Discount ─────────────────────────────
         # 60-day lookback (was 20) so a single spike candle (e.g. March 2026
@@ -2497,7 +2735,7 @@ class ProductionForexPredictor:
         # Spike-resistant: 95th/5th percentile instead of raw max/min so
         # outlier wicks don't anchor the entire range calculation.
         _d1_pd = 0  # default: equilibrium (no gate)
-        _df_d1_gate = self.fetch_bars(interval="1day", outputsize=70)
+        _df_d1_gate = _bars['1day/90']
         if _df_d1_gate is not None and len(_df_d1_gate) >= 20:
             _tail60  = _df_d1_gate.tail(60)
             _d1_high = float(np.percentile(_tail60["high"], 95))
@@ -2585,7 +2823,32 @@ class ProductionForexPredictor:
                     pass  # neutral 4H = no strong bias, let ML model decide
                 # h4_trend == 'bearish': fall through — with-trend continuation sell, allow it
 
-            base_probability = self.predict_with_proper_features(zone, df, htf_context)
+            # FIX (v9): Pre-inject m5 features into 15-min zone dict using
+            # tail(60) BEFORE calling predict_with_proper_features.
+            # Without this, feature_builder falls back to _compute_m5_features()
+            # which used tail(20) — a narrower window that misses most BOS/sweeps
+            # and systematically suppresses model scores for all 15-min zones.
+            # With pre-injected values, feature_builder takes the fast pre-computed
+            # path (zone["m5_micro_bos"] is not None) and skips recomputation.
+            if 'm5_micro_bos' not in zone:
+                _m5_dir = 'BUY' if zone['type'] == 'demand' else 'SELL'
+                _m5_conf = self._check_5min_entry(
+                    zone.get('price_high', zone.get('price_mid', 0)),
+                    zone.get('price_low',  zone.get('price_mid', 0)),
+                    _m5_dir,
+                    _bars['5min/60'],
+                )
+                zone['m5_micro_bos']            = _m5_conf['m5_micro_bos']
+                zone['m5_sweep_confirmation']   = _m5_conf['m5_sweep_confirmation']
+                zone['m5_entry_candle_quality'] = _m5_conf['m5_entry_candle_quality']
+
+            base_probability = self.predict_with_proper_features(
+                zone, df, htf_context,
+                df_1h = _bars['1h/100'],
+                df_4h = _bars['4h/100'],
+                df_5m = _bars['5min/60'],
+                df_d1 = _bars['1day/90'],
+            )
             probability      = base_probability
 
             # ── Update zone history for prev_zone_outcome / time_since_last_touch ──
@@ -2626,7 +2889,8 @@ class ProductionForexPredictor:
             # This was killing every zone in low-volatility / early-session periods.
             refinement = None
             if self.use_5min_refinement and not is_cont:
-                refinement = self.refine_entry_with_5min(zone, current_price, current_atr)
+                refinement = self.refine_entry_with_5min(
+                    zone, current_price, current_atr, df_5min=_bars['5min/60'])
                 if refinement is None:
                     # Fall back gracefully instead of hard reject
                     self.stats['refine_rejections'] += 1

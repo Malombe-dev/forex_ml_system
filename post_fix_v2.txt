@@ -1,0 +1,1061 @@
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  FOREX ML FILTER DIAGNOSTIC   —   2026-05-29 11:09 UTC
+══════════════════════════════════════════════════════════════════════════════════════════
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  OB FILTER PIPELINE — EUR/USD
+══════════════════════════════════════════════════════════════════════════════════════════
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [EUR/USD] loaded | Base: 65% | MaxBoost: 7%
+  Fetching bars …
+
+  Symbol              : EUR/USD
+  Current price       : 1.16445
+  4H ATR              : 0.00207  (20.7 pips)
+  ATR tolerance       : 0.00207  (20.7 pips)
+  Max dist (pips)     : 413.7  (20.0× ATR)
+  H1 trend (bias)     : bullish
+  Pip size            : 0.0001
+  Prob threshold      : 65%
+  MAX_HTF_RR          : 10.0  (Forex: 10.0)
+  ML gate             : 55%  (Asia<07UTC=45%, else 55%) — now 55%
+
+  Total 4H OBs detected : 9
+
+  #    Type      Mid          Dist(p)   Dir    reac_sz    risk       reward     RR      str    G1    G2    G3    G4    G5    Fate              
+  -----------------------------------------------------------------------------------------------------------------------------------------------
+  1    bear      1.1788       143.2     SELL   49.1p      10.6p      73.7p      6.96    2.95   ✓     ✓c3   ✓     ✓     ✓     → ML scoring
+  2    bear      1.1780       135.1     SELL   53.9p      12.8p      80.8p      6.32    2.52   ✓     ✓c5   ✓     ✓     ✓     → ML scoring
+  3    bear      1.1778       133.4     SELL   60.2p      9.7p       90.3p      9.27    2.91   ✓     ✓c4   ✓     ✓     ✓     → ML scoring
+  4    bear      1.1715       70.3      SELL   52.9p      8.6p       79.4p      9.19    2.81   ✓     ✓c4   ✓     ✓     ✓     → ML scoring
+  5    bear      1.1644       0.3       SELL   68.1p      20.6p      102.1p     4.95    4.19   ✓     ✓c4   ✓     ✓     ✓     → ML scoring
+  6    bull      1.1595       49.3      BUY    67.3p      14.8p      101.0p     6.80    3.98   ✓     ✓c4   ✓     ✓     ✓     → ML scoring
+  7    bear      1.1625       19.8      SELL   72.2p      42.4p      108.3p     2.56    3.96   ✓     ✓c5   ✓     ✓     ✓     → ML scoring
+  8    bear      1.1648       3.0       SELL   74.9p      18.0p      112.4p     6.25    4.60   ✓     ✓c5   ✓     ✓     ✓     → ML scoring
+  9    bull      1.1604       40.4      BUY    73.5p      21.7p      110.2p     5.07    4.09   ✓     ✓c5   ✓     ✓     ✓     → ML scoring
+
+  Gate summary
+    OBs detected                       : 9
+    Killed by distance (Gate 1)        : 0
+    Killed by confs < 2 (Gate 2)       : 0
+    Killed by direction/side (Gate 3)  : 0
+    Killed by RR out of range (Gate 4) : 0
+    Killed by strength < 0.5 (Gate 5)  : 0
+    Survivors for ML scoring           : 9
+
+──────────────────────────────────────────────────────────────────────────────────────────
+  ML SCORING — surviving OBs
+──────────────────────────────────────────────────────────────────────────────────────────
+  #    Dir         Entry   base_prob   final_prob   threshold  Result
+  ---------------------------------------------------------------------------
+  1    SELL      1.17877       19.8%        25.8%       65.0%  FAIL base<0.55
+
+    Feature snapshot (key model inputs)
+      h1_trend_alignment        : -1  ⚠ counter-trend (-1 suppresses model)
+      h1_structure_shift        : 0
+      h1_displacement           : 1.747
+      h1_liquidity_sweep        : 1
+      m5_micro_bos              : 1
+      m5_sweep_confirmation     : 1
+      m5_entry_candle_qual      : 0.0
+      approach_distance(p)      : 50.0
+      approach_momentum         : -0.02
+      candle_body_ratio         : 0.852
+      zone_confluence           : 4
+      h4_fvg_inside             : 0
+      zone_strength             : 2.946
+      touch_count               : 21
+      risk_pips                 : 10.6
+
+  2    SELL      1.17796       13.8%        20.8%       65.0%  FAIL base<0.55
+
+    Feature snapshot (key model inputs)
+      h1_trend_alignment        : -1  ⚠ counter-trend (-1 suppresses model)
+      h1_structure_shift        : 0
+      h1_displacement           : 1.747
+      h1_liquidity_sweep        : 1
+      m5_micro_bos              : 1
+      m5_sweep_confirmation     : 1
+      m5_entry_candle_qual      : 0.0
+      approach_distance(p)      : 50.0
+      approach_momentum         : -0.02
+      candle_body_ratio         : 0.852
+      zone_confluence           : 4
+      h4_fvg_inside             : 0
+      zone_strength             : 2.52
+      touch_count               : 27
+      risk_pips                 : 12.8
+
+  3    SELL      1.17779       16.2%        23.2%       65.0%  FAIL base<0.55
+
+    Feature snapshot (key model inputs)
+      h1_trend_alignment        : -1  ⚠ counter-trend (-1 suppresses model)
+      h1_structure_shift        : 0
+      h1_displacement           : 1.747
+      h1_liquidity_sweep        : 1
+      m5_micro_bos              : 1
+      m5_sweep_confirmation     : 1
+      m5_entry_candle_qual      : 0.0
+      approach_distance(p)      : 50.0
+      approach_momentum         : -0.02
+      candle_body_ratio         : 0.852
+      zone_confluence           : 4
+      h4_fvg_inside             : 0
+      zone_strength             : 2.914
+      touch_count               : 25
+      risk_pips                 : 9.7
+
+  4    SELL      1.17148       77.2%        84.2%       65.0%  PASS → bias check
+
+    Feature snapshot (key model inputs)
+      h1_trend_alignment        : -1  ⚠ counter-trend (-1 suppresses model)
+      h1_structure_shift        : 0
+      h1_displacement           : 1.747
+      h1_liquidity_sweep        : 1
+      m5_micro_bos              : 1
+      m5_sweep_confirmation     : 1
+      m5_entry_candle_qual      : 0.0
+      approach_distance(p)      : 50.0
+      approach_momentum         : -0.02
+      candle_body_ratio         : 0.852
+      zone_confluence           : 3
+      h4_fvg_inside             : 1
+      zone_strength             : 2.811
+      touch_count               : 41
+      risk_pips                 : 8.6
+
+  5    SELL      1.16442       31.7%        38.7%       65.0%  FAIL base<0.55
+
+    Feature snapshot (key model inputs)
+      h1_trend_alignment        : -1  ⚠ counter-trend (-1 suppresses model)
+      h1_structure_shift        : 0
+      h1_displacement           : 1.747
+      h1_liquidity_sweep        : 1
+      m5_micro_bos              : 1
+      m5_sweep_confirmation     : 1
+      m5_entry_candle_qual      : 0.0
+      approach_distance(p)      : 16.8
+      approach_momentum         : -0.02
+      candle_body_ratio         : 0.852
+      zone_confluence           : 5
+      h4_fvg_inside             : 0
+      zone_strength             : 4.19
+      touch_count               : 51
+      risk_pips                 : 20.6
+
+  6    BUY       1.15952       21.7%        28.7%       65.0%  FAIL base<0.55
+
+    Feature snapshot (key model inputs)
+      h1_trend_alignment        : 1
+      h1_structure_shift        : 0
+      h1_displacement           : 1.747
+      h1_liquidity_sweep        : 1
+      m5_micro_bos              : 1
+      m5_sweep_confirmation     : 1
+      m5_entry_candle_qual      : 0.5
+      approach_distance(p)      : 38.6
+      approach_momentum         : -0.02
+      candle_body_ratio         : 0.852
+      zone_confluence           : 8
+      h4_fvg_inside             : 0
+      zone_strength             : 3.979
+      touch_count               : 31
+      risk_pips                 : 14.8
+
+  7    SELL      1.16247        7.4%        14.4%       65.0%  FAIL base<0.55
+
+    Feature snapshot (key model inputs)
+      h1_trend_alignment        : -1  ⚠ counter-trend (-1 suppresses model)
+      h1_structure_shift        : 0
+      h1_displacement           : 1.747
+      h1_liquidity_sweep        : 1
+      m5_micro_bos              : 1
+      m5_sweep_confirmation     : 1
+      m5_entry_candle_qual      : 0.0
+      approach_distance(p)      : 50.0
+      approach_momentum         : -0.02
+      candle_body_ratio         : 0.852
+      zone_confluence           : 11
+      h4_fvg_inside             : 0
+      zone_strength             : 3.96
+      touch_count               : 90
+      risk_pips                 : 42.4
+
+  8    SELL      1.16475       55.2%        62.2%       65.0%  FAIL final<65%
+
+    Feature snapshot (key model inputs)
+      h1_trend_alignment        : -1  ⚠ counter-trend (-1 suppresses model)
+      h1_structure_shift        : 0
+      h1_displacement           : 1.747
+      h1_liquidity_sweep        : 1
+      m5_micro_bos              : 1
+      m5_sweep_confirmation     : 1
+      m5_entry_candle_qual      : 0.0
+      approach_distance(p)      : 10.8
+      approach_momentum         : -0.02
+      candle_body_ratio         : 0.852
+      zone_confluence           : 5
+      h4_fvg_inside             : 0
+      zone_strength             : 4.595
+      touch_count               : 43
+      risk_pips                 : 18.0
+
+  9    BUY       1.16041       28.2%        35.2%       65.0%  FAIL base<0.55
+
+    Feature snapshot (key model inputs)
+      h1_trend_alignment        : 1
+      h1_structure_shift        : 0
+      h1_displacement           : 1.747
+      h1_liquidity_sweep        : 1
+      m5_micro_bos              : 1
+      m5_sweep_confirmation     : 1
+      m5_entry_candle_qual      : 0.5
+      approach_distance(p)      : 22.8
+      approach_momentum         : -0.02
+      candle_body_ratio         : 0.852
+      zone_confluence           : 8
+      h4_fvg_inside             : 0
+      zone_strength             : 4.094
+      touch_count               : 48
+      risk_pips                 : 21.7
+
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  BIAS FILTER SIMULATION — EUR/USD
+══════════════════════════════════════════════════════════════════════════════════════════
+  H1 trend = bullish
+  Rule: bullish → keep BUY with entry < 1.16445
+        bearish → keep SELL with entry > 1.16445
+        neutral → keep everything (no filter applied)
+
+    SELL @ 1.17877  → FAIL  SELL but trend is bullish
+    SELL @ 1.17796  → FAIL  SELL but trend is bullish
+    SELL @ 1.17779  → FAIL  SELL but trend is bullish
+    SELL @ 1.17148  → FAIL  SELL but trend is bullish
+    SELL @ 1.16442  → FAIL  SELL but trend is bullish
+    BUY @ 1.15952  → PASS  BUY 1.15952 < price 1.16445
+    SELL @ 1.16247  → FAIL  SELL but trend is bullish
+    SELL @ 1.16475  → FAIL  SELL but trend is bullish
+    BUY @ 1.16041  → PASS  BUY 1.16041 < price 1.16445
+
+──────────────────────────────────────────────────────────────────────────────────────────
+  STATUS & REMAINING ISSUES
+──────────────────────────────────────────────────────────────────────────────────────────
+  ✅ Gate 6 fix APPLIED: ML gate = 55% for EUR/USD at current UTC hour.
+     7 OB(s) still failed — base_prob < 55%.
+     Root cause: h1_liquidity_sweep, m5_micro_bos, m5_sweep_confirmation = 0.
+     London session active — low scores indicate genuine lack of confirmation.
+
+  ★ Bias filter killed 1 OB(s) post-ML.
+    h1_trend = bullish → only BUY zones below/above price pass.
+
+  ✅ 1 OB(s) passed all gates including ML and bias filter.
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  D1 PREMIUM/DISCOUNT GATE — EUR/USD
+══════════════════════════════════════════════════════════════════════════════════════════
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [EUR/USD] loaded | Base: 65% | MaxBoost: 7%
+  Symbol                : EUR/USD
+  Current price         : 1.16445
+  D1 60-bar raw max     : 1.18488
+  D1 60-bar raw min     : 1.14400
+  P95 high (filter)     : 1.18089
+  P5 low (filter)       : 1.15092
+  P5→P95 range          : 0.02997  (299.7 pips)
+  Price position        : 0.452  (45.2%)
+  D1 zone               : 🟡 EQUILIBRIUM (40-60%)
+
+  Interpretation:
+    BUY signals are favoured when price is in DISCOUNT (position < 0.40).
+    SELL signals are favoured when price is in PREMIUM (position > 0.60).
+    → Mid-range (45%). Model gets less D1 premium/discount signal.
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  RR SENSITIVITY ANALYSIS — EUR/USD
+══════════════════════════════════════════════════════════════════════════════════════════
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [EUR/USD] loaded | Base: 65% | MaxBoost: 7%
+  4H ATR                        : 0.00207 = 20.7 pips
+  Current price                 : 1.16445
+  MAX_HTF_RR (this pair)        : 10.0
+  OBs reaching RR gate          : 9
+
+  OB #   type       reac(p)   risk(p)   TP=reac×1.5   TP=clamped    TP=ATR×2  Result
+  --------------------------------------------------------------------------------
+  1      bearish       49.1      10.6    6.96 ✓       6.96 ✓      3.91 ✓   
+  2      bearish       53.9      12.8    6.32 ✓       6.32 ✓      3.24 ✓   
+  3      bearish       60.2       9.7    9.27 ✓       9.27 ✓      4.25 ✓   
+  4      bearish       52.9       8.6    9.19 ✓       9.19 ✓      4.79 ✓   
+  5      bearish       68.1      20.6    4.95 ✓       4.95 ✓      2.00 ✓   
+  6      bullish       67.3      14.8    6.80 ✓       6.80 ✓      2.79 ✓   
+  7      bearish       72.2      42.4    2.56 ✓       2.56 ✓      0.98 ✗   
+  8      bearish       74.9      18.0    6.25 ✓       6.25 ✓      2.30 ✓   
+  9      bullish       73.5      21.7    5.07 ✓       5.07 ✓      1.90 ✓   
+
+  Fix recommendation:
+  In htf_trade_detect(), replace:
+    tp_target = entry + ob['reaction_size'] * 1.5
+  With:
+    tp_target = entry + max(ob['reaction_size'], current_atr) * 1.5
+  This ensures TP is at least 1.5× ATR even when the initial impulse was small.
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  OB FILTER PIPELINE — GBP/USD
+══════════════════════════════════════════════════════════════════════════════════════════
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [GBP/USD] loaded | Base: 65% | MaxBoost: 7%
+  Fetching bars …
+
+  Symbol              : GBP/USD
+  Current price       : 1.34199
+  4H ATR              : 0.00239  (23.9 pips)
+  ATR tolerance       : 0.00239  (23.9 pips)
+  Max dist (pips)     : 478.1  (20.0× ATR)
+  H1 trend (bias)     : bearish
+  Pip size            : 0.0001
+  Prob threshold      : 65%
+  MAX_HTF_RR          : 10.0  (Forex: 10.0)
+  ML gate             : 55%  (Asia<07UTC=45%, else 55%) — now 55%
+
+  Total 4H OBs detected : 6
+
+  #    Type      Mid          Dist(p)   Dir    reac_sz    risk       reward     RR      str    G1    G2    G3    G4    G5    Fate              
+  -----------------------------------------------------------------------------------------------------------------------------------------------
+  1    bear      1.3630       210.4     SELL   149.7p     26.8p      224.5p     8.37    6.03   ✓     ✓c5   ✓     ✓     ✓     → ML scoring
+  2    bear      1.3527       106.9     SELL   137.5p     10.5p      100.0p     9.50    5.03   ✓     ✓c5   ✓     ✓     ✓     → ML scoring
+  3    bull      1.3317       103.4     BUY    142.2p     15.8p      149.9p     9.50    8.03   ✓     ✓c4   ✓     ✓     ✓     → ML scoring
+  4    bull      1.3392       28.4      BUY    89.3p      19.8p      134.0p     6.75    3.46   ✓     ✓c5   ✓     ✓     ✓     → ML scoring
+  5    bear      1.3506       86.6      SELL   75.8p      7.8p       73.9p      9.50    3.77   ✓     ✓c5   ✓     ✓     ✓     → ML scoring
+  6    bull      1.3391       28.5      BUY    81.2p      27.9p      121.8p     4.37    3.59   ✓     ✓c5   ✓     ✓     ✓     → ML scoring
+
+  Gate summary
+    OBs detected                       : 6
+    Killed by distance (Gate 1)        : 0
+    Killed by confs < 2 (Gate 2)       : 0
+    Killed by direction/side (Gate 3)  : 0
+    Killed by RR out of range (Gate 4) : 0
+    Killed by strength < 0.5 (Gate 5)  : 0
+    Survivors for ML scoring           : 6
+
+──────────────────────────────────────────────────────────────────────────────────────────
+  ML SCORING — surviving OBs
+──────────────────────────────────────────────────────────────────────────────────────────
+  #    Dir         Entry   base_prob   final_prob   threshold  Result
+  ---------------------------------------------------------------------------
+  1    SELL      1.36303       61.9%        68.9%       65.0%  PASS → bias check
+
+    Feature snapshot (key model inputs)
+      h1_trend_alignment        : 1
+      h1_structure_shift        : 0
+      h1_displacement           : 1.997
+      h1_liquidity_sweep        : 1
+      m5_micro_bos              : 1
+      m5_sweep_confirmation     : 1
+      m5_entry_candle_qual      : 0.25
+      approach_distance(p)      : 50.0
+      approach_momentum         : 0.84
+      candle_body_ratio         : 0.905
+      zone_confluence           : 2
+      h4_fvg_inside             : 0
+      zone_strength             : 6.031
+      touch_count               : 34
+      risk_pips                 : 26.8
+
+  2    SELL      1.35268       58.3%        65.3%       65.0%  PASS → bias check
+
+    Feature snapshot (key model inputs)
+      h1_trend_alignment        : 1
+      h1_structure_shift        : 0
+      h1_displacement           : 1.997
+      h1_liquidity_sweep        : 1
+      m5_micro_bos              : 1
+      m5_sweep_confirmation     : 1
+      m5_entry_candle_qual      : 0.25
+      approach_distance(p)      : 50.0
+      approach_momentum         : 0.84
+      candle_body_ratio         : 0.905
+      zone_confluence           : 2
+      h4_fvg_inside             : 0
+      zone_strength             : 5.027
+      touch_count               : 36
+      risk_pips                 : 10.5
+
+  3    BUY       1.33165       86.7%        93.7%       65.0%  PASS → bias check
+
+    Feature snapshot (key model inputs)
+      h1_trend_alignment        : -1  ⚠ counter-trend (-1 suppresses model)
+      h1_structure_shift        : 0
+      h1_displacement           : 1.997
+      h1_liquidity_sweep        : 1
+      m5_micro_bos              : 1
+      m5_sweep_confirmation     : 1
+      m5_entry_candle_qual      : 0.5
+      approach_distance(p)      : 50.0
+      approach_momentum         : 0.84
+      candle_body_ratio         : 0.905
+      zone_confluence           : 3
+      h4_fvg_inside             : 1
+      zone_strength             : 8.033
+      touch_count               : 17
+      risk_pips                 : 15.8
+
+  4    BUY       1.33915       27.4%        34.4%       65.0%  FAIL base<0.55
+
+    Feature snapshot (key model inputs)
+      h1_trend_alignment        : -1  ⚠ counter-trend (-1 suppresses model)
+      h1_structure_shift        : 0
+      h1_displacement           : 1.997
+      h1_liquidity_sweep        : 1
+      m5_micro_bos              : 1
+      m5_sweep_confirmation     : 1
+      m5_entry_candle_qual      : 0.5
+      approach_distance(p)      : 13.3
+      approach_momentum         : 0.84
+      candle_body_ratio         : 0.905
+      zone_confluence           : 6
+      h4_fvg_inside             : 0
+      zone_strength             : 3.457
+      touch_count               : 25
+      risk_pips                 : 19.8
+
+  5    SELL      1.35065       47.5%        54.5%       65.0%  FAIL base<0.55
+
+    Feature snapshot (key model inputs)
+      h1_trend_alignment        : 1
+      h1_structure_shift        : 0
+      h1_displacement           : 1.997
+      h1_liquidity_sweep        : 1
+      m5_micro_bos              : 1
+      m5_sweep_confirmation     : 1
+      m5_entry_candle_qual      : 0.25
+      approach_distance(p)      : 50.0
+      approach_momentum         : 0.84
+      candle_body_ratio         : 0.905
+      zone_confluence           : 3
+      h4_fvg_inside             : 0
+      zone_strength             : 3.772
+      touch_count               : 23
+      risk_pips                 : 7.8
+
+  6    BUY       1.33914       28.0%        35.0%       65.0%  FAIL base<0.55
+
+    Feature snapshot (key model inputs)
+      h1_trend_alignment        : -1  ⚠ counter-trend (-1 suppresses model)
+      h1_structure_shift        : 0
+      h1_displacement           : 1.997
+      h1_liquidity_sweep        : 1
+      m5_micro_bos              : 1
+      m5_sweep_confirmation     : 1
+      m5_entry_candle_qual      : 0.5
+      approach_distance(p)      : 5.4
+      approach_momentum         : 0.84
+      candle_body_ratio         : 0.905
+      zone_confluence           : 6
+      h4_fvg_inside             : 0
+      zone_strength             : 3.586
+      touch_count               : 30
+      risk_pips                 : 27.9
+
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  BIAS FILTER SIMULATION — GBP/USD
+══════════════════════════════════════════════════════════════════════════════════════════
+  H1 trend = bearish
+  Rule: bullish → keep BUY with entry < 1.34199
+        bearish → keep SELL with entry > 1.34199
+        neutral → keep everything (no filter applied)
+
+    SELL @ 1.36303  → PASS  SELL 1.36303 > price 1.34199
+    SELL @ 1.35268  → PASS  SELL 1.35268 > price 1.34199
+    BUY @ 1.33165  → FAIL  BUY but trend is bearish
+    BUY @ 1.33915  → FAIL  BUY but trend is bearish
+    SELL @ 1.35065  → PASS  SELL 1.35065 > price 1.34199
+    BUY @ 1.33914  → FAIL  BUY but trend is bearish
+
+──────────────────────────────────────────────────────────────────────────────────────────
+  STATUS & REMAINING ISSUES
+──────────────────────────────────────────────────────────────────────────────────────────
+  ✅ Gate 6 fix APPLIED: ML gate = 55% for GBP/USD at current UTC hour.
+     3 OB(s) still failed — base_prob < 55%.
+     Root cause: h1_liquidity_sweep, m5_micro_bos, m5_sweep_confirmation = 0.
+     London session active — low scores indicate genuine lack of confirmation.
+
+  ✅ 3 OB(s) passed all gates including ML and bias filter.
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  D1 PREMIUM/DISCOUNT GATE — GBP/USD
+══════════════════════════════════════════════════════════════════════════════════════════
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [GBP/USD] loaded | Base: 65% | MaxBoost: 7%
+  Symbol                : GBP/USD
+  Current price         : 1.34199
+  D1 60-bar raw max     : 1.36575
+  D1 60-bar raw min     : 1.31381
+  P95 high (filter)     : 1.36383
+  P5 low (filter)       : 1.31824
+  P5→P95 range          : 0.04559  (455.9 pips)
+  Price position        : 0.521  (52.1%)
+  D1 zone               : 🟡 EQUILIBRIUM (40-60%)
+
+  Interpretation:
+    BUY signals are favoured when price is in DISCOUNT (position < 0.40).
+    SELL signals are favoured when price is in PREMIUM (position > 0.60).
+    → Mid-range (52%). Model gets less D1 premium/discount signal.
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  RR SENSITIVITY ANALYSIS — GBP/USD
+══════════════════════════════════════════════════════════════════════════════════════════
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [GBP/USD] loaded | Base: 65% | MaxBoost: 7%
+  4H ATR                        : 0.00239 = 23.9 pips
+  Current price                 : 1.34199
+  MAX_HTF_RR (this pair)        : 10.0
+  OBs reaching RR gate          : 6
+
+  OB #   type       reac(p)   risk(p)   TP=reac×1.5   TP=clamped    TP=ATR×2  Result
+  --------------------------------------------------------------------------------
+  1      bearish      149.7      26.8    8.37 ✓       8.37 ✓      1.78 ✓   
+  2      bearish      137.5      10.5    19.59 ✗      9.50 ✓      4.54 ✓    ← CLAMP SAVES THIS
+  3      bullish      142.2      15.8    13.52 ✗      9.50 ✓      3.03 ✓    ← CLAMP SAVES THIS
+  4      bullish       89.3      19.8    6.75 ✓       6.75 ✓      2.41 ✓   
+  5      bearish       75.8       7.8    14.61 ✗      9.50 ✓      6.14 ✓    ← CLAMP SAVES THIS
+  6      bullish       81.2      27.9    4.37 ✓       4.37 ✓      1.71 ✓   
+
+  Fix recommendation:
+  In htf_trade_detect(), replace:
+    tp_target = entry + ob['reaction_size'] * 1.5
+  With:
+    tp_target = entry + max(ob['reaction_size'], current_atr) * 1.5
+  This ensures TP is at least 1.5× ATR even when the initial impulse was small.
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  OB FILTER PIPELINE — USD/JPY
+══════════════════════════════════════════════════════════════════════════════════════════
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [USD/JPY] loaded | Base: 65% | MaxBoost: 7%
+  Fetching bars …
+
+  Symbol              : USD/JPY
+  Current price       : 159.29118
+  4H ATR              : 0.14711  (14.7 pips)
+  ATR tolerance       : 0.14711  (14.7 pips)
+  Max dist (pips)     : 294.2  (20.0× ATR)
+  H1 trend (bias)     : bearish
+  Pip size            : 0.01
+  Prob threshold      : 65%
+  MAX_HTF_RR          : 10.0  (Forex: 10.0)
+  ML gate             : 55%  (Asia<07UTC=45%, else 55%) — now 55%
+
+  Total 4H OBs detected : 11
+
+  #    Type      Mid          Dist(p)   Dir    reac_sz    risk       reward     RR      str    G1    G2    G3    G4    G5    Fate              
+  -----------------------------------------------------------------------------------------------------------------------------------------------
+  1    bear      160.4160     112.5     SELL   494.3p     21.8p      207.0p     9.50    16.27  ✓     ✓c4   ✓     ✓     ✓     → ML scoring
+  2    bull      157.6413     165.0     BUY    194.6p     200.9p     291.9p     1.45    3.11   ✓     ✓c4   ✓     ✓     ✓     → ML scoring
+  3    bull      156.4929     279.8     BUY    147.4p     144.2p     221.1p     1.53    2.63   ✓     ✓c5   ✓     ✓     ✓     → ML scoring
+  4    bull      156.6660     262.5     BUY    70.4p      22.3p      105.6p     4.73    3.34   ✓     ✓c4   ✓     ✓     ✓     → ML scoring
+  5    bull      157.0573     223.4     BUY    68.5p      12.9p      102.8p     7.99    2.90   ✓     ✓c5   ✓     ✓     ✓     → ML scoring
+  6    bull      157.8293     146.2     BUY    67.8p      11.1p      101.7p     9.13    3.26   ✓     ✓c4   ✓     ✓     ✓     → ML scoring
+  7    bull      158.7167     57.5      BUY    44.0p      11.9p      66.1p      5.57    2.58   ✓     ✓c2   ✓     ✓     ✓     → ML scoring
+  8    bull      158.6652     62.6      BUY    54.9p      17.6p      82.4p      4.69    2.97   ✓     ✓c5   ✓     ✓     ✓     → ML scoring
+  9    bear      159.5413     25.0      SELL   44.0p      7.3p       66.0p      9.04    3.03   ✓     ✓c2   ✓     ✓     ✓     → ML scoring
+  10   bear      159.5280     23.7      SELL   46.0p      10.6p      69.0p      6.51    3.16   ✓     ✓c4   ✓     ✓     ✓     → ML scoring
+  11   bear      159.5934     30.2      SELL   51.1p      9.2p       76.7p      8.35    3.54   ✓     ✓c5   ✓     ✓     ✓     → ML scoring
+
+  Gate summary
+    OBs detected                       : 11
+    Killed by distance (Gate 1)        : 0
+    Killed by confs < 2 (Gate 2)       : 0
+    Killed by direction/side (Gate 3)  : 0
+    Killed by RR out of range (Gate 4) : 0
+    Killed by strength < 0.5 (Gate 5)  : 0
+    Survivors for ML scoring           : 11
+
+──────────────────────────────────────────────────────────────────────────────────────────
+  ML SCORING — surviving OBs
+──────────────────────────────────────────────────────────────────────────────────────────
+  #    Dir         Entry   base_prob   final_prob   threshold  Result
+  ---------------------------------------------------------------------------
+  1    SELL    160.41598       70.0%        77.0%       65.0%  PASS → bias check
+
+    Feature snapshot (key model inputs)
+      h1_trend_alignment        : 1
+      h1_structure_shift        : 0
+      h1_displacement           : 1.657
+      h1_liquidity_sweep        : 1
+      m5_micro_bos              : 1
+      m5_sweep_confirmation     : 1
+      m5_entry_candle_qual      : 0.25
+      approach_distance(p)      : 50.0
+      approach_momentum         : 0.021
+      candle_body_ratio         : 0.105
+      zone_confluence           : 2
+      h4_fvg_inside             : 0
+      zone_strength             : 16.267
+      touch_count               : 5
+      risk_pips                 : 21.8
+
+  2    BUY     157.64134       28.1%        35.1%       65.0%  FAIL base<0.55
+
+    Feature snapshot (key model inputs)
+      h1_trend_alignment        : -1  ⚠ counter-trend (-1 suppresses model)
+      h1_structure_shift        : 0
+      h1_displacement           : 1.657
+      h1_liquidity_sweep        : 1
+      m5_micro_bos              : 1
+      m5_sweep_confirmation     : 1
+      m5_entry_candle_qual      : 0.25
+      approach_distance(p)      : 33.0
+      approach_momentum         : 0.021
+      candle_body_ratio         : 0.105
+      zone_confluence           : 21
+      h4_fvg_inside             : 1
+      zone_strength             : 3.109
+      touch_count               : 195
+      risk_pips                 : 200.9
+
+  3    BUY     156.49294        6.1%        13.1%       65.0%  FAIL base<0.55
+
+    Feature snapshot (key model inputs)
+      h1_trend_alignment        : -1  ⚠ counter-trend (-1 suppresses model)
+      h1_structure_shift        : 0
+      h1_displacement           : 1.657
+      h1_liquidity_sweep        : 1
+      m5_micro_bos              : 1
+      m5_sweep_confirmation     : 1
+      m5_entry_candle_qual      : 0.25
+      approach_distance(p)      : 50.0
+      approach_momentum         : 0.021
+      candle_body_ratio         : 0.105
+      zone_confluence           : 6
+      h4_fvg_inside             : 0
+      zone_strength             : 2.627
+      touch_count               : 86
+      risk_pips                 : 144.2
+
+  4    BUY     156.66602       20.5%        27.5%       65.0%  FAIL base<0.55
+
+    Feature snapshot (key model inputs)
+      h1_trend_alignment        : -1  ⚠ counter-trend (-1 suppresses model)
+      h1_structure_shift        : 0
+      h1_displacement           : 1.657
+      h1_liquidity_sweep        : 1
+      m5_micro_bos              : 1
+      m5_sweep_confirmation     : 1
+      m5_entry_candle_qual      : 0.25
+      approach_distance(p)      : 50.0
+      approach_momentum         : 0.021
+      candle_body_ratio         : 0.105
+      zone_confluence           : 4
+      h4_fvg_inside             : 0
+      zone_strength             : 3.336
+      touch_count               : 39
+      risk_pips                 : 22.3
+
+  5    BUY     157.05732       20.9%        27.9%       65.0%  FAIL base<0.55
+
+    Feature snapshot (key model inputs)
+      h1_trend_alignment        : -1  ⚠ counter-trend (-1 suppresses model)
+      h1_structure_shift        : 0
+      h1_displacement           : 1.657
+      h1_liquidity_sweep        : 1
+      m5_micro_bos              : 1
+      m5_sweep_confirmation     : 1
+      m5_entry_candle_qual      : 0.25
+      approach_distance(p)      : 50.0
+      approach_momentum         : 0.021
+      candle_body_ratio         : 0.105
+      zone_confluence           : 4
+      h4_fvg_inside             : 0
+      zone_strength             : 2.903
+      touch_count               : 38
+      risk_pips                 : 12.9
+
+  6    BUY     157.82929       23.3%        30.3%       65.0%  FAIL base<0.55
+
+    Feature snapshot (key model inputs)
+      h1_trend_alignment        : -1  ⚠ counter-trend (-1 suppresses model)
+      h1_structure_shift        : 0
+      h1_displacement           : 1.657
+      h1_liquidity_sweep        : 1
+      m5_micro_bos              : 1
+      m5_sweep_confirmation     : 1
+      m5_entry_candle_qual      : 0.25
+      approach_distance(p)      : 50.0
+      approach_momentum         : 0.021
+      candle_body_ratio         : 0.105
+      zone_confluence           : 4
+      h4_fvg_inside             : 0
+      zone_strength             : 3.257
+      touch_count               : 20
+      risk_pips                 : 11.1
+
+  7    BUY     158.71667       18.9%        22.9%       65.0%  FAIL base<0.55
+
+    Feature snapshot (key model inputs)
+      h1_trend_alignment        : -1  ⚠ counter-trend (-1 suppresses model)
+      h1_structure_shift        : 0
+      h1_displacement           : 1.657
+      h1_liquidity_sweep        : 1
+      m5_micro_bos              : 1
+      m5_sweep_confirmation     : 1
+      m5_entry_candle_qual      : 0.25
+      approach_distance(p)      : 48.5
+      approach_momentum         : 0.021
+      candle_body_ratio         : 0.105
+      zone_confluence           : 4
+      h4_fvg_inside             : 0
+      zone_strength             : 2.583
+      touch_count               : 29
+      risk_pips                 : 11.9
+
+  8    BUY     158.66523       19.8%        26.8%       65.0%  FAIL base<0.55
+
+    Feature snapshot (key model inputs)
+      h1_trend_alignment        : -1  ⚠ counter-trend (-1 suppresses model)
+      h1_structure_shift        : 0
+      h1_displacement           : 1.657
+      h1_liquidity_sweep        : 1
+      m5_micro_bos              : 1
+      m5_sweep_confirmation     : 1
+      m5_entry_candle_qual      : 0.25
+      approach_distance(p)      : 48.0
+      approach_momentum         : 0.021
+      candle_body_ratio         : 0.105
+      zone_confluence           : 4
+      h4_fvg_inside             : 0
+      zone_strength             : 2.972
+      touch_count               : 31
+      risk_pips                 : 17.6
+
+  9    SELL    159.54129       28.4%        32.4%       65.0%  FAIL base<0.55
+
+    Feature snapshot (key model inputs)
+      h1_trend_alignment        : 1
+      h1_structure_shift        : 0
+      h1_displacement           : 1.657
+      h1_liquidity_sweep        : 1
+      m5_micro_bos              : 1
+      m5_sweep_confirmation     : 1
+      m5_entry_candle_qual      : 0.25
+      approach_distance(p)      : 20.6
+      approach_momentum         : 0.021
+      candle_body_ratio         : 0.105
+      zone_confluence           : 7
+      h4_fvg_inside             : 0
+      zone_strength             : 3.034
+      touch_count               : 17
+      risk_pips                 : 7.3
+
+  10   SELL    159.52797       22.9%        29.9%       65.0%  FAIL base<0.55
+
+    Feature snapshot (key model inputs)
+      h1_trend_alignment        : 1
+      h1_structure_shift        : 0
+      h1_displacement           : 1.657
+      h1_liquidity_sweep        : 1
+      m5_micro_bos              : 1
+      m5_sweep_confirmation     : 1
+      m5_entry_candle_qual      : 0.25
+      approach_distance(p)      : 16.0
+      approach_momentum         : 0.021
+      candle_body_ratio         : 0.105
+      zone_confluence           : 9
+      h4_fvg_inside             : 0
+      zone_strength             : 3.157
+      touch_count               : 24
+      risk_pips                 : 10.6
+
+  11   SELL    159.59336       82.1%        89.1%       65.0%  PASS → bias check
+
+    Feature snapshot (key model inputs)
+      h1_trend_alignment        : 1
+      h1_structure_shift        : 0
+      h1_displacement           : 1.657
+      h1_liquidity_sweep        : 1
+      m5_micro_bos              : 1
+      m5_sweep_confirmation     : 1
+      m5_entry_candle_qual      : 0.25
+      approach_distance(p)      : 24.0
+      approach_momentum         : 0.021
+      candle_body_ratio         : 0.105
+      zone_confluence           : 7
+      h4_fvg_inside             : 1
+      zone_strength             : 3.545
+      touch_count               : 17
+      risk_pips                 : 9.2
+
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  BIAS FILTER SIMULATION — USD/JPY
+══════════════════════════════════════════════════════════════════════════════════════════
+  H1 trend = bearish
+  Rule: bullish → keep BUY with entry < 159.29118
+        bearish → keep SELL with entry > 159.29118
+        neutral → keep everything (no filter applied)
+
+    SELL @ 160.41598  → PASS  SELL 160.41598 > price 159.29118
+    BUY @ 157.64134  → FAIL  BUY but trend is bearish
+    BUY @ 156.49294  → FAIL  BUY but trend is bearish
+    BUY @ 156.66602  → FAIL  BUY but trend is bearish
+    BUY @ 157.05732  → FAIL  BUY but trend is bearish
+    BUY @ 157.82929  → FAIL  BUY but trend is bearish
+    BUY @ 158.71667  → FAIL  BUY but trend is bearish
+    BUY @ 158.66523  → FAIL  BUY but trend is bearish
+    SELL @ 159.54129  → PASS  SELL 159.54129 > price 159.29118
+    SELL @ 159.52797  → PASS  SELL 159.52797 > price 159.29118
+    SELL @ 159.59336  → PASS  SELL 159.59336 > price 159.29118
+
+──────────────────────────────────────────────────────────────────────────────────────────
+  STATUS & REMAINING ISSUES
+──────────────────────────────────────────────────────────────────────────────────────────
+  ✅ Gate 6 fix APPLIED: ML gate = 55% for USD/JPY at current UTC hour.
+     9 OB(s) still failed — base_prob < 55%.
+     Root cause: h1_liquidity_sweep, m5_micro_bos, m5_sweep_confirmation = 0.
+     London session active — low scores indicate genuine lack of confirmation.
+
+  ✅ 2 OB(s) passed all gates including ML and bias filter.
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  D1 PREMIUM/DISCOUNT GATE — USD/JPY
+══════════════════════════════════════════════════════════════════════════════════════════
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [USD/JPY] loaded | Base: 65% | MaxBoost: 7%
+  Symbol                : USD/JPY
+  Current price         : 159.29118
+  D1 60-bar raw max     : 160.71630
+  D1 60-bar raw min     : 155.08038
+  P95 high (filter)     : 160.04015
+  P5 low (filter)       : 155.81227
+  P5→P95 range          : 4.22788  (422.8 pips)
+  Price position        : 0.823  (82.3%)
+  D1 zone               : 🔴 PREMIUM (>60%)
+
+  Interpretation:
+    BUY signals are favoured when price is in DISCOUNT (position < 0.40).
+    SELL signals are favoured when price is in PREMIUM (position > 0.60).
+    → Deep premium (82%). High-confidence SELL bias.
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  RR SENSITIVITY ANALYSIS — USD/JPY
+══════════════════════════════════════════════════════════════════════════════════════════
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [USD/JPY] loaded | Base: 65% | MaxBoost: 7%
+  4H ATR                        : 0.14711 = 14.7 pips
+  Current price                 : 159.29118
+  MAX_HTF_RR (this pair)        : 10.0
+  OBs reaching RR gate          : 11
+
+  OB #   type       reac(p)   risk(p)   TP=reac×1.5   TP=clamped    TP=ATR×2  Result
+  --------------------------------------------------------------------------------
+  1      bearish      494.3      21.8    34.02 ✗      9.50 ✓      1.35 ✓    ← CLAMP SAVES THIS
+  2      bullish      194.6     200.9    1.45 ✓       1.45 ✓      0.15 ✗   
+  3      bullish      147.4     144.2    1.53 ✓       1.53 ✓      0.20 ✗   
+  4      bullish       70.4      22.3    4.73 ✓       4.73 ✓      1.32 ✓   
+  5      bullish       68.5      12.9    7.99 ✓       7.99 ✓      2.29 ✓   
+  6      bullish       67.8      11.1    9.13 ✓       9.13 ✓      2.64 ✓   
+  7      bullish       44.0      11.9    5.57 ✓       5.57 ✓      2.48 ✓   
+  8      bullish       54.9      17.6    4.69 ✓       4.69 ✓      1.67 ✓   
+  9      bearish       44.0       7.3    9.04 ✓       9.04 ✓      4.03 ✓   
+  10     bearish       46.0      10.6    6.51 ✓       6.51 ✓      2.78 ✓   
+  11     bearish       51.1       9.2    8.35 ✓       8.35 ✓      3.20 ✓   
+
+  Fix recommendation:
+  In htf_trade_detect(), replace:
+    tp_target = entry + ob['reaction_size'] * 1.5
+  With:
+    tp_target = entry + max(ob['reaction_size'], current_atr) * 1.5
+  This ensures TP is at least 1.5× ATR even when the initial impulse was small.
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  OB FILTER PIPELINE — XAU/USD
+══════════════════════════════════════════════════════════════════════════════════════════
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [XAU/USD] loaded | Base: 65% | MaxBoost: 7%
+  Fetching bars …
+
+  Symbol              : XAU/USD
+  Current price       : 4533.96968
+  4H ATR              : 32.91528  (32.9 pips)
+  ATR tolerance       : 32.91528  (32.9 pips)
+  Max dist (pips)     : 658.3  (20.0× ATR)
+  H1 trend (bias)     : bullish
+  Pip size            : 1.0
+  Prob threshold      : 65%
+  MAX_HTF_RR          : 6.0  (Gold: 6.0)
+  ML gate             : 55%  (Gold fixed)
+
+  Total 4H OBs detected : 7
+
+  #    Type      Mid          Dist(p)   Dir    reac_sz    risk       reward     RR      str    G1    G2    G3    G4    G5    Fate              
+  -----------------------------------------------------------------------------------------------------------------------------------------------
+  1    bear      4752.5735    218.6     SELL   131.8p     27.5p      197.8p     7.19    5.41   ✓     ✓c5   ✓     ✗  —     RR=7.19 > 6.0
+  2    bear      4692.1320    158.2     SELL   98.6p      27.2p      147.8p     5.44    3.30   ✓     ✓c4   ✓     ✓     ✓     → ML scoring
+  3    bear      4699.0750    165.1     SELL   156.5p     16.2p      234.7p     14.46   5.37   ✓     ✓c5   ✓     ✗  —     RR=14.46 > 6.0
+  4    bear      4578.4379    44.5      SELL   126.6p     21.6p      189.9p     8.79    4.77   ✓     ✓c5   ✓     ✗  —     RR=8.79 > 6.0
+  5    bear      4565.2985    31.3      SELL   55.9p      18.1p      83.8p      4.62    3.14   ✓     ✓c3   ✓     ✓     ✓     → ML scoring
+  6    bear      4567.4122    33.4      SELL   73.3p      13.6p      110.0p     8.11    4.19   ✓     ✓c3   ✓     ✗  —     RR=8.11 > 6.0
+  7    bull      4413.5755    120.4     BUY    149.3p     53.0p      224.0p     4.23    4.61   ✓     ✓c5   ✓     ✓     ✓     → ML scoring
+
+  Gate summary
+    OBs detected                       : 7
+    Killed by distance (Gate 1)        : 0
+    Killed by confs < 2 (Gate 2)       : 0
+    Killed by direction/side (Gate 3)  : 0
+    Killed by RR out of range (Gate 4) : 4
+    Killed by strength < 0.5 (Gate 5)  : 0
+    Survivors for ML scoring           : 3
+
+──────────────────────────────────────────────────────────────────────────────────────────
+  ML SCORING — surviving OBs
+──────────────────────────────────────────────────────────────────────────────────────────
+  #    Dir         Entry   base_prob   final_prob   threshold  Result
+  ---------------------------------------------------------------------------
+  1    SELL   4692.13203       26.9%        33.9%       65.0%  FAIL base<0.55
+
+    Feature snapshot (key model inputs)
+      h1_trend_alignment        : -1  ⚠ counter-trend (-1 suppresses model)
+      h1_structure_shift        : 1
+      h1_displacement           : 2.175
+      h1_liquidity_sweep        : 1
+      m5_micro_bos              : 1
+      m5_sweep_confirmation     : 1
+      m5_entry_candle_qual      : 0.75
+      approach_distance(p)      : 50.0
+      approach_momentum         : 0.775
+      candle_body_ratio         : 0.383
+      zone_confluence           : 3
+      h4_fvg_inside             : 0
+      zone_strength             : 3.299
+      touch_count               : 47
+      risk_pips                 : 27.2
+
+  2    SELL   4565.29855       69.1%        75.1%       65.0%  PASS → bias check
+
+    Feature snapshot (key model inputs)
+      h1_trend_alignment        : -1  ⚠ counter-trend (-1 suppresses model)
+      h1_structure_shift        : 1
+      h1_displacement           : 2.175
+      h1_liquidity_sweep        : 1
+      m5_micro_bos              : 1
+      m5_sweep_confirmation     : 1
+      m5_entry_candle_qual      : 0.75
+      approach_distance(p)      : 19.8
+      approach_momentum         : 0.775
+      candle_body_ratio         : 0.383
+      zone_confluence           : 9
+      h4_fvg_inside             : 1
+      zone_strength             : 3.145
+      touch_count               : 40
+      risk_pips                 : 18.1
+
+  3    BUY    4413.57554       68.5%        75.5%       65.0%  PASS → bias check
+
+    Feature snapshot (key model inputs)
+      h1_trend_alignment        : 1
+      h1_structure_shift        : 1
+      h1_displacement           : 2.175
+      h1_liquidity_sweep        : 1
+      m5_micro_bos              : 1
+      m5_sweep_confirmation     : 1
+      m5_entry_candle_qual      : 0.5
+      approach_distance(p)      : 50.0
+      approach_momentum         : 0.775
+      candle_body_ratio         : 0.383
+      zone_confluence           : 7
+      h4_fvg_inside             : 1
+      zone_strength             : 4.609
+      touch_count               : 9
+      risk_pips                 : 53.0
+
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  BIAS FILTER SIMULATION — XAU/USD
+══════════════════════════════════════════════════════════════════════════════════════════
+  H1 trend = bullish
+  Rule: bullish → keep BUY with entry < 4533.96968
+        bearish → keep SELL with entry > 4533.96968
+        neutral → keep everything (no filter applied)
+
+    SELL @ 4692.13203  → FAIL  SELL but trend is bullish
+    SELL @ 4565.29855  → FAIL  SELL but trend is bullish
+    BUY @ 4413.57554  → PASS  BUY 4413.57554 < price 4533.96968
+
+──────────────────────────────────────────────────────────────────────────────────────────
+  STATUS & REMAINING ISSUES
+──────────────────────────────────────────────────────────────────────────────────────────
+  ★ Gate 4 (RR) killed 4 OB(s). [Gold: MAX_RR=6.0 unchanged]
+  ★ Gate 6 (ML) killed 1 OB(s). [Gold: gate fixed at 0.55]
+  ✅ 2 OB(s) passed all gates including ML and bias filter.
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  D1 PREMIUM/DISCOUNT GATE — XAU/USD
+══════════════════════════════════════════════════════════════════════════════════════════
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [XAU/USD] loaded | Base: 65% | MaxBoost: 7%
+  Symbol                : XAU/USD
+  Current price         : 4533.96968
+  D1 60-bar raw max     : 4887.92586
+  D1 60-bar raw min     : 4367.19364
+  P95 high (filter)     : 4847.47633
+  P5 low (filter)       : 4466.24142
+  P5→P95 range          : 381.23491  (381.2 pips)
+  Price position        : 0.178  (17.8%)
+  D1 zone               : 🟢 DISCOUNT (<40%)
+
+  Interpretation:
+    BUY signals are favoured when price is in DISCOUNT (position < 0.40).
+    SELL signals are favoured when price is in PREMIUM (position > 0.60).
+    → Deep discount (18%). High-confidence BUY bias. (Gold-like)
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  RR SENSITIVITY ANALYSIS — XAU/USD
+══════════════════════════════════════════════════════════════════════════════════════════
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [XAU/USD] loaded | Base: 65% | MaxBoost: 7%
+  4H ATR                        : 32.91528 = 32.9 pips
+  Current price                 : 4533.96968
+  MAX_HTF_RR (this pair)        : 6.0
+  OBs reaching RR gate          : 7
+
+  OB #   type       reac(p)   risk(p)   TP=reac×1.5   TP=clamped    TP=ATR×2  Result
+  --------------------------------------------------------------------------------
+  1      bearish      131.8      27.5    7.19 ✗       7.19 ✗      2.39 ✓   
+  2      bearish       98.6      27.2    5.44 ✓       5.44 ✓      2.42 ✓   
+  3      bearish      156.5      16.2    14.46 ✗      14.46 ✗     4.05 ✓   
+  4      bearish      126.6      21.6    8.79 ✗       8.79 ✗      3.05 ✓   
+  5      bearish       55.9      18.1    4.62 ✓       4.62 ✓      3.63 ✓   
+  6      bearish       73.3      13.6    8.11 ✗       8.11 ✗      4.85 ✓   
+  7      bullish      149.3      53.0    4.23 ✓       4.23 ✓      1.24 ✓   
+
+  Fix recommendation:
+  In htf_trade_detect(), replace:
+    tp_target = entry + ob['reaction_size'] * 1.5
+  With:
+    tp_target = entry + max(ob['reaction_size'], current_atr) * 1.5
+  This ensures TP is at least 1.5× ATR even when the initial impulse was small.
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  CROSS-PAIR FILTER COMPARISON SUMMARY
+══════════════════════════════════════════════════════════════════════════════════════════
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [EUR/USD] loaded | Base: 65% | MaxBoost: 7%
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [GBP/USD] loaded | Base: 65% | MaxBoost: 7%
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [USD/JPY] loaded | Base: 65% | MaxBoost: 7%
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [XAU/USD] loaded | Base: 65% | MaxBoost: 7%
+  Symbol   Price      ATR(p)  H1 Trend  MaxRR  MLgate  OBs  G1 dist  G2 confs  G3 dir  G4 rr  G5 str  ML cands  D1 pos  
+  ----------------------------------------------------------------------------------------------------------------------
+  EUR/USD  1.1644     20.7    bearish  10     55%     9    0        0         0       0      0       9  45% EQ  
+  GBP/USD  1.3420     23.9    bearish  10     55%     6    0        0         0       0      0       6  52% EQ  
+  USD/JPY  159.2912   14.7    bearish  10     55%     11   0        0         0       0      0       11  82% PREM
+  XAU/USD  4533.9697  32.9    bullish  6      55%     7    0        0         0       4  0       3  18% DIS 
+
+  G1=dist  G2=confs  G3=direction  G4=RR  G5=strength  ML cands=passed all gates
+
+══════════════════════════════════════════════════════════════════════════════════════════
+

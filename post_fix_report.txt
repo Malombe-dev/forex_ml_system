@@ -1,0 +1,553 @@
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  FOREX ML FILTER DIAGNOSTIC   —   2026-05-29 06:51 UTC
+══════════════════════════════════════════════════════════════════════════════════════════
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  OB FILTER PIPELINE — EUR/USD
+══════════════════════════════════════════════════════════════════════════════════════════
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [EUR/USD] loaded | Base: 65% | MaxBoost: 7%
+  Fetching bars …
+
+  Symbol              : EUR/USD
+  Current price       : 1.16523
+  4H ATR              : 0.00197  (19.7 pips)
+  ATR tolerance       : 0.00197  (19.7 pips)
+  Max dist (pips)     : 394.1  (20.0× ATR)
+  H1 trend (bias)     : bullish
+  Pip size            : 0.0001
+  Prob threshold      : 65%
+
+  Total 4H OBs detected : 9
+
+  #    Type      Mid          Dist(p)   Dir    reac_sz    risk       reward     RR      str    G1    G2    G3    G4    G5    Fate              
+  -----------------------------------------------------------------------------------------------------------------------------------------------
+  1    bear      1.1788       135.4     SELL   49.1p      10.4p      73.7p      7.09    2.95   ✓     ✓c3   ✓     ✗  —     RR=7.09 > 6.0
+  2    bear      1.1780       127.3     SELL   53.9p      12.6p      80.8p      6.42    2.52   ✓     ✓c5   ✓     ✗  —     RR=6.42 > 6.0
+  3    bear      1.1778       125.6     SELL   60.2p      9.5p       90.3p      9.46    2.91   ✓     ✓c4   ✓     ✗  —     RR=9.46 > 6.0
+  4    bear      1.1715       62.5      SELL   52.9p      8.4p       79.4p      9.40    2.81   ✓     ✓c4   ✓     ✗  —     RR=9.40 > 6.0
+  5    bear      1.1644       8.1       SELL   68.1p      20.4p      102.1p     5.00    4.19   ✓     ✓c4   ✓     ✓     ✓     → ML scoring
+  6    bull      1.1595       57.1      BUY    67.3p      14.6p      101.0p     6.90    3.98   ✓     ✓c4   ✓     ✗  —     RR=6.90 > 6.0
+  7    bear      1.1625       27.6      SELL   —          —          —          —       —      ✓     ✓c5   ✗  —     —     DIR: SELL mid 1.1625 < price-tol 1.1633
+  8    bear      1.1648       4.8       SELL   74.9p      17.8p      112.4p     6.31    4.60   ✓     ✓c5   ✓     ✗  —     RR=6.31 > 6.0
+  9    bull      1.1604       48.2      BUY    73.5p      21.5p      110.2p     5.12    4.09   ✓     ✓c5   ✓     ✓     ✓     → ML scoring
+
+  Gate summary
+    OBs detected                       : 9
+    Killed by distance (Gate 1)        : 0
+    Killed by confs < 2 (Gate 2)       : 0
+    Killed by direction/side (Gate 3)  : 1
+    Killed by RR out of range (Gate 4) : 6
+    Killed by strength < 0.5 (Gate 5)  : 0
+    Survivors for ML scoring           : 2
+
+──────────────────────────────────────────────────────────────────────────────────────────
+  ML SCORING — surviving OBs
+──────────────────────────────────────────────────────────────────────────────────────────
+  #    Dir         Entry   base_prob   final_prob   threshold  Result
+  ---------------------------------------------------------------------------
+  1    SELL      1.16442       25.5%        32.5%       65.0%  FAIL base<0.55
+  2    BUY       1.16041       26.3%        33.3%       65.0%  FAIL base<0.55
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  BIAS FILTER SIMULATION — EUR/USD
+══════════════════════════════════════════════════════════════════════════════════════════
+  H1 trend = bullish
+  Rule: bullish → keep BUY with entry < 1.16523
+        bearish → keep SELL with entry > 1.16523
+        neutral → keep everything (no filter applied)
+
+    SELL @ 1.16442  → FAIL  SELL but trend is bullish
+    BUY @ 1.16041  → PASS  BUY 1.16041 < price 1.16523
+
+──────────────────────────────────────────────────────────────────────────────────────────
+  SUGGESTED FIXES
+──────────────────────────────────────────────────────────────────────────────────────────
+  ★ Gate 4 (RR) killed 6 OB(s).
+    Current formula:  TP = entry + reaction_size × 1.5
+    reaction_size is the 5-bar impulse after the OB — often < 1 ATR on compressed EUR/USD.
+    ATR = 0.00197 = 19.7 pips  →  TP floor = 39p would give RR ≈ 2.0 with typical 16p risk.
+    Fix: use  TP = entry ± max(reaction_size, ATR) × 1.5
+         or   TP = entry ± ATR_multiplier (2–3 ATR)  instead of reaction_size.
+
+  ★ Gate 3 (direction) killed 1 OB(s).
+    atr_tol = 0.00197 (19.7p).
+    Zones beyond 1 ATR from price on the wrong side are rejected.
+    Consider raising ATR_TOL_MULT to 1.5–2.0 for approaching zones.
+
+  ★ Gate 6 (ML) killed 2 OB(s) with base_prob < 0.55.
+    Check the feature snapshot above for low-value inputs:
+    h1_liquidity_sweep=0 and m5_micro_bos=0 are the most common suppressors.
+
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  D1 PREMIUM/DISCOUNT GATE — EUR/USD
+══════════════════════════════════════════════════════════════════════════════════════════
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [EUR/USD] loaded | Base: 65% | MaxBoost: 7%
+  Symbol                : EUR/USD
+  Current price         : 1.16523
+  D1 60-bar raw max     : 1.18488
+  D1 60-bar raw min     : 1.14400
+  P95 high (filter)     : 1.18089
+  P5 low (filter)       : 1.15092
+  P5→P95 range          : 0.02997  (299.7 pips)
+  Price position        : 0.478  (47.8%)
+  D1 zone               : 🟡 EQUILIBRIUM (40-60%)
+
+  Interpretation:
+    BUY signals are favoured when price is in DISCOUNT (position < 0.40).
+    SELL signals are favoured when price is in PREMIUM (position > 0.60).
+    → Mid-range (48%). Model gets less D1 premium/discount signal.
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  RR SENSITIVITY ANALYSIS — EUR/USD
+══════════════════════════════════════════════════════════════════════════════════════════
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [EUR/USD] loaded | Base: 65% | MaxBoost: 7%
+  4H ATR                        : 0.00197 = 19.7 pips
+  Current price                 : 1.16523
+  OBs reaching RR gate          : 8
+
+  OB #   type       reac(p)   risk(p)   TP=reac×1.5    TP=ATR×2    TP=ATR×3  Result
+  ------------------------------------------------------------------------
+  1      bearish       49.1      10.4    7.09 ✗       3.79 ✓     5.69 ✓    ← already passes
+  2      bearish       53.9      12.6    6.42 ✗       3.13 ✓     4.70 ✓    ← already passes
+  3      bearish       60.2       9.5    9.46 ✗       4.13 ✓     6.20 ✗    ← already passes
+  4      bearish       52.9       8.4    9.40 ✗       4.67 ✓     7.00 ✗    ← already passes
+  5      bearish       68.1      20.4    5.00 ✓       1.93 ✓     2.89 ✓    ← already passes
+  6      bullish       67.3      14.6    6.90 ✗       2.69 ✓     4.04 ✓    ← already passes
+  7      bearish       74.9      17.8    6.31 ✗       2.22 ✓     3.32 ✓    ← already passes
+  8      bullish       73.5      21.5    5.12 ✓       1.83 ✓     2.74 ✓    ← already passes
+
+  Fix recommendation:
+  In htf_trade_detect(), replace:
+    tp_target = entry + ob['reaction_size'] * 1.5
+  With:
+    tp_target = entry + max(ob['reaction_size'], current_atr) * 1.5
+  This ensures TP is at least 1.5× ATR even when the initial impulse was small.
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  OB FILTER PIPELINE — GBP/USD
+══════════════════════════════════════════════════════════════════════════════════════════
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [GBP/USD] loaded | Base: 65% | MaxBoost: 7%
+  Fetching bars …
+
+  Symbol              : GBP/USD
+  Current price       : 1.34403
+  4H ATR              : 0.00229  (22.9 pips)
+  ATR tolerance       : 0.00229  (22.9 pips)
+  Max dist (pips)     : 458.3  (20.0× ATR)
+  H1 trend (bias)     : bullish
+  Pip size            : 0.0001
+  Prob threshold      : 65%
+
+  Total 4H OBs detected : 6
+
+  #    Type      Mid          Dist(p)   Dir    reac_sz    risk       reward     RR      str    G1    G2    G3    G4    G5    Fate              
+  -----------------------------------------------------------------------------------------------------------------------------------------------
+  1    bear      1.3630       190.0     SELL   149.7p     26.6p      224.5p     8.43    6.03   ✓     ✓c5   ✓     ✗  —     RR=8.43 > 6.0
+  2    bear      1.3527       86.5      SELL   137.5p     10.3p      206.2p     19.96   5.03   ✓     ✓c5   ✓     ✗  —     RR=19.96 > 6.0
+  3    bull      1.3317       123.8     BUY    142.2p     15.6p      213.3p     13.69   8.03   ✓     ✓c4   ✓     ✗  —     RR=13.69 > 6.0
+  4    bull      1.3392       48.8      BUY    89.3p      19.6p      134.0p     6.82    3.46   ✓     ✓c5   ✓     ✗  —     RR=6.82 > 6.0
+  5    bear      1.3506       66.2      SELL   75.8p      7.6p       113.7p     14.99   3.77   ✓     ✓c5   ✓     ✗  —     RR=14.99 > 6.0
+  6    bull      1.3391       48.9      BUY    81.2p      27.7p      121.8p     4.40    3.59   ✓     ✓c5   ✓     ✓     ✓     → ML scoring
+
+  Gate summary
+    OBs detected                       : 6
+    Killed by distance (Gate 1)        : 0
+    Killed by confs < 2 (Gate 2)       : 0
+    Killed by direction/side (Gate 3)  : 0
+    Killed by RR out of range (Gate 4) : 5
+    Killed by strength < 0.5 (Gate 5)  : 0
+    Survivors for ML scoring           : 1
+
+──────────────────────────────────────────────────────────────────────────────────────────
+  ML SCORING — surviving OBs
+──────────────────────────────────────────────────────────────────────────────────────────
+  #    Dir         Entry   base_prob   final_prob   threshold  Result
+  ---------------------------------------------------------------------------
+  1    BUY       1.33914       29.1%        36.1%       65.0%  FAIL base<0.55
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  BIAS FILTER SIMULATION — GBP/USD
+══════════════════════════════════════════════════════════════════════════════════════════
+  H1 trend = bullish
+  Rule: bullish → keep BUY with entry < 1.34403
+        bearish → keep SELL with entry > 1.34403
+        neutral → keep everything (no filter applied)
+
+    BUY @ 1.33914  → PASS  BUY 1.33914 < price 1.34403
+
+──────────────────────────────────────────────────────────────────────────────────────────
+  SUGGESTED FIXES
+──────────────────────────────────────────────────────────────────────────────────────────
+  ★ Gate 4 (RR) killed 5 OB(s).
+    Current formula:  TP = entry + reaction_size × 1.5
+    reaction_size is the 5-bar impulse after the OB — often < 1 ATR on compressed GBP/USD.
+    ATR = 0.00229 = 22.9 pips  →  TP floor = 46p would give RR ≈ 2.0 with typical 18p risk.
+    Fix: use  TP = entry ± max(reaction_size, ATR) × 1.5
+         or   TP = entry ± ATR_multiplier (2–3 ATR)  instead of reaction_size.
+
+  ★ Gate 6 (ML) killed 1 OB(s) with base_prob < 0.55.
+    Check the feature snapshot above for low-value inputs:
+    h1_liquidity_sweep=0 and m5_micro_bos=0 are the most common suppressors.
+
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  D1 PREMIUM/DISCOUNT GATE — GBP/USD
+══════════════════════════════════════════════════════════════════════════════════════════
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [GBP/USD] loaded | Base: 65% | MaxBoost: 7%
+  Symbol                : GBP/USD
+  Current price         : 1.34403
+  D1 60-bar raw max     : 1.36575
+  D1 60-bar raw min     : 1.31381
+  P95 high (filter)     : 1.36383
+  P5 low (filter)       : 1.31824
+  P5→P95 range          : 0.04559  (455.9 pips)
+  Price position        : 0.566  (56.6%)
+  D1 zone               : 🟡 EQUILIBRIUM (40-60%)
+
+  Interpretation:
+    BUY signals are favoured when price is in DISCOUNT (position < 0.40).
+    SELL signals are favoured when price is in PREMIUM (position > 0.60).
+    → Mid-range (57%). Model gets less D1 premium/discount signal.
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  RR SENSITIVITY ANALYSIS — GBP/USD
+══════════════════════════════════════════════════════════════════════════════════════════
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [GBP/USD] loaded | Base: 65% | MaxBoost: 7%
+  4H ATR                        : 0.00229 = 22.9 pips
+  Current price                 : 1.34403
+  OBs reaching RR gate          : 6
+
+  OB #   type       reac(p)   risk(p)   TP=reac×1.5    TP=ATR×2    TP=ATR×3  Result
+  ------------------------------------------------------------------------
+  1      bearish      149.7      26.6    8.43 ✗       1.72 ✓     2.58 ✓    ← already passes
+  2      bearish      137.5      10.3    19.96 ✗      4.44 ✓     6.65 ✗    ← already passes
+  3      bullish      142.2      15.6    13.69 ✗      2.94 ✓     4.41 ✓    ← already passes
+  4      bullish       89.3      19.6    6.82 ✗       2.33 ✓     3.50 ✓    ← already passes
+  5      bearish       75.8       7.6    14.99 ✗      6.04 ✗     9.07 ✗    ← already passes
+  6      bullish       81.2      27.7    4.40 ✓       1.66 ✓     2.48 ✓    ← already passes
+
+  Fix recommendation:
+  In htf_trade_detect(), replace:
+    tp_target = entry + ob['reaction_size'] * 1.5
+  With:
+    tp_target = entry + max(ob['reaction_size'], current_atr) * 1.5
+  This ensures TP is at least 1.5× ATR even when the initial impulse was small.
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  OB FILTER PIPELINE — USD/JPY
+══════════════════════════════════════════════════════════════════════════════════════════
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [USD/JPY] loaded | Base: 65% | MaxBoost: 7%
+  Fetching bars …
+
+  Symbol              : USD/JPY
+  Current price       : 159.26946
+  4H ATR              : 0.14861  (14.9 pips)
+  ATR tolerance       : 0.14861  (14.9 pips)
+  Max dist (pips)     : 297.2  (20.0× ATR)
+  H1 trend (bias)     : bearish
+  Pip size            : 0.01
+  Prob threshold      : 65%
+
+  Total 4H OBs detected : 11
+
+  #    Type      Mid          Dist(p)   Dir    reac_sz    risk       reward     RR      str    G1    G2    G3    G4    G5    Fate              
+  -----------------------------------------------------------------------------------------------------------------------------------------------
+  1    bear      160.4160     114.7     SELL   494.3p     21.8p      741.4p     33.98   16.83  ✓     ✓c4   ✓     ✗  —     RR=33.98 > 6.0
+  2    bull      157.6413     162.8     BUY    194.6p     200.9p     291.9p     1.45    3.15   ✓     ✓c4   ✓     ✓     ✓     → ML scoring
+  3    bull      156.4929     277.7     BUY    147.4p     144.2p     221.1p     1.53    2.63   ✓     ✓c5   ✓     ✓     ✓     → ML scoring
+  4    bull      156.6660     260.3     BUY    70.4p      22.3p      105.6p     4.73    3.34   ✓     ✓c4   ✓     ✓     ✓     → ML scoring
+  5    bull      157.0573     221.2     BUY    68.5p      12.9p      102.8p     7.97    2.90   ✓     ✓c5   ✓     ✗  —     RR=7.97 > 6.0
+  6    bull      157.8293     144.0     BUY    67.8p      11.2p      101.7p     9.11    3.26   ✓     ✓c4   ✓     ✗  —     RR=9.11 > 6.0
+  7    bull      158.7167     55.3      BUY    44.0p      11.9p      66.1p      5.56    2.58   ✓     ✓c2   ✓     ✓     ✓     → ML scoring
+  8    bull      158.6652     60.4      BUY    54.9p      17.6p      82.4p      4.68    2.97   ✓     ✓c5   ✓     ✓     ✓     → ML scoring
+  9    bear      159.5413     27.2      SELL   44.0p      7.3p       66.0p      9.00    3.03   ✓     ✓c2   ✓     ✗  —     RR=9.00 > 6.0
+  10   bear      159.5280     25.9      SELL   46.0p      10.6p      69.0p      6.49    3.16   ✓     ✓c4   ✓     ✗  —     RR=6.49 > 6.0
+  11   bear      159.5934     32.4      SELL   51.1p      9.2p       76.7p      8.32    3.54   ✓     ✓c5   ✓     ✗  —     RR=8.32 > 6.0
+
+  Gate summary
+    OBs detected                       : 11
+    Killed by distance (Gate 1)        : 0
+    Killed by confs < 2 (Gate 2)       : 0
+    Killed by direction/side (Gate 3)  : 0
+    Killed by RR out of range (Gate 4) : 6
+    Killed by strength < 0.5 (Gate 5)  : 0
+    Survivors for ML scoring           : 5
+
+──────────────────────────────────────────────────────────────────────────────────────────
+  ML SCORING — surviving OBs
+──────────────────────────────────────────────────────────────────────────────────────────
+  #    Dir         Entry   base_prob   final_prob   threshold  Result
+  ---------------------------------------------------------------------------
+  1    BUY     157.64134       24.4%        31.4%       65.0%  FAIL base<0.55
+  2    BUY     156.49294        5.3%        12.3%       65.0%  FAIL base<0.55
+  3    BUY     156.66602       23.3%        30.3%       65.0%  FAIL base<0.55
+  4    BUY     158.71667       20.0%        24.0%       65.0%  FAIL base<0.55
+  5    BUY     158.66523       22.5%        29.5%       65.0%  FAIL base<0.55
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  BIAS FILTER SIMULATION — USD/JPY
+══════════════════════════════════════════════════════════════════════════════════════════
+  H1 trend = bearish
+  Rule: bullish → keep BUY with entry < 159.26946
+        bearish → keep SELL with entry > 159.26946
+        neutral → keep everything (no filter applied)
+
+    BUY @ 157.64134  → FAIL  BUY but trend is bearish
+    BUY @ 156.49294  → FAIL  BUY but trend is bearish
+    BUY @ 156.66602  → FAIL  BUY but trend is bearish
+    BUY @ 158.71667  → FAIL  BUY but trend is bearish
+    BUY @ 158.66523  → FAIL  BUY but trend is bearish
+
+──────────────────────────────────────────────────────────────────────────────────────────
+  SUGGESTED FIXES
+──────────────────────────────────────────────────────────────────────────────────────────
+  ★ Gate 4 (RR) killed 6 OB(s).
+    Current formula:  TP = entry + reaction_size × 1.5
+    reaction_size is the 5-bar impulse after the OB — often < 1 ATR on compressed USD/JPY.
+    ATR = 0.14861 = 14.9 pips  →  TP floor = 30p would give RR ≈ 2.0 with typical 12p risk.
+    Fix: use  TP = entry ± max(reaction_size, ATR) × 1.5
+         or   TP = entry ± ATR_multiplier (2–3 ATR)  instead of reaction_size.
+
+  ★ Gate 6 (ML) killed 5 OB(s) with base_prob < 0.55.
+    Check the feature snapshot above for low-value inputs:
+    h1_liquidity_sweep=0 and m5_micro_bos=0 are the most common suppressors.
+
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  D1 PREMIUM/DISCOUNT GATE — USD/JPY
+══════════════════════════════════════════════════════════════════════════════════════════
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [USD/JPY] loaded | Base: 65% | MaxBoost: 7%
+  Symbol                : USD/JPY
+  Current price         : 159.26946
+  D1 60-bar raw max     : 160.71630
+  D1 60-bar raw min     : 155.08038
+  P95 high (filter)     : 160.04015
+  P5 low (filter)       : 155.81227
+  P5→P95 range          : 4.22788  (422.8 pips)
+  Price position        : 0.818  (81.8%)
+  D1 zone               : 🔴 PREMIUM (>60%)
+
+  Interpretation:
+    BUY signals are favoured when price is in DISCOUNT (position < 0.40).
+    SELL signals are favoured when price is in PREMIUM (position > 0.60).
+    → Deep premium (82%). High-confidence SELL bias.
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  RR SENSITIVITY ANALYSIS — USD/JPY
+══════════════════════════════════════════════════════════════════════════════════════════
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [USD/JPY] loaded | Base: 65% | MaxBoost: 7%
+  4H ATR                        : 0.14861 = 14.9 pips
+  Current price                 : 159.26946
+  OBs reaching RR gate          : 11
+
+  OB #   type       reac(p)   risk(p)   TP=reac×1.5    TP=ATR×2    TP=ATR×3  Result
+  ------------------------------------------------------------------------
+  1      bearish      494.3      21.8    33.98 ✗      1.36 ✓     2.04 ✓    ← already passes
+  2      bullish      194.6     200.9    1.45 ✓       0.15 ✗     0.22 ✗    ← already passes
+  3      bullish      147.4     144.2    1.53 ✓       0.21 ✗     0.31 ✗    ← already passes
+  4      bullish       70.4      22.3    4.73 ✓       1.33 ✓     2.00 ✓    ← already passes
+  5      bullish       68.5      12.9    7.97 ✗       2.30 ✓     3.46 ✓    ← already passes
+  6      bullish       67.8      11.2    9.11 ✗       2.66 ✓     3.99 ✓    ← already passes
+  7      bullish       44.0      11.9    5.56 ✓       2.50 ✓     3.75 ✓    ← already passes
+  8      bullish       54.9      17.6    4.68 ✓       1.69 ✓     2.53 ✓    ← already passes
+  9      bearish       44.0       7.3    9.00 ✗       4.05 ✓     6.08 ✗    ← already passes
+  10     bearish       46.0      10.6    6.49 ✗       2.80 ✓     4.19 ✓    ← already passes
+  11     bearish       51.1       9.2    8.32 ✗       3.23 ✓     4.84 ✓    ← already passes
+
+  Fix recommendation:
+  In htf_trade_detect(), replace:
+    tp_target = entry + ob['reaction_size'] * 1.5
+  With:
+    tp_target = entry + max(ob['reaction_size'], current_atr) * 1.5
+  This ensures TP is at least 1.5× ATR even when the initial impulse was small.
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  OB FILTER PIPELINE — XAU/USD
+══════════════════════════════════════════════════════════════════════════════════════════
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [XAU/USD] loaded | Base: 65% | MaxBoost: 7%
+  Fetching bars …
+
+  Symbol              : XAU/USD
+  Current price       : 4517.03754
+  4H ATR              : 32.95743  (33.0 pips)
+  ATR tolerance       : 32.95743  (33.0 pips)
+  Max dist (pips)     : 659.1  (20.0× ATR)
+  H1 trend (bias)     : bullish
+  Pip size            : 1.0
+  Prob threshold      : 65%
+
+  Total 4H OBs detected : 8
+
+  #    Type      Mid          Dist(p)   Dir    reac_sz    risk       reward     RR      str    G1    G2    G3    G4    G5    Fate              
+  -----------------------------------------------------------------------------------------------------------------------------------------------
+  1    bear      4752.5735    235.5     SELL   131.8p     27.5p      197.8p     7.19    5.41   ✓     ✓c5   ✓     ✗  —     RR=7.19 > 6.0
+  2    bear      4692.1320    175.1     SELL   98.6p      27.2p      147.8p     5.44    3.30   ✓     ✓c4   ✓     ✓     ✓     → ML scoring
+  3    bear      4699.0750    182.0     SELL   156.5p     16.2p      234.7p     14.45   5.37   ✓     ✓c5   ✓     ✗  —     RR=14.45 > 6.0
+  4    bear      4578.4379    61.4      SELL   126.6p     21.6p      189.9p     8.78    4.77   ✓     ✓c5   ✓     ✗  —     RR=8.78 > 6.0
+  5    bear      4565.2985    48.3      SELL   55.9p      18.2p      83.8p      4.62    3.14   ✓     ✓c3   ✓     ✓     ✓     → ML scoring
+  6    bear      4567.4122    50.4      SELL   73.3p      13.6p      110.0p     8.11    4.19   ✓     ✓c3   ✓     ✗  —     RR=8.11 > 6.0
+  7    bear      4513.2887    3.7       SELL   125.6p     21.3p      188.4p     8.86    5.59   ✓     ✓c5   ✓     ✗  —     RR=8.86 > 6.0
+  8    bull      4413.5755    103.5     BUY    149.3p     53.0p      224.0p     4.23    4.61   ✓     ✓c5   ✓     ✓     ✓     → ML scoring
+
+  Gate summary
+    OBs detected                       : 8
+    Killed by distance (Gate 1)        : 0
+    Killed by confs < 2 (Gate 2)       : 0
+    Killed by direction/side (Gate 3)  : 0
+    Killed by RR out of range (Gate 4) : 5
+    Killed by strength < 0.5 (Gate 5)  : 0
+    Survivors for ML scoring           : 3
+
+──────────────────────────────────────────────────────────────────────────────────────────
+  ML SCORING — surviving OBs
+──────────────────────────────────────────────────────────────────────────────────────────
+  #    Dir         Entry   base_prob   final_prob   threshold  Result
+  ---------------------------------------------------------------------------
+  1    SELL   4692.13203       30.2%        37.2%       65.0%  FAIL base<0.55
+  2    SELL   4565.29855       72.5%        78.5%       65.0%  PASS → bias check
+
+    Feature snapshot (key model inputs)
+      h1_trend_alignment        : -1  ⚠ counter-trend (-1 suppresses model)
+      h1_structure_shift        : 0
+      h1_displacement           : 3.607
+      h1_liquidity_sweep        : 1
+      m5_micro_bos              : 1
+      m5_sweep_confirmation     : 1
+      m5_entry_candle_qual      : 0.25
+      approach_distance(p)      : 36.7
+      approach_momentum         : 0.576
+      candle_body_ratio         : 0.528
+      zone_confluence           : 8
+      h4_fvg_inside             : 1
+      zone_strength             : 3.145
+      touch_count               : 40
+      risk_pips                 : 18.2
+
+  3    BUY    4413.57554       73.4%        80.4%       65.0%  PASS → bias check
+
+    Feature snapshot (key model inputs)
+      h1_trend_alignment        : 1
+      h1_structure_shift        : 0
+      h1_displacement           : 3.607
+      h1_liquidity_sweep        : 1
+      m5_micro_bos              : 1
+      m5_sweep_confirmation     : 1
+      m5_entry_candle_qual      : 0.0
+      approach_distance(p)      : 50.0
+      approach_momentum         : 0.576
+      candle_body_ratio         : 0.528
+      zone_confluence           : 7
+      h4_fvg_inside             : 1
+      zone_strength             : 4.609
+      touch_count               : 9
+      risk_pips                 : 53.0
+
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  BIAS FILTER SIMULATION — XAU/USD
+══════════════════════════════════════════════════════════════════════════════════════════
+  H1 trend = bullish
+  Rule: bullish → keep BUY with entry < 4517.03754
+        bearish → keep SELL with entry > 4517.03754
+        neutral → keep everything (no filter applied)
+
+    SELL @ 4692.13203  → FAIL  SELL but trend is bullish
+    SELL @ 4565.29855  → FAIL  SELL but trend is bullish
+    BUY @ 4413.57554  → PASS  BUY 4413.57554 < price 4517.03754
+
+──────────────────────────────────────────────────────────────────────────────────────────
+  SUGGESTED FIXES
+──────────────────────────────────────────────────────────────────────────────────────────
+  ★ Gate 4 (RR) killed 5 OB(s).
+    Current formula:  TP = entry + reaction_size × 1.5
+    reaction_size is the 5-bar impulse after the OB — often < 1 ATR on compressed XAU/USD.
+    ATR = 32.95743 = 33.0 pips  →  TP floor = 66p would give RR ≈ 2.0 with typical 26p risk.
+    Fix: use  TP = entry ± max(reaction_size, ATR) × 1.5
+         or   TP = entry ± ATR_multiplier (2–3 ATR)  instead of reaction_size.
+
+  ★ Gate 6 (ML) killed 1 OB(s) with base_prob < 0.55.
+    Check the feature snapshot above for low-value inputs:
+    h1_liquidity_sweep=0 and m5_micro_bos=0 are the most common suppressors.
+
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  D1 PREMIUM/DISCOUNT GATE — XAU/USD
+══════════════════════════════════════════════════════════════════════════════════════════
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [XAU/USD] loaded | Base: 65% | MaxBoost: 7%
+  Symbol                : XAU/USD
+  Current price         : 4517.03754
+  D1 60-bar raw max     : 4887.92586
+  D1 60-bar raw min     : 4367.19364
+  P95 high (filter)     : 4847.47633
+  P5 low (filter)       : 4466.24142
+  P5→P95 range          : 381.23491  (381.2 pips)
+  Price position        : 0.133  (13.3%)
+  D1 zone               : 🟢 DISCOUNT (<40%)
+
+  Interpretation:
+    BUY signals are favoured when price is in DISCOUNT (position < 0.40).
+    SELL signals are favoured when price is in PREMIUM (position > 0.60).
+    → Deep discount (13%). High-confidence BUY bias. (Gold-like)
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  RR SENSITIVITY ANALYSIS — XAU/USD
+══════════════════════════════════════════════════════════════════════════════════════════
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [XAU/USD] loaded | Base: 65% | MaxBoost: 7%
+  4H ATR                        : 32.95743 = 33.0 pips
+  Current price                 : 4517.03754
+  OBs reaching RR gate          : 8
+
+  OB #   type       reac(p)   risk(p)   TP=reac×1.5    TP=ATR×2    TP=ATR×3  Result
+  ------------------------------------------------------------------------
+  1      bearish      131.8      27.5    7.19 ✗       2.40 ✓     3.59 ✓    ← already passes
+  2      bearish       98.6      27.2    5.44 ✓       2.42 ✓     3.64 ✓    ← already passes
+  3      bearish      156.5      16.2    14.45 ✗      4.06 ✓     6.09 ✗    ← already passes
+  4      bearish      126.6      21.6    8.78 ✗       3.05 ✓     4.57 ✓    ← already passes
+  5      bearish       55.9      18.2    4.62 ✓       3.63 ✓     5.45 ✓    ← already passes
+  6      bearish       73.3      13.6    8.11 ✗       4.86 ✓     7.28 ✗    ← already passes
+  7      bearish      125.6      21.3    8.86 ✗       3.10 ✓     4.65 ✓    ← already passes
+  8      bullish      149.3      53.0    4.23 ✓       1.24 ✓     1.87 ✓    ← already passes
+
+  Fix recommendation:
+  In htf_trade_detect(), replace:
+    tp_target = entry + ob['reaction_size'] * 1.5
+  With:
+    tp_target = entry + max(ob['reaction_size'], current_atr) * 1.5
+  This ensures TP is at least 1.5× ATR even when the initial impulse was small.
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  CROSS-PAIR FILTER COMPARISON SUMMARY
+══════════════════════════════════════════════════════════════════════════════════════════
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [EUR/USD] loaded | Base: 65% | MaxBoost: 7%
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [GBP/USD] loaded | Base: 65% | MaxBoost: 7%
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [USD/JPY] loaded | Base: 65% | MaxBoost: 7%
+  ✅ Model v5 (reversion) loaded — XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]
+✓ REV [XAU/USD] loaded | Base: 65% | MaxBoost: 7%
+  Symbol   Price      ATR(p)  H1 Trend  OBs  G1 dist  G2 confs  G3 dir  G4 rr  G5 str  ML cands  D1 pos  
+  -------------------------------------------------------------------------------------------------------
+  EUR/USD  1.1652     19.7    bullish  9    0        0         1  6  0       2  48% EQ  
+  GBP/USD  1.3440     22.9    bullish  6    0        0         0       5  0       1  57% EQ  
+  USD/JPY  159.2695   14.9    bullish  11   0        0         0       6  0       5  82% PREM
+  XAU/USD  4517.0375  33.0    bullish  8    0        0         0       5  0       3  13% DIS 
+
+  G1=dist  G2=confs  G3=direction  G4=RR  G5=strength  ML cands=passed all gates
+
+══════════════════════════════════════════════════════════════════════════════════════════
+

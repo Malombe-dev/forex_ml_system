@@ -1,9 +1,25 @@
 """
-CANONICAL FEATURE BUILDER  v8
+CANONICAL FEATURE BUILDER  v9
 ==============================
 build_feature_row() is the SINGLE function that produces a feature DataFrame
 for one zone candidate. Called identically from label_generator.py,
 production_predictor.py, and model_trainer.py.
+
+v9: Feature-alignment fixes —
+    FIX 1: _compute_m5_features now uses tail(60) instead of tail(20) for
+            m5_micro_bos and m5_sweep_confirmation. production_predictor's
+            _check_5min_entry() already used tail(60); the mismatch caused the
+            fallback path (15-min zones without pre-injected m5 values) to
+            scan a narrower window, producing fewer BOS/sweep detections and
+            systematically lower model scores for all 15-min zones.
+            m5_entry_candle_quality still uses the final tail(5) of that window
+            — unchanged.
+
+    FIX 2: _compute_raw_features now resolves htf_trend_alignment as {-1,0,1}
+            instead of accepting raw zone["htf_alignment"] which was {0,1} for
+            15-min zones (predict_with_proper_features set 0 for counter-trend
+            instead of -1). The correct value is now enforced here so both the
+            HTF-OB path (pre-injected) and the 15-min path agree.
 
 v8: Removed unreliable live features —
     REMOVED : prev_zone_outcome (always 0.5 live, XGB importance 11%)
@@ -187,9 +203,18 @@ def _compute_raw_features(
     approach_atr_reg = get_atr_regime(t_atr, t_atr_ma)
 
     # ── zone_touch_count and htf_trend_alignment ──────────────────────────────
-    # zone_touch_count    = int(zone.get("touch_count", 1))
+    # zone_touch_count: accept either key name — upstream uses both spellings.
     zone_touch_count = int(zone.get("touch_count", zone.get("zone_touch_count", 1)))
-    htf_trend_alignment = int(zone.get("htf_alignment", 0))
+
+    # FIX 2 (v9): htf_trend_alignment must be {-1, 0, 1}.
+    # The HTF-OB path (htf_trade_detect) injects the correct direction-flipped
+    # value via h1_conf['h1_trend_alignment'].  The 15-min path
+    # (predict_with_proper_features) historically set htf_alignment = {0, 1}
+    # only — counter-trend zones got 0 instead of -1, silencing the model's
+    # counter-trend penalty.
+    # Fix: clamp the raw value to {-1, 0, 1} here so both paths are safe.
+    _raw_htf = int(zone.get("htf_alignment", 0))
+    htf_trend_alignment = max(-1, min(1, _raw_htf))
 
     # ── v5: Approach-time features ────────────────────────────────────────────
     zone_edge = zone.get("price_high") if zone.get("type") == "demand" else zone.get("price_low")
@@ -221,8 +246,17 @@ def _compute_raw_features(
     # h1_confluence REMOVED — replaced by granular features below
 
     sources = zone.get("sources", [])
+    # FIX A: h4_fvg_inside was always 0.0 live because htf_trade_detect() built
+    # zone dicts with no 'sources', 'source', or 'tf_source'='fvg' fields.
+    # Two new explicit flags are now injected upstream in production_predictor:
+    #   h4_fvg_zone  — set True on every FVG zone entering _ml_score_htf_zone
+    #   fvg_overlap  — set True on OB zones whose price range overlaps a 4H FVG
+    # Original string-match checks kept as fallback for training-path zones
+    # from smc_detector which carry 'sources' / 'tf_source'.
     h4_fvg_inside = 1.0 if (
-        "fvg" in sources
+        zone.get("h4_fvg_zone", False)
+        or zone.get("fvg_overlap", False)
+        or "fvg" in sources
         or zone.get("source", "") == "fvg"
         or "fvg" in str(zone.get("tf_source", ""))
         or any("fvg" in str(s) for s in sources)
@@ -390,14 +424,18 @@ def _compute_h1_features(
 
         # ── h1_liquidity_sweep ────────────────────────────────────────────────
         # Detect: price spiked below a swing low (or above swing high) and
-        # closed back inside structure within 3 bars
+        # closed back inside structure.
+        # FIX 3: scan full `sub` (all 1H bars up to touch_time) instead of
+        # tail(30). tail(30) missed sweeps that occurred earlier in the zone's
+        # lifetime, producing near-zero values vs training mean of 0.972 —
+        # a −5.85 z-score that systematically suppressed model scores.
         h1_liquidity_sweep = 0
-        check_window = sub.tail(30).reset_index(drop=True)
+        check_window = sub.reset_index(drop=True)
         sp = 4
-        for i in range(sp, len(check_window) - 3):
+        for i in range(sp, len(check_window)):
             bar     = check_window.iloc[i]
-            prev_lo = check_window.iloc[i-sp:i]["low"].min()
-            prev_hi = check_window.iloc[i-sp:i]["high"].max()
+            prev_lo = check_window.iloc[max(0, i-sp):i]["low"].min()
+            prev_hi = check_window.iloc[max(0, i-sp):i]["high"].max()
 
             # Bullish sweep: wick below prior swing low, closed back above
             if (bar["low"] < prev_lo and
@@ -475,10 +513,18 @@ def _compute_m5_features(
     """
     Returns (m5_micro_bos, m5_sweep_confirmation, m5_entry_candle_quality).
 
-    m5_micro_bos            : 1 if a micro BOS exists in the last 20 5M bars
-    m5_sweep_confirmation   : 1 if a micro liquidity grab (sweep + close back) in last 20 5M bars
+    m5_micro_bos            : 1 if a micro BOS exists in the last 60 5M bars
+    m5_sweep_confirmation   : 1 if a micro liquidity grab (sweep + close back) in last 60 5M bars
     m5_entry_candle_quality : composite float [0, 1] from last 5 5M bars:
                               0.25 each for engulfing, displacement, strong close, rejection wick
+
+    FIX 1 (v9): Window changed from tail(20) to tail(60).
+    production_predictor._check_5min_entry() uses tail(60) when pre-computing
+    m5 values for HTF-OB zones.  The fallback path (15-min zones that reach
+    _compute_m5_features without pre-injected values) was using tail(20),
+    producing fewer BOS/sweep detections and systematically lower model scores.
+    Both paths now use the same 60-bar (5-hour) window.
+    m5_entry_candle_quality still evaluates only the last 5 bars of that window.
 
     touch_time: timestamp of the touch bar — filters df_5m to bars BEFORE this
                 time so no future bars are used. Critical for training correctness.
@@ -500,7 +546,9 @@ def _compute_m5_features(
         if len(sub) < 20:
             return defaults
 
-        recent = sub.tail(20).reset_index(drop=True)
+        # FIX 1 (v9): use tail(60) — 5 hours of 5M bars — matching
+        # production_predictor._check_5min_entry() exactly.
+        recent = sub.tail(60).reset_index(drop=True)
 
         # ── ATR on 5M ─────────────────────────────────────────────────────────
         hi = recent["high"]; lo = recent["low"]; cl = recent["close"]
