@@ -9,9 +9,11 @@ KEY FIXES vs the original:
   FIX-2  Bar-by-bar simulation (same logic as backtest_engine.py) instead
          of shortcut .any() checks that ignore ordering.
   FIX-3  Three-state lifecycle: pending → triggered → resolved.
-  FIX-4  Signals where entry was never hit are marked 'entry_missed'
-         instead of being silently expired, so you can track how many
-         signals fire but price never reaches the zone.
+  FIX-4  Expired signals use valid_until from the signal record, not raw age.
+         EXPIRED    = TTL (valid_until) elapsed, price never reached the zone.
+         ENTRY_MISSED = reserved for explicit invalidation (structure break /
+                        zone bypass confirmed by bar data). Never auto-assigned
+                        on expiry — the two statuses are semantically distinct.
   FIX-5  Resolved timestamp is set to the actual bar time, not utcnow().
   FIX-6  BUY entry trigger tightened: bar_open must be >= entry (not entry - tol).
          Prevents false fills when price is already below entry when signal fires.
@@ -272,7 +274,9 @@ class SignalOutcomeTrackerV2:
                 continue
 
             try:
-                ts        = pd.to_datetime(sig.get("timestamp"))
+                ts        = pd.to_datetime(sig.get("timestamp"), utc=False)
+                # Strip timezone so comparison with datetime64[ns] (tz-naive) works
+                ts        = ts.tz_localize(None) if ts.tzinfo is not None else ts
                 entry     = float(sig["entry"])
                 sl        = float(sig["sl"])
                 tp        = float(sig["tp"])
@@ -280,23 +284,92 @@ class SignalOutcomeTrackerV2:
                 age_h     = (datetime.utcnow() - ts.to_pydatetime().replace(tzinfo=None)).total_seconds() / 3600
 
                 # Bars strictly after signal generation time
-                bars_after = df[df["time"] > ts].copy()
+                # Twelve Data fetch_bars() uses "datetime" column; normalise here
+                time_col   = "datetime" if "datetime" in df.columns else "time"
+                # Ensure df time column is also tz-naive before comparison
+                if df[time_col].dtype == "datetime64[ns, UTC]" or hasattr(df[time_col].dtype, "tz"):
+                    df[time_col] = df[time_col].dt.tz_localize(None)
+                bars_after = df[df[time_col] > ts].copy()
+                if "datetime" in bars_after.columns:
+                    bars_after = bars_after.rename(columns={"datetime": "time"})
                 if bars_after.empty:
                     continue
+
+                # Use correct pip size per symbol (JPY pairs = 0.01, Gold = 1.0)
+                _sym = sig.get("symbol", "").upper()
+                _pip = (0.01 if "JPY" in _sym
+                        else 1.0 if "XAU" in _sym or "XAG" in _sym
+                        else self.pip_size)
 
                 result = simulate_signal_bar_by_bar(
                     bars_after, direction, entry, sl, tp,
                     entry_tolerance_pips=self.entry_tolerance_pips,
-                    pip_size=self.pip_size,
+                    pip_size=_pip,
                 )
 
                 new_status = result["status"]
 
-                # If still pending and old enough → entry_missed
-                if new_status == Status.PENDING and age_h > self.expire_after_hours:
-                    new_status = Status.ENTRY_MISSED
+                # ── Expiry classification ─────────────────────────────────────────
+                # Use the signal's own valid_until if present; fall back to raw age.
+                # ENTRY_MISSED  = price reached the zone level but never filled
+                #                 (gapped past, or the simulator found no touch).
+                #                 Only set this when the bar simulator returns PENDING
+                #                 AND we can confirm price actually traded through the
+                #                 zone — we cannot confirm that here, so this branch
+                #                 is reserved for explicit invalidation paths.
+                # EXPIRED       = TTL ran out while signal was still PENDING (price
+                #                 never came close enough to fill).
+                # The two must never be conflated — ENTRY_MISSED inflates "near-miss"
+                # stats; EXPIRED is genuinely "zone never tested".
+                if new_status == Status.PENDING:
+                    valid_until_str = sig.get("valid_until")
+                    if valid_until_str:
+                        try:
+                            vu = datetime.fromisoformat(valid_until_str)
+                            timed_out = datetime.utcnow() > vu
+                        except ValueError:
+                            timed_out = age_h > self.expire_after_hours
+                    else:
+                        timed_out = age_h > self.expire_after_hours
 
-                # If triggered but still open and very old → expire
+                    # Distance-based early expiry: if price has moved so far past the
+                    # TP level that re-entry is implausible within the remaining TTL,
+                    # expire the signal early.
+                    #
+                    # MULTIPLIER IS TIMEFRAME-AWARE:
+                    #   15min / 1h  → 3× risk  (tight, fast-moving zones)
+                    #   4h          → 15× risk  (HTF OBs sit far from price legitimately)
+                    #   1d / weekly → no distance expiry at all (let TTL decide)
+                    #
+                    # This prevents 4H OB signals at 1.17 being instantly expired
+                    # just because price is currently at 1.15 — those zones are valid
+                    # until price either reaches them or the plan window closes.
+                    if not timed_out:
+                        _tf = sig.get("timeframe", "15min")
+                        if _tf in ("1d", "1day", "daily", "1w", "weekly"):
+                            _dist_multiplier = None
+                        elif _tf in ("4h", "4hour"):
+                            _dist_multiplier = 15
+                        elif _tf in ("1h", "1hour"):
+                            _dist_multiplier = 8
+                        else:
+                            _dist_multiplier = 3   # 15min default
+
+                        if _dist_multiplier is not None:
+                            current_price = float(bars_after.iloc[-1].get("close", entry))
+                            risk_pips     = float(sig.get("risk_pips", 0)) or 0
+                            if risk_pips > 0:
+                                threshold = risk_pips * _dist_multiplier * _pip
+                                if direction == "SELL" and current_price < entry - threshold:
+                                    timed_out = True   # price blew through TP, zone invalidated
+                                elif direction == "BUY" and current_price > entry + threshold:
+                                    timed_out = True   # price blew through TP, zone invalidated
+
+                    if timed_out:
+                        new_status = Status.EXPIRED   # TTL elapsed, price never reached zone
+
+                # A triggered trade that has been open far too long (data gap or feed
+                # outage) — mark expired so it doesn't stay pending forever.
                 if new_status == Status.TRIGGERED and age_h > self.expire_after_hours * 2:
                     new_status = Status.EXPIRED
 
@@ -306,10 +379,10 @@ class SignalOutcomeTrackerV2:
                     sig["triggered"]     = result["triggered"]
                     sig["bars_to_entry"] = result["bars_to_entry"]
                     sig["bars_to_exit"]  = result["bars_to_exit"]
-                    sig["resolved_at"]   = (
-                        result["resolved_bar"]["time"].isoformat()
-                        if result["resolved_bar"] is not None
-                        and hasattr(result["resolved_bar"]["time"], "isoformat")
+                    _rb = result["resolved_bar"]
+                    _ts = ((_rb.get("time") or _rb.get("datetime")) if _rb is not None else None)
+                    sig["resolved_at"] = (
+                        _ts.isoformat() if _ts is not None and hasattr(_ts, "isoformat")
                         else datetime.utcnow().isoformat()
                     )
                     counts["updated"] += 1
@@ -352,6 +425,204 @@ class SignalOutcomeTrackerV2:
         return counts
 
 
+    def check_outcomes_by_symbol(self, sym_predictor: dict) -> Dict:
+        """
+        Symbol-aware version of check_outcomes.
+
+        BUG-FIX: the original check_outcomes(fetch_fn) accepted a single fetch
+        function and used it for every signal regardless of symbol.  This meant
+        all GBP/USD, USD/JPY and XAU/USD signals were being simulated against
+        EUR/USD bars — the bars for whichever predictor happened to be first in
+        the list.  Wrong bars → wrong entry/SL/TP hit detection → outcomes never
+        update (or update incorrectly).
+
+        sym_predictor: dict mapping symbol string (e.g. "EUR/USD") to a
+                       ProductionForexPredictor instance.  The predictor's
+                       fetch_bars(interval, outputsize) method is called to
+                       obtain the correct bars for each signal's symbol.
+        """
+        if not self.signals_file.exists():
+            return {}
+
+        try:
+            with open(self.signals_file) as f:
+                signals: List[Dict] = json.load(f)
+        except Exception as e:
+            logger.warning(f"OutcomeTrackerV2: load failed — {e}")
+            return {}
+
+        # Cache per (symbol, timeframe) so we fetch each pair's bars only once
+        df_cache: Dict[str, Optional[pd.DataFrame]] = {}
+
+        counts = {
+            "updated": 0, "hit_tp": 0, "hit_sl": 0,
+            "expired": 0, "entry_missed": 0, "still_pending": 0,
+        }
+
+        for sig in signals:
+            if sig.get("status") not in (None, Status.PENDING, Status.TRIGGERED, "active"):
+                continue
+
+            sym = sig.get("symbol", "")
+            tf  = sig.get("timeframe", "15min")
+            cache_key = f"{sym}_{tf}"
+
+            if cache_key not in df_cache:
+                pred = sym_predictor.get(sym)
+                if pred is None:
+                    # Unknown symbol — skip rather than use wrong bars
+                    logger.warning(f"OutcomeTrackerV2: no predictor for symbol '{sym}', skipping")
+                    df_cache[cache_key] = None
+                else:
+                    df_cache[cache_key] = pred.fetch_bars(tf, 500)
+
+            df = df_cache[cache_key]
+            if df is None or df.empty:
+                continue
+
+            try:
+                ts        = pd.to_datetime(sig.get("timestamp"), utc=False)
+                ts        = ts.tz_localize(None) if ts.tzinfo is not None else ts
+                entry     = float(sig["entry"])
+                sl        = float(sig["sl"])
+                tp        = float(sig["tp"])
+                direction = sig.get("direction", "BUY")
+                age_h     = (datetime.utcnow() - ts.to_pydatetime().replace(tzinfo=None)).total_seconds() / 3600
+
+                time_col   = "datetime" if "datetime" in df.columns else "time"
+                if df[time_col].dtype == "datetime64[ns, UTC]" or hasattr(df[time_col].dtype, "tz"):
+                    df[time_col] = df[time_col].dt.tz_localize(None)
+                bars_after = df[df[time_col] > ts].copy()
+                if "datetime" in bars_after.columns:
+                    bars_after = bars_after.rename(columns={"datetime": "time"})
+                if bars_after.empty:
+                    continue
+
+                _sym = sym.upper()
+                _pip = (0.01 if "JPY" in _sym
+                        else 1.0 if "XAU" in _sym or "XAG" in _sym
+                        else self.pip_size)
+
+                result = simulate_signal_bar_by_bar(
+                    bars_after, direction, entry, sl, tp,
+                    entry_tolerance_pips=self.entry_tolerance_pips,
+                    pip_size=_pip,
+                )
+
+                new_status = result["status"]
+
+                # ── Expiry classification ─────────────────────────────────────────
+                # Use the signal's own valid_until if present; fall back to raw age.
+                # ENTRY_MISSED  = price reached the zone level but never filled
+                #                 (gapped past, or the simulator found no touch).
+                #                 Only set this when the bar simulator returns PENDING
+                #                 AND we can confirm price actually traded through the
+                #                 zone — we cannot confirm that here, so this branch
+                #                 is reserved for explicit invalidation paths.
+                # EXPIRED       = TTL ran out while signal was still PENDING (price
+                #                 never came close enough to fill).
+                # The two must never be conflated — ENTRY_MISSED inflates "near-miss"
+                # stats; EXPIRED is genuinely "zone never tested".
+                if new_status == Status.PENDING:
+                    valid_until_str = sig.get("valid_until")
+                    if valid_until_str:
+                        try:
+                            vu = datetime.fromisoformat(valid_until_str)
+                            timed_out = datetime.utcnow() > vu
+                        except ValueError:
+                            timed_out = age_h > self.expire_after_hours
+                    else:
+                        timed_out = age_h > self.expire_after_hours
+
+                    # Distance-based early expiry: if price has moved so far past the
+                    # TP level that re-entry is implausible within the remaining TTL,
+                    # expire the signal early.
+                    #
+                    # MULTIPLIER IS TIMEFRAME-AWARE:
+                    #   15min / 1h  → 3× risk  (tight, fast-moving zones)
+                    #   4h          → 15× risk  (HTF OBs sit far from price legitimately)
+                    #   1d / weekly → no distance expiry at all (let TTL decide)
+                    #
+                    # This prevents 4H OB signals at 1.17 being instantly expired
+                    # just because price is currently at 1.15 — those zones are valid
+                    # until price either reaches them or the plan window closes.
+                    if not timed_out:
+                        _tf = sig.get("timeframe", "15min")
+                        if _tf in ("1d", "1day", "daily", "1w", "weekly"):
+                            # Daily/weekly zones — never distance-expire, let TTL decide
+                            _dist_multiplier = None
+                        elif _tf in ("4h", "4hour"):
+                            _dist_multiplier = 15
+                        elif _tf in ("1h", "1hour"):
+                            _dist_multiplier = 8
+                        else:
+                            _dist_multiplier = 3   # 15min default
+
+                        if _dist_multiplier is not None:
+                            current_price = float(bars_after.iloc[-1].get("close", entry))
+                            risk_pips     = float(sig.get("risk_pips", 0)) or 0
+                            if risk_pips > 0:
+                                threshold = risk_pips * _dist_multiplier * _pip
+                                if direction == "SELL" and current_price < entry - threshold:
+                                    timed_out = True   # price blew through TP, zone invalidated
+                                elif direction == "BUY" and current_price > entry + threshold:
+                                    timed_out = True   # price blew through TP, zone invalidated
+
+                    if timed_out:
+                        new_status = Status.EXPIRED   # TTL elapsed, price never reached zone
+
+                
+
+                if new_status != sig.get("status"):
+                    sig["status"]        = new_status
+                    sig["triggered"]     = result["triggered"]
+                    sig["bars_to_entry"] = result["bars_to_entry"]
+                    sig["bars_to_exit"]  = result["bars_to_exit"]
+                    _rb = result["resolved_bar"]
+                    _ts = ((_rb.get("time") or _rb.get("datetime")) if _rb is not None else None)
+                    sig["resolved_at"] = (
+                        _ts.isoformat() if _ts is not None and hasattr(_ts, "isoformat")
+                        else datetime.utcnow().isoformat()
+                    )
+                    counts["updated"] += 1
+
+                    if new_status == Status.HIT_TP:
+                        counts["hit_tp"] += 1
+                    elif new_status == Status.HIT_SL:
+                        counts["hit_sl"] += 1
+                    elif new_status == Status.ENTRY_MISSED:
+                        counts["entry_missed"] += 1
+                    elif new_status == Status.EXPIRED:
+                        counts["expired"] += 1
+
+                if new_status in (Status.PENDING, Status.TRIGGERED):
+                    counts["still_pending"] += 1
+
+            except Exception as e:
+                logger.warning(f"OutcomeTrackerV2: error on signal — {e}")
+                continue
+
+        if counts["updated"]:
+            try:
+                with open(self.signals_file, "w") as f:
+                    json.dump(signals, f, indent=2)
+                logger.info(f"OutcomeTrackerV2: saved {counts['updated']} updates")
+            except Exception as e:
+                logger.warning(f"OutcomeTrackerV2: save failed — {e}")
+
+        resolved = counts["hit_tp"] + counts["hit_sl"]
+        win_rate = round(counts["hit_tp"] / resolved * 100, 1) if resolved else 0.0
+        counts["win_rate_pct"] = win_rate
+
+        logger.info(
+            f"OutcomeTrackerV2: TP={counts['hit_tp']} SL={counts['hit_sl']} "
+            f"EntryMissed={counts['entry_missed']} WinRate={win_rate}% "
+            f"Pending={counts['still_pending']}"
+        )
+        return counts
+
+
+
 # ── Standalone backfill utility ────────────────────────────────────────────────
 def backfill_outcomes_from_bars(
     signals_file: str,
@@ -378,12 +649,18 @@ def backfill_outcomes_from_bars(
     rows = []
     for sig in signals:
         try:
-            ts         = pd.to_datetime(sig.get("timestamp"))
+            ts         = pd.to_datetime(sig.get("timestamp"), utc=False)
+            ts         = ts.tz_localize(None) if ts.tzinfo is not None else ts
             entry      = float(sig["entry"])
             sl         = float(sig["sl"])
             tp         = float(sig["tp"])
             direction  = sig.get("direction", "BUY")
-            bars_after = bars_df[bars_df["time"] > ts].copy()
+            _tc        = "datetime" if "datetime" in bars_df.columns else "time"
+            if bars_df[_tc].dtype == "datetime64[ns, UTC]" or hasattr(bars_df[_tc].dtype, "tz"):
+                bars_df[_tc] = bars_df[_tc].dt.tz_localize(None)
+            bars_after = bars_df[bars_df[_tc] > ts].copy()
+            if "datetime" in bars_after.columns:
+                bars_after = bars_after.rename(columns={"datetime": "time"})
             if bars_after.empty:
                 result = {
                     "status": "no_bars", "triggered": False,

@@ -47,6 +47,7 @@ body::before{display:none}
 #clock{font-size:12px;color:var(--text);letter-spacing:1px;opacity:0.75}
 .btn{background:transparent;border:1px solid var(--border2);color:var(--text);cursor:pointer;font-family:var(--mono);font-size:11px;padding:5px 12px;border-radius:3px;letter-spacing:.5px;transition:all .15s;opacity:0.85}
 .btn:hover{border-color:var(--accent);color:var(--accent);opacity:1}
+.btn.active-filter{border-color:var(--accent);color:var(--accent);opacity:1;background:rgba(43,108,176,0.07)}
 #conn-status{font-size:11px;color:var(--muted);letter-spacing:.3px}
 
 /* TICKER */
@@ -115,8 +116,7 @@ body::before{display:none}
 /* TABLE */
 .table-wrap{overflow-x:auto;border-bottom:1px solid var(--border)}
 .tbl{width:100%;border-collapse:collapse;font-size:12px;font-family:var(--mono)}
-
-.tbl thead th{ background:var(--bg3); padding:9px 12px; text-align:left; font-size:9px; letter-spacing:1px; text-transform:uppercase; color:var(--muted); border-bottom:1px solid var(--border2); white-space:nowrap; font-weight:700; }
+.tbl thead th{background:var(--bg3);padding:9px 12px;text-align:left;font-size:9px;letter-spacing:1px;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--border2);white-space:nowrap;font-weight:700}
 .tbl tbody tr{border-bottom:1px solid var(--border);transition:background .1s}
 .tbl tbody tr:hover{background:var(--bg3)}
 .tbl tbody td{padding:10px 12px;white-space:nowrap;vertical-align:middle;color:var(--text)}
@@ -147,8 +147,6 @@ body::before{display:none}
 .prob-track{width:50px;height:3px;background:var(--border);border-radius:2px;flex-shrink:0}
 .prob-fill{height:100%;border-radius:2px;transition:width .3s}
 .prob-num{font-size:11px;min-width:36px;text-align:right}
-
-/* THRESHOLD MARKER on prob bar */
 .prob-wrap{position:relative;display:inline-flex;align-items:center;gap:6px}
 .thr-marker{position:absolute;top:-3px;width:1px;height:9px;background:rgba(255,255,255,.25);pointer-events:none}
 
@@ -184,8 +182,6 @@ body::before{display:none}
 .cache-status{font-size:10px;color:var(--muted);padding:0 24px 0 0}
 .cache-hit{color:var(--green)}
 .cache-miss{color:var(--yellow)}
-
-/* SIGNAL DETAIL tooltip-style extra row */
 .sig-extra{font-size:9px;color:var(--muted);margin-top:1px}
 
 /* EMPTY */
@@ -193,9 +189,11 @@ body::before{display:none}
 .empty-icon{font-size:32px;margin-bottom:12px;opacity:.4}
 .empty-title{font-family:var(--sans);font-size:15px;font-weight:600;color:var(--dim);margin-bottom:6px}
 .empty-sub{font-size:11px;max-width:360px;margin:0 auto;line-height:1.6}
-.section-header{display:flex;align-items:center;justify-content:space-between;padding:10px 24px;background:var(--bg1);border-bottom:1px solid var(--border)}
+.section-header{display:flex;align-items:center;justify-content:space-between;padding:10px 24px;background:var(--bg1);border-bottom:1px solid var(--border);flex-wrap:wrap;gap:8px}
 .section-title{font-size:10px;color:var(--muted);letter-spacing:1px;text-transform:uppercase;font-weight:600}
 .section-note{font-size:10px;color:var(--muted);font-weight:500}
+.filter-group{display:flex;align-items:center;gap:6px}
+
 /* OUTCOMES */
 .outcomes-header{display:grid;grid-template-columns:repeat(4,1fr);border-bottom:1px solid var(--border)}
 @media(max-width:600px){.outcomes-header{grid-template-columns:repeat(2,1fr)}}
@@ -289,7 +287,13 @@ body::before{display:none}
 <div class="tab-panel active" id="panel-real">
   <div class="section-header">
     <div class="section-title">Signals that passed ALL gates — REV ≥65% · CONT ≥60% · 4H bias · D1 zone</div>
-    <div class="section-note" id="real-note">—</div>
+    <div class="filter-group">
+      <span style="font-size:10px;color:var(--muted);letter-spacing:.5px;margin-right:2px">FILTER:</span>
+      <button class="btn active-filter" id="filter-all" onclick="setFilter('all')" style="font-size:10px;padding:3px 10px">ALL</button>
+      <button class="btn" id="filter-htf" onclick="setFilter('htf')" style="font-size:10px;padding:3px 10px">HTF</button>
+      <button class="btn" id="filter-rev" onclick="setFilter('rev')" style="font-size:10px;padding:3px 10px">REV</button>
+      <div class="section-note" id="real-note" style="margin-left:8px">—</div>
+    </div>
   </div>
   <div class="table-wrap">
     <table class="tbl">
@@ -399,11 +403,26 @@ body::before{display:none}
 
 <script>
 const $ = id => document.getElementById(id);
-
 const PAIRS = ['EUR/USD','GBP/USD','USD/JPY','XAU/USD'];
 
+// ── Active filter state ───────────────────────────────────────────────────────
+window._activeFilter = 'all';
+
+function setFilter(f) {
+  window._activeFilter = f;
+  ['all','htf','rev'].forEach(k => {
+    const btn = $('filter-' + k);
+    if (!btn) return;
+    if (k === f) {
+      btn.classList.add('active-filter');
+    } else {
+      btn.classList.remove('active-filter');
+    }
+  });
+  renderReal(window._allSignals || []);
+}
+
 // ── Price formatting ──────────────────────────────────────────────────────────
-// Gold (XAU) uses 2dp; JPY pairs use 3dp; forex uses 5dp
 function fPrice(n, symbol) {
   const v = parseFloat(n) || 0;
   if (!symbol) return v.toFixed(5);
@@ -412,10 +431,8 @@ function fPrice(n, symbol) {
   if (s.includes('JPY')) return v.toFixed(3);
   return v.toFixed(5);
 }
-// Legacy f5 kept for places where symbol isn't available
 const f5 = n => {
   const v = parseFloat(n) || 0;
-  // Heuristic: gold prices > 1000; JPY prices 100-200
   if (v > 500) return v.toFixed(2);
   if (v > 20)  return v.toFixed(3);
   return v.toFixed(5);
@@ -429,7 +446,7 @@ function stratThreshold(strategy) {
   return 65;
 }
 
-// ── Probability color — strategy-aware ───────────────────────────────────────
+// ── Probability color ─────────────────────────────────────────────────────────
 function probColor(p, strategy) {
   const thr = stratThreshold(strategy);
   if (p >= thr + 15) return 'var(--green)';
@@ -442,36 +459,36 @@ function probColor(p, strategy) {
 function trendColor(t) {
   if (!t) return 'var(--muted)';
   t = t.toLowerCase();
-  if (t==='bullish') return 'var(--green)';
-  if (t==='bearish') return 'var(--red)';
+  if (t === 'bullish') return 'var(--green)';
+  if (t === 'bearish') return 'var(--red)';
   return 'var(--yellow)';
 }
 function trendLabel(t) {
-  if (!t||t==='—') return '—';
-  const m=t.toLowerCase();
-  return m==='bullish'?'▲ BULL':m==='bearish'?'▼ BEAR':'— NEUT';
+  if (!t || t === '—') return '—';
+  const m = t.toLowerCase();
+  return m === 'bullish' ? '▲ BULL' : m === 'bearish' ? '▼ BEAR' : '— NEUT';
 }
 function gateLabel(r) {
-  const m={
-    '4h_bias_bullish_blocks_supply':'4H BULL → NO SHORT',
-    '4h_bias_bearish_blocks_demand':'4H BEAR → NO LONG',
-    'd1_premium_blocks_demand':'D1 PREM → NO LONG',
-    'd1_discount_blocks_supply':'D1 DISC → NO SHORT',
+  const m = {
+    '4h_bias_bullish_blocks_supply': '4H BULL → NO SHORT',
+    '4h_bias_bearish_blocks_demand': '4H BEAR → NO LONG',
+    'd1_premium_blocks_demand':      'D1 PREM → NO LONG',
+    'd1_discount_blocks_supply':     'D1 DISC → NO SHORT',
   };
-  return m[r]||(r||'—').toUpperCase();
+  return m[r] || (r || '—').toUpperCase();
 }
 function parseTS(ts) {
-  if (!ts) return {date:'—',time:'—'};
-  const s=ts.replace(' UTC','').trim();
-  if (s.includes(' ')&&s.split(' ')[0].includes('-')) {
-    const [d,t]=s.split(' ');
-    return {date:d,time:t};
+  if (!ts) return {date:'—', time:'—'};
+  const s = ts.replace(' UTC','').trim();
+  if (s.includes(' ') && s.split(' ')[0].includes('-')) {
+    const [d, t] = s.split(' ');
+    return {date: d, time: t};
   }
-  return {date:'—',time:s};
+  return {date: '—', time: s};
 }
 function stratPill(s) {
   if (!s) return '';
-  const sl=s.toLowerCase();
+  const sl = s.toLowerCase();
   if (sl.includes('cont')) return `<span class="strat-pill cont">CONT</span>`;
   if (sl.includes('rev'))  return `<span class="strat-pill rev">REV</span>`;
   if (sl.includes('htf'))  return `<span class="strat-pill htf">HTF</span>`;
@@ -485,25 +502,25 @@ function thrPill(strategy) {
 
 // ── Clock & session ───────────────────────────────────────────────────────────
 function updateClock() {
-  const n=new Date(), p=x=>String(x).padStart(2,'0');
-  $('clock').textContent=`${n.getUTCFullYear()}-${p(n.getUTCMonth()+1)}-${p(n.getUTCDate())} ${p(n.getUTCHours())}:${p(n.getUTCMinutes())}:${p(n.getUTCSeconds())} UTC`;
-  const h=n.getUTCHours();
-  let sess='CLOSED',col='var(--muted)';
-  if (h>=22||h<2)      {sess='SYDNEY';  col='var(--purple)';}
-  else if (h>=2&&h<7)  {sess='TOKYO';   col='var(--blue)';}
-  else if (h>=7&&h<12) {sess='LONDON';  col='var(--green)';}
-  else if (h>=12&&h<17){sess='LON/NY';  col='var(--teal)';}
-  else if (h>=17&&h<22){sess='NEW YORK';col='var(--orange)';}
-  $('session-name').textContent=sess;
-  $('session-name').style.color=col;
-  document.querySelector('.session-dot').style.background=col;
+  const n = new Date(), p = x => String(x).padStart(2,'0');
+  $('clock').textContent = `${n.getUTCFullYear()}-${p(n.getUTCMonth()+1)}-${p(n.getUTCDate())} ${p(n.getUTCHours())}:${p(n.getUTCMinutes())}:${p(n.getUTCSeconds())} UTC`;
+  const h = n.getUTCHours();
+  let sess = 'CLOSED', col = 'var(--muted)';
+  if (h >= 22 || h < 2)       { sess = 'SYDNEY';   col = 'var(--purple)'; }
+  else if (h >= 2  && h < 7)  { sess = 'TOKYO';    col = 'var(--blue)'; }
+  else if (h >= 7  && h < 12) { sess = 'LONDON';   col = 'var(--green)'; }
+  else if (h >= 12 && h < 17) { sess = 'LON/NY';   col = 'var(--teal)'; }
+  else if (h >= 17 && h < 22) { sess = 'NEW YORK'; col = 'var(--orange)'; }
+  $('session-name').textContent = sess;
+  $('session-name').style.color = col;
+  document.querySelector('.session-dot').style.background = col;
 }
-setInterval(updateClock,1000);
+setInterval(updateClock, 1000);
 updateClock();
 
 function switchTab(name) {
-  document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
-  document.querySelectorAll('.tab-panel').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
   $(`tab-${name}`).classList.add('active');
   $(`panel-${name}`).classList.add('active');
 }
@@ -514,13 +531,13 @@ function renderTicker(signals, funnelData) {
   const pairs = funnelData?.pairs || {};
   bar.innerHTML = PAIRS.map(sym => {
     const pd = pairs[sym] || pairs[sym.replace('/','_')] || {};
-    const sigs = signals.filter(s=>s.symbol===sym);
-    const last = sigs[sigs.length-1];
+    const sigs = signals.filter(s => s.symbol === sym);
+    const last = sigs[sigs.length - 1];
     const trend = pd.h1_trend || last?.h4_trend || last?.htf_trend || '—';
-    const tClass = trend==='bullish'?'trend-bull':trend==='bearish'?'trend-bear':'trend-neut';
-    const tLabel = trend==='bullish'?'▲ BULLISH':trend==='bearish'?'▼ BEARISH':'— NEUTRAL';
-    const atr   = pd.atr   || last?.atr   || '—';
-    const price = pd.price || last?.current_price || last?.entry || '—';
+    const tClass = trend === 'bullish' ? 'trend-bull' : trend === 'bearish' ? 'trend-bear' : 'trend-neut';
+    const tLabel = trend === 'bullish' ? '▲ BULLISH' : trend === 'bearish' ? '▼ BEARISH' : '— NEUTRAL';
+    const atr    = pd.atr   || last?.atr   || '—';
+    const price  = pd.price || last?.current_price || last?.entry || '—';
     const priceFmt = price !== '—' ? fPrice(price, sym) : '—';
     return `<div class="ticker-item">
       <span class="ticker-sym">${sym}</span>
@@ -534,86 +551,99 @@ function renderTicker(signals, funnelData) {
 
 // ── D1 bar ────────────────────────────────────────────────────────────────────
 function renderD1(stats) {
-  const zone=stats.d1_zone||'unknown';
-  const pos=stats.d1_position;
-  const labels={premium:'🔴 PREMIUM',discount:'🟢 DISCOUNT',equilibrium:'🟡 EQUILIBRIUM',unknown:'UNKNOWN'};
-  const badge=$('d1-badge');
-  badge.className=`d1-badge ${zone}`;
-  badge.textContent=labels[zone]||zone.toUpperCase();
-  $('d1-pos').textContent=pos!=null?(pos*100).toFixed(1)+'%':'—';
-  if (pos!=null) {
-    const pct=Math.min(100,Math.max(0,pos*100));
-    $('d1-fill').style.width=pct+'%';
-    $('d1-cursor').style.left=pct+'%';
+  const zone = stats.d1_zone || 'unknown';
+  const pos  = stats.d1_position;
+  const labels = {premium:'🔴 PREMIUM', discount:'🟢 DISCOUNT', equilibrium:'🟡 EQUILIBRIUM', unknown:'UNKNOWN'};
+  const badge = $('d1-badge');
+  badge.className = `d1-badge ${zone}`;
+  badge.textContent = labels[zone] || zone.toUpperCase();
+  $('d1-pos').textContent = pos != null ? (pos * 100).toFixed(1) + '%' : '—';
+  if (pos != null) {
+    const pct = Math.min(100, Math.max(0, pos * 100));
+    $('d1-fill').style.width  = pct + '%';
+    $('d1-cursor').style.left = pct + '%';
   }
 }
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
 function renderStats(stats, sigResp) {
-  $('s-live').textContent      = sigResp.live ?? stats.signals_live ?? '—';
+  $('s-live').textContent      = sigResp.live      ?? stats.signals_live      ?? '—';
   $('s-obs').textContent       = sigResp.observation ?? stats.observation_count ?? '—';
-  $('s-wr').textContent        = stats.win_rate!=null ? stats.win_rate+'%' : '—';
+  $('s-wr').textContent        = stats.win_rate != null ? stats.win_rate + '%' : '—';
   $('s-triggered').textContent = stats.triggered_total ?? '—';
-  $('s-tp-sl').textContent     = `${stats.win_count??0} TP / ${stats.loss_count??0} SL`;
-  $('s-prob').textContent      = stats.avg_probability ? stats.avg_probability+'%' : '—';
-  $('s-rr').textContent        = stats.avg_rr ?? '—';
-  $('s-bestrr').textContent    = 'best '+(stats.best_rr??'—');
+  $('s-tp-sl').textContent     = `${stats.win_count ?? 0} TP / ${stats.loss_count ?? 0} SL`;
+  $('s-prob').textContent      = stats.avg_probability ? stats.avg_probability + '%' : '—';
+  $('s-rr').textContent        = stats.avg_rr  ?? '—';
+  $('s-bestrr').textContent    = 'best ' + (stats.best_rr ?? '—');
   $('s-missed').textContent    = stats.entry_missed ?? '—';
-  $('tc-real').textContent     = sigResp.live ?? '0';
+  $('tc-real').textContent     = sigResp.live      ?? '0';
   $('tc-obs').textContent      = sigResp.observation ?? '0';
   const allSigs = window._allSignals || [];
-  const last = allSigs.find(s=>s.h4_trend||s.htf_trend);
+  const last = allSigs.find(s => s.h4_trend || s.htf_trend);
   const h4 = last?.h4_trend || last?.htf_trend || '—';
   const d1 = last?.d1_trend || '—';
   const h4el = $('s-h4');
   h4el.textContent = h4.toUpperCase();
   h4el.style.color = trendColor(h4);
-  $('s-d1trend').textContent = 'D1: '+d1.toUpperCase();
+  $('s-d1trend').textContent = 'D1: ' + d1.toUpperCase();
   $('conn-status').textContent = '● LIVE';
   $('conn-status').style.color = 'var(--green)';
-  $('conn-updated').textContent = stats.updated?'Updated '+stats.updated.replace('UTC','').trim()+' UTC':'';
+  $('conn-updated').textContent = stats.updated ? 'Updated ' + stats.updated.replace('UTC','').trim() + ' UTC' : '';
   renderD1(stats);
 }
 
 // ── Real signals ──────────────────────────────────────────────────────────────
 function renderReal(signals) {
-  const real = signals.filter(s=>s.signal_type==='real'||(!s.signal_type&&s.status!=='observation'));
+  let real = signals.filter(s => s.signal_type === 'real' || (!s.signal_type && s.status !== 'observation'));
+
+  // Apply active filter
+  const f = window._activeFilter || 'all';
+  if (f === 'htf') {
+    real = real.filter(s => (s.strategy || '').toUpperCase().includes('HTF'));
+  } else if (f === 'rev') {
+    real = real.filter(s =>
+      (s.strategy || '').toLowerCase().includes('rev') ||
+      (s.type     || '').toLowerCase().includes('rev')
+    );
+  }
+
   const tbody = $('tbody-real');
-  $('real-note').textContent = `${real.length} signal${real.length!==1?'s':''}`;
+  $('real-note').textContent = `${real.length} signal${real.length !== 1 ? 's' : ''}${f !== 'all' ? ' · ' + f.toUpperCase() + ' filter' : ''}`;
+
   if (!real.length) {
-    tbody.innerHTML=`<tr><td colspan="14"><div class="empty"><div class="empty-icon">⏳</div><div class="empty-title">No real signals yet</div><div class="empty-sub">System is scanning all 4 pairs. Best signal window is 08:00–12:00 UTC (London) and 13:00–17:00 UTC (NY overlap).</div></div></td></tr>`;
+    const filterMsg = f !== 'all' ? `No ${f.toUpperCase()} signals found. <button class="btn" onclick="setFilter('all')" style="font-size:10px;padding:2px 8px;margin-left:8px">Clear filter</button>` : 'System is scanning all 4 pairs. Best signal window is 08:00–12:00 UTC (London) and 13:00–17:00 UTC (NY overlap).';
+    tbody.innerHTML = `<tr><td colspan="14"><div class="empty"><div class="empty-icon">⏳</div><div class="empty-title">${f !== 'all' ? 'No ' + f.toUpperCase() + ' signals' : 'No real signals yet'}</div><div class="empty-sub">${filterMsg}</div></div></td></tr>`;
     return;
   }
+
   tbody.innerHTML = real.map(s => {
-    const dt = parseTS(s.timestamp);
-    const dir = (s.direction||'').toLowerCase();
-    const prob = parseFloat(s.probability||0);
-    const status = s.status||'pending';
-    const pct = Math.min(100,prob);
-    const thr = stratThreshold(s.strategy);
-    const thrPct = thr; // 60 or 65
-    const barThrLeft = Math.min(100, thrPct); // position of threshold marker on 50px track
+    const dt  = parseTS(s.timestamp);
+    const dir = (s.direction || '').toLowerCase();
+    const prob   = parseFloat(s.probability || 0);
+    const status = s.status || 'pending';
+    const pct    = Math.min(100, prob);
+    const thr    = stratThreshold(s.strategy);
     return `<tr class="row-${dir}">
       <td style="color:var(--muted)">${dt.date}</td>
       <td style="color:var(--muted)">${dt.time}</td>
-      <td><b style="font-family:var(--sans);font-size:12px">${s.symbol||'—'}</b></td>
+      <td><b style="font-family:var(--sans);font-size:12px">${s.symbol || '—'}</b></td>
       <td>${stratPill(s.strategy)}</td>
-      <td><span class="dir-badge ${dir}">${s.direction||'—'}</span></td>
+      <td><span class="dir-badge ${dir}">${s.direction || '—'}</span></td>
       <td>${fPrice(s.entry, s.symbol)}</td>
       <td style="color:var(--red)">${fPrice(s.sl, s.symbol)}</td>
       <td style="color:var(--green)">${fPrice(s.tp, s.symbol)}</td>
-      <td style="color:var(--muted)">${s.risk_pips??'—'}</td>
-      <td style="color:var(--blue)">${s.rr||s.risk_reward||'—'}</td>
+      <td style="color:var(--muted)">${s.risk_pips ?? '—'}</td>
+      <td style="color:var(--blue)">${s.rr || s.risk_reward || '—'}</td>
       <td>
         <div class="prob-cell" style="position:relative">
           <div class="prob-track" style="position:relative">
-            <div class="prob-fill" style="width:${pct}%;background:${probColor(prob,s.strategy)}"></div>
-            <div class="thr-marker" style="left:${barThrLeft}%"></div>
+            <div class="prob-fill" style="width:${pct}%;background:${probColor(prob, s.strategy)}"></div>
+            <div class="thr-marker" style="left:${thr}%"></div>
           </div>
-          <span class="prob-num" style="color:${probColor(prob,s.strategy)}">${prob.toFixed(1)}%</span>
+          <span class="prob-num" style="color:${probColor(prob, s.strategy)}">${prob.toFixed(1)}%</span>
         </div>
       </td>
-      <td style="color:var(--muted)">${s.confluence_score??'—'}/10</td>
+      <td style="color:var(--muted)">${s.confluence_score ?? '—'}/10</td>
       <td style="color:${trendColor(s.h4_trend)}">${trendLabel(s.h4_trend)}</td>
       <td><span class="status-badge ${status}">${status.toUpperCase().replace('_',' ')}</span></td>
     </tr>`;
@@ -624,25 +654,25 @@ function renderReal(signals) {
 function renderObs(obs) {
   const tbody = $('tbody-obs');
   if (!obs.length) {
-    tbody.innerHTML=`<tr><td colspan="14"><div class="empty"><div class="empty-icon">◎</div><div class="empty-title">No observation signals yet</div><div class="empty-sub">Gate-blocked zones will appear here as the system runs through cycles.</div></div></td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="14"><div class="empty"><div class="empty-icon">◎</div><div class="empty-title">No observation signals yet</div><div class="empty-sub">Gate-blocked zones will appear here as the system runs through cycles.</div></div></td></tr>`;
     return;
   }
   tbody.innerHTML = obs.map(s => {
-    const dt=parseTS(s.timestamp);
-    const dir=(s.direction||'').toLowerCase();
-    const d1z=s.d1_zone||'unknown';
+    const dt  = parseTS(s.timestamp);
+    const dir = (s.direction || '').toLowerCase();
+    const d1z = s.d1_zone || 'unknown';
     return `<tr class="row-${dir}">
       <td style="color:var(--muted)">${dt.date}</td>
       <td style="color:var(--muted)">${dt.time}</td>
-      <td><b style="font-family:var(--sans);font-size:12px">${s.symbol||'—'}</b></td>
+      <td><b style="font-family:var(--sans);font-size:12px">${s.symbol || '—'}</b></td>
       <td>${stratPill(s.strategy)}</td>
-      <td><span class="dir-badge ${dir}">${s.direction||'—'}</span></td>
-      <td>${fPrice(s.entry,s.symbol)}</td>
-      <td style="color:var(--red)">${fPrice(s.sl,s.symbol)}</td>
-      <td style="color:var(--muted)">${fPrice(s.tp,s.symbol)}</td>
-      <td style="color:var(--muted)">${s.risk_pips??'—'}</td>
-      <td style="color:var(--muted)">${s.zone_strength??'—'}</td>
-      <td style="color:var(--muted)">${s.confluence_score??'—'}/10</td>
+      <td><span class="dir-badge ${dir}">${s.direction || '—'}</span></td>
+      <td>${fPrice(s.entry, s.symbol)}</td>
+      <td style="color:var(--red)">${fPrice(s.sl, s.symbol)}</td>
+      <td style="color:var(--muted)">${fPrice(s.tp, s.symbol)}</td>
+      <td style="color:var(--muted)">${s.risk_pips ?? '—'}</td>
+      <td style="color:var(--muted)">${s.zone_strength ?? '—'}</td>
+      <td style="color:var(--muted)">${s.confluence_score ?? '—'}/10</td>
       <td style="color:${trendColor(s.h4_trend)}">${trendLabel(s.h4_trend)}</td>
       <td><span class="d1-badge ${d1z}" style="font-size:10px;padding:2px 8px">${d1z.toUpperCase()}</span></td>
       <td><span class="gate-pill">${gateLabel(s.gate_blocked_by)}</span></td>
@@ -652,41 +682,40 @@ function renderObs(obs) {
 
 // ── Funnel ────────────────────────────────────────────────────────────────────
 function renderFunnel(signals, funnelData) {
-  const cycleNum  = funnelData?.cycle ?? '—';
+  const cycleNum  = funnelData?.cycle      ?? '—';
   const cycleTime = funnelData?.cycle_time ?? '—';
   const nextCycle = funnelData?.next_cycle ?? '—';
-  $('f-cycle').textContent     = cycleNum!=='—' ? '#'+cycleNum : '#—';
+  $('f-cycle').textContent      = cycleNum !== '—' ? '#' + cycleNum : '#—';
   $('f-cycle-time').textContent = cycleTime;
-  $('f-next').textContent      = 'Next: '+nextCycle;
+  $('f-next').textContent       = 'Next: ' + nextCycle;
 
-  // Cache status if available
   const cacheEl = $('f-cache');
   if (funnelData?.cache_summary) {
     const c = funnelData.cache_summary;
-    cacheEl.innerHTML = `<span class="cache-miss">${c.fetched||0} fetched</span> · <span class="cache-hit">${c.cached||0} cached</span>`;
+    cacheEl.innerHTML = `<span class="cache-miss">${c.fetched || 0} fetched</span> · <span class="cache-hit">${c.cached || 0} cached</span>`;
   } else {
     cacheEl.textContent = '';
   }
 
   const grid = $('funnel-grid');
   if (!funnelData?.pairs && !signals.length) {
-    grid.innerHTML=`<div style="grid-column:1/-1;padding:40px;text-align:center;color:var(--muted)">No funnel data yet — production_predictor.py writes funnel_state.json each cycle.</div>`;
+    grid.innerHTML = `<div style="grid-column:1/-1;padding:40px;text-align:center;color:var(--muted)">No funnel data yet — production_predictor.py writes funnel_state.json each cycle.</div>`;
     return;
   }
 
   const pairsData = funnelData?.pairs || {};
   grid.innerHTML = PAIRS.map(sym => {
-    const pd = pairsData[sym] || pairsData[sym.replace('/','_')] || {};
-    const sigs = signals.filter(s=>s.symbol===sym);
-    const last = sigs[sigs.length-1];
+    const pd   = pairsData[sym] || pairsData[sym.replace('/','_')] || {};
+    const sigs = signals.filter(s => s.symbol === sym);
+    const last = sigs[sigs.length - 1];
     const trend = pd.h1_trend || last?.h4_trend || '—';
     const price = pd.price || last?.entry || '—';
     const atr   = pd.atr   || last?.atr   || '—';
-    const priceFmt = price !== '—' ? fPrice(price, sym) : '—';
-    const fvg4h = pd.fvg_4h ?? '—';
-    const ob4h  = pd.ob_4h  ?? '—';
-    const fvg1h = pd.fvg_1h ?? '—';
-    const ob1h  = pd.ob_1h  ?? '—';
+    const priceFmt  = price !== '—' ? fPrice(price, sym) : '—';
+    const fvg4h     = pd.fvg_4h    ?? '—';
+    const ob4h      = pd.ob_4h     ?? '—';
+    const fvg1h     = pd.fvg_1h    ?? '—';
+    const ob1h      = pd.ob_1h     ?? '—';
     const zones15m  = pd.zones_15m  ?? '—';
     const htfBefore = pd.htf_before ?? 0;
     const htfAfter  = pd.htf_after  ?? 0;
@@ -694,18 +723,17 @@ function renderFunnel(signals, funnelData) {
     const revProb   = pd.rev_prob   ?? null;
     const contProb  = pd.cont_prob  ?? null;
     const rj = pd.reject_reasons || {};
-    const tClass = trend==='bullish'?'trend-bull':trend==='bearish'?'trend-bear':'trend-neut';
+    const tClass = trend === 'bullish' ? 'trend-bull' : trend === 'bearish' ? 'trend-bear' : 'trend-neut';
 
     const rejPills = [];
-    if (rj.dist)  rejPills.push(`<span class="rej-pill dist">dist: ${rj.dist}</span>`);
-    if (rj.dir)   rejPills.push(`<span class="rej-pill dir">dir: ${rj.dir}</span>`);
-    if (rj.prob)  rejPills.push(`<span class="rej-pill prob">prob: ${rj.prob}</span>`);
-    if (rj.rr)    rejPills.push(`<span class="rej-pill rr">rr: ${rj.rr}</span>`);
-    if (rj.conf)  rejPills.push(`<span class="rej-pill conf">conf: ${rj.conf}</span>`);
+    if (rj.dist)     rejPills.push(`<span class="rej-pill dist">dist: ${rj.dist}</span>`);
+    if (rj.dir)      rejPills.push(`<span class="rej-pill dir">dir: ${rj.dir}</span>`);
+    if (rj.prob)     rejPills.push(`<span class="rej-pill prob">prob: ${rj.prob}</span>`);
+    if (rj.rr)       rejPills.push(`<span class="rej-pill rr">rr: ${rj.rr}</span>`);
+    if (rj.conf)     rejPills.push(`<span class="rej-pill conf">conf: ${rj.conf}</span>`);
     if (rj.strength) rejPills.push(`<span class="rej-pill dist">strength: ${rj.strength}</span>`);
 
-    // Per-strategy prob display
-    const revProbStr  = revProb  != null ? `<span style="color:${probColor(revProb*100,'rev')}">${(revProb*100).toFixed(1)}%</span>` : '—';
+    const revProbStr  = revProb  != null ? `<span style="color:${probColor(revProb*100,'rev')}">${(revProb*100).toFixed(1)}%</span>`   : '—';
     const contProbStr = contProb != null ? `<span style="color:${probColor(contProb*100,'cont')}">${(contProb*100).toFixed(1)}%</span>` : '—';
 
     return `<div class="funnel-card">
@@ -717,7 +745,7 @@ function renderFunnel(signals, funnelData) {
       <div class="fc-strategy-thresholds">
         <span class="thr-pill rev">REV ≥65%</span>
         <span class="thr-pill cont">CONT ≥60%</span>
-        ${revProb!=null||contProb!=null ? `<span style="font-size:10px;color:var(--muted);margin-left:4px">scores: REV ${revProbStr} CONT ${contProbStr}</span>` : ''}
+        ${revProb != null || contProb != null ? `<span style="font-size:10px;color:var(--muted);margin-left:4px">scores: REV ${revProbStr} CONT ${contProbStr}</span>` : ''}
       </div>
       <div class="funnel-steps">
         <div class="fstep pass">
@@ -735,28 +763,28 @@ function renderFunnel(signals, funnelData) {
           <span class="fstep-label">15m raw zones</span>
           <span class="fstep-val">${zones15m} (tracking only)</span>
         </div>
-        ${obSkips>0?`<div class="fstep fail">
+        ${obSkips > 0 ? `<div class="fstep fail">
           <span class="fstep-num">⛔</span>
           <span class="fstep-label">OB skipped</span>
           <span class="fstep-reason">${obSkips}× 1H trend opposite</span>
-        </div>`:''}
-        <div class="fstep ${htfBefore>0?'pass':'fail'}">
+        </div>` : ''}
+        <div class="fstep ${htfBefore > 0 ? 'pass' : 'fail'}">
           <span class="fstep-num">④</span>
           <span class="fstep-label">HTF before bias filter</span>
           <span class="fstep-val">${htfBefore}</span>
         </div>
-        <div class="fstep ${htfAfter>0?'pass':'fail'}">
+        <div class="fstep ${htfAfter > 0 ? 'pass' : 'fail'}">
           <span class="fstep-num">⑤</span>
           <span class="fstep-label">HTF after bias filter</span>
           <span class="fstep-val">${htfAfter}</span>
         </div>
-        <div class="fstep ${htfAfter>0?'info':'warn'}">
+        <div class="fstep ${htfAfter > 0 ? 'info' : 'warn'}">
           <span class="fstep-num">⑥</span>
           <span class="fstep-label">Prob filter (REV≥65 / CONT≥60)</span>
-          <span class="fstep-reason">${htfAfter>0?'scored':'no HTF signals → skipped'}</span>
+          <span class="fstep-reason">${htfAfter > 0 ? 'scored' : 'no HTF signals → skipped'}</span>
         </div>
       </div>
-      ${rejPills.length?`<div class="rej-pills">${rejPills.join('')}</div>`:''}
+      ${rejPills.length ? `<div class="rej-pills">${rejPills.join('')}</div>` : ''}
     </div>`;
   }).join('');
 }
@@ -766,61 +794,61 @@ function renderOutcomes(signals, stats) {
   const wins   = stats.win_count  || 0;
   const losses = stats.loss_count || 0;
   const total  = wins + losses;
-  $('oc-wr').textContent       = stats.win_rate!=null ? stats.win_rate+'%' : '—';
-  $('oc-resolved').textContent = stats.triggered_total ?? '—';
+  $('oc-wr').textContent          = stats.win_rate != null ? stats.win_rate + '%' : '—';
+  $('oc-resolved').textContent    = stats.triggered_total ?? '—';
   $('oc-resolved-sub').textContent = `${wins} TP wins + ${losses} SL losses`;
-  $('oc-pending').textContent  = stats.signals_active ?? '—';
-  $('oc-missed').textContent   = stats.entry_missed ?? '—';
+  $('oc-pending').textContent     = stats.signals_active ?? '—';
+  $('oc-missed').textContent      = stats.entry_missed   ?? '—';
 
   if (total > 0) {
-    const r=28,cx=36,cy=36,sw=10;
-    const circ=2*Math.PI*r;
-    const wDash=(wins/total)*circ;
-    $('donut-box').innerHTML=`
+    const r = 28, cx = 36, cy = 36, sw = 10;
+    const circ = 2 * Math.PI * r;
+    const wDash = (wins / total) * circ;
+    $('donut-box').innerHTML = `
       <svg width="72" height="72" viewBox="0 0 72 72">
         <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="var(--bg3)" stroke-width="${sw}"/>
         <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="var(--red)" stroke-width="${sw}"
           stroke-dasharray="${circ}" stroke-dashoffset="0" transform="rotate(-90 ${cx} ${cy})"/>
         <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="var(--green)" stroke-width="${sw}"
-          stroke-dasharray="${wDash} ${circ-wDash}" stroke-dashoffset="0" transform="rotate(-90 ${cx} ${cy})"/>
-        <text x="${cx}" y="${cy+5}" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="700" font-family="var(--sans)">${wins}/${total}</text>
+          stroke-dasharray="${wDash} ${circ - wDash}" stroke-dashoffset="0" transform="rotate(-90 ${cx} ${cy})"/>
+        <text x="${cx}" y="${cy + 5}" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="700" font-family="var(--sans)">${wins}/${total}</text>
       </svg>
       <div class="donut-legend">
-        <div class="dl-row"><div class="dl-dot" style="background:var(--green)"></div><span>${wins} TP (${total?Math.round(wins/total*100):0}%)</span></div>
-        <div class="dl-row"><div class="dl-dot" style="background:var(--red)"></div><span>${losses} SL (${total?Math.round(losses/total*100):0}%)</span></div>
+        <div class="dl-row"><div class="dl-dot" style="background:var(--green)"></div><span>${wins} TP (${total ? Math.round(wins/total*100) : 0}%)</span></div>
+        <div class="dl-row"><div class="dl-dot" style="background:var(--red)"></div><span>${losses} SL (${total ? Math.round(losses/total*100) : 0}%)</span></div>
       </div>`;
   }
 
-  const real = signals.filter(s=>s.signal_type==='real'||(!s.signal_type&&s.status!=='observation'));
-  const order = ['hit_tp','hit_sl','triggered','pending','entry_missed','expired'];
-  const sorted = [...real].sort((a,b)=>order.indexOf(a.status||'pending')-order.indexOf(b.status||'pending'));
-  const tbody = $('tbody-outcomes');
+  const real   = signals.filter(s => s.signal_type === 'real' || (!s.signal_type && s.status !== 'observation'));
+  const order  = ['hit_tp','hit_sl','triggered','pending','entry_missed','expired'];
+  const sorted = [...real].sort((a, b) => order.indexOf(a.status || 'pending') - order.indexOf(b.status || 'pending'));
+  const tbody  = $('tbody-outcomes');
+
   if (!sorted.length) {
-    tbody.innerHTML=`<tr><td colspan="15" style="text-align:center;padding:40px;color:var(--muted)">No resolved signals yet.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="15" style="text-align:center;padding:40px;color:var(--muted)">No resolved signals yet.</td></tr>`;
     return;
   }
   tbody.innerHTML = sorted.map(s => {
-    const dt=parseTS(s.timestamp);
-    const dir=(s.direction||'').toLowerCase();
-    const status=s.status||'pending';
-    const prob=parseFloat(s.probability||0);
-    const thr=stratThreshold(s.strategy);
+    const dt     = parseTS(s.timestamp);
+    const dir    = (s.direction || '').toLowerCase();
+    const status = s.status || 'pending';
+    const prob   = parseFloat(s.probability || 0);
     return `<tr class="row-${dir}">
       <td style="color:var(--muted)">${dt.date}</td>
       <td style="color:var(--muted)">${dt.time}</td>
-      <td><b style="font-family:var(--sans);font-size:12px">${s.symbol||'—'}</b></td>
+      <td><b style="font-family:var(--sans);font-size:12px">${s.symbol || '—'}</b></td>
       <td>${stratPill(s.strategy)}</td>
-      <td><span class="dir-badge ${dir}">${s.direction||'—'}</span></td>
-      <td>${fPrice(s.entry,s.symbol)}</td>
-      <td style="color:var(--red)">${fPrice(s.sl,s.symbol)}</td>
-      <td style="color:var(--green)">${fPrice(s.tp,s.symbol)}</td>
-      <td style="color:var(--blue)">${s.rr||s.risk_reward||'—'}</td>
-      <td style="color:${probColor(prob,s.strategy)}">${prob.toFixed(1)}%</td>
+      <td><span class="dir-badge ${dir}">${s.direction || '—'}</span></td>
+      <td>${fPrice(s.entry, s.symbol)}</td>
+      <td style="color:var(--red)">${fPrice(s.sl, s.symbol)}</td>
+      <td style="color:var(--green)">${fPrice(s.tp, s.symbol)}</td>
+      <td style="color:var(--blue)">${s.rr || s.risk_reward || '—'}</td>
+      <td style="color:${probColor(prob, s.strategy)}">${prob.toFixed(1)}%</td>
       <td>${thrPill(s.strategy)}</td>
       <td><span class="status-badge ${status}">${status.toUpperCase().replace('_',' ')}</span></td>
-      <td style="color:var(--muted);text-align:center">${s.bars_to_entry??'—'}</td>
-      <td style="color:var(--muted);text-align:center">${s.bars_to_exit??'—'}</td>
-      <td style="color:var(--muted)">${s.resolved_at?s.resolved_at.slice(0,10):'—'}</td>
+      <td style="color:var(--muted);text-align:center">${s.bars_to_entry ?? '—'}</td>
+      <td style="color:var(--muted);text-align:center">${s.bars_to_exit  ?? '—'}</td>
+      <td style="color:var(--muted)">${s.resolved_at ? s.resolved_at.slice(0,10) : '—'}</td>
     </tr>`;
   }).join('');
 }
@@ -831,10 +859,10 @@ async function fetchAll() {
   $('conn-status').style.color = 'var(--yellow)';
   try {
     const [sigResp, obsResp, statsResp, funnelResp] = await Promise.all([
-      fetch('/api/signals').then(r=>r.json()).catch(()=>({data:[],live:0,observation:0})),
-      fetch('/api/observation_signals').then(r=>r.json()).catch(()=>({data:[]})),
-      fetch('/api/stats').then(r=>r.json()).catch(()=>({})),
-      fetch('/api/funnel').then(r=>r.json()).catch(()=>({})),
+      fetch('/api/signals').then(r => r.json()).catch(() => ({data:[], live:0, observation:0})),
+      fetch('/api/observation_signals').then(r => r.json()).catch(() => ({data:[]})),
+      fetch('/api/stats').then(r => r.json()).catch(() => ({})),
+      fetch('/api/funnel').then(r => r.json()).catch(() => ({})),
     ]);
     const allSignals = sigResp.data || [];
     window._allSignals = allSignals;
@@ -844,7 +872,7 @@ async function fetchAll() {
     renderObs(obsResp.data || []);
     renderFunnel(allSignals, funnelResp);
     renderOutcomes(allSignals, statsResp);
-  } catch(err) {
+  } catch (err) {
     console.error('Fetch error:', err);
     $('conn-status').textContent = '● ERROR';
     $('conn-status').style.color = 'var(--red)';

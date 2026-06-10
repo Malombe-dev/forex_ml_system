@@ -337,7 +337,33 @@ def api_health():
         "server_time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
     })
 
+@app.route("/api/signals")
+def api_signals():
+    data = _merge_signals()
 
+    # ── filters ──────────────────────────────────────────────────────────────
+    from flask import request
+    tf  = request.args.get("timeframe")   # ?timeframe=HTF
+    typ = request.args.get("type")        # ?type=rev  or  ?type=htf
+
+    if tf:
+        data = [s for s in data if s.get("timeframe", "").upper() == tf.upper()]
+    if typ:
+        t = typ.lower()
+        if t == "htf":
+            data = [s for s in data if s.get("strategy", "").upper().startswith("HTF")]
+        elif t == "rev":
+            data = [s for s in data if "rev" in s.get("strategy", "").lower()
+                                    or "rev" in s.get("type", "").lower()]
+
+    return jsonify({
+        "data":        data,
+        "count":       len(data),
+        "live":        len(_read(_sig("all_signals.json")) or []),
+        "planned":     len(_read(_sig("daily_plan.json"))  or []),
+        "observation": len(_observation_signals()),
+        "updated":     _mtime(_sig("all_signals.json")) or _mtime(_sig("daily_plan.json")),
+    })
 # ── entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print(f"\n{'='*60}")

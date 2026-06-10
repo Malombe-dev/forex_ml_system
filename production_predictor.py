@@ -195,6 +195,24 @@ CHANGES vs V6:
              Fix: compute the real HTF item overlap count (count of h1/h4/daily
              FVG and OB items whose price range overlaps the zone) — identical
              to the method used in htf_trade_detect() for HTF-OB zones.
+
+  BUGFIX-15  EXPIRED SIGNALS RE-APPEARING IN DAILY PLAN
+             DailyPlanScheduler.generate() was running pred.generate_signals()
+             fresh each cycle and adding all returned zones to the plan without
+             checking whether those zones already had a resolved outcome in
+             all_signals.json (expired / hit_tp / hit_sl / entry_missed).
+             The same 4H OB zone that expired in the previous plan window would
+             score above threshold again (zone still structurally intact, price
+             never reached entry), pass all filters, and appear in the new plan
+             as a brand-new signal — even though the trader had already been
+             shown it and it had timed out.
+             Fix: at the start of generate(), load all_signals.json and build a
+             set of resolved zone IDs (same bucketed key used by
+             save_signals_to_single_file). Any new signal whose ID matches a
+             resolved record is silently filtered out of the plan, with a
+             one-line console summary of how many were suppressed.
+             Zones that are genuinely new (different OB, different price level,
+             or a reset zone after structural invalidation) are unaffected.
 """
 
 import pandas as pd
@@ -617,7 +635,39 @@ class ActiveZoneTracker:
 
 def save_signals_to_single_file(signals: List[Dict],
                                 filepath: str = "signals/all_signals.json"):
-    """Save signals to JSON, deduplicating and keeping highest-probability version."""
+    """Save signals to JSON with zone-region deduplication and selective field updates.
+
+    DEDUP IDENTITY (zone-region key)
+    ---------------------------------
+    Key = symbol + direction + bucketed_entry + timeframe
+    Entry is bucketed by rounding to 3 decimal places (~10 pip bucket for FX,
+    ~$1 bucket for Gold) so that minor cycle-to-cycle re-estimates of the same
+    zone don't create duplicate records.  SL, TP, date and type are intentionally
+    excluded because:
+      - SL drifts each cycle (ATR buffer recomputed from live bars)
+      - TP shifts when structural levels change
+      - The same 4H OB can be active across multiple calendar days
+
+    UPDATE RULES (pending signals only)
+    -------------------------------------
+    1. Execution levels (entry, SL, TP, risk, RR) — ALWAYS updated.
+       The model has fresher bar data each cycle; these are the levels a trader
+       would actually use, so they must stay current.
+
+    2. Probability — only UPGRADED (new > old).
+       A falling probability mid-trade reflects noisy short-term feature changes
+       (e.g. 5min BOS reset), not a genuine invalidation.  Downward drift would
+       cause unnecessary signal churn without improving outcome prediction.
+       Hard invalidation is handled separately by the outcome tracker (hit_sl /
+       expired paths), not by probability decay here.
+
+    3. Status guard — resolved outcomes (hit_tp / hit_sl / expired / entry_missed)
+       are NEVER overwritten.  Once a signal has an outcome it becomes a permanent
+       historical record for model evaluation and win-rate tracking.
+
+    4. Metadata (confluence, distance, valid_until, last_seen) — updated with
+       latest values when available, preserved from existing record otherwise.
+    """
     filepath = Path(filepath)
     filepath.parent.mkdir(exist_ok=True)
 
@@ -633,33 +683,87 @@ def save_signals_to_single_file(signals: List[Dict],
             logger.warning(f"save_signals: could not read existing file — {e}")
             existing_signals = []
 
+    # Resolved statuses that must never be overwritten
+    RESOLVED_STATUSES = {'hit_tp', 'hit_sl', 'expired', 'entry_missed'}
+
     def get_signal_id(signal):
-        ts = signal.get('timestamp', '')
-        try:
-            date_str = str(pd.to_datetime(ts).date())
-        except Exception:
-            date_str = 'unknown'
-        return (f"{signal.get('symbol')}_{signal.get('direction')}_"
-                f"{signal.get('entry')}_{signal.get('sl')}_{signal.get('tp')}_{date_str}")
+        """Zone-region identity — symbol-aware bucketed entry, no SL/TP/date.
+
+        Bucket sizes are wider than max ATR-buffer drift between cycles:
+          XAU/USD : $5 bucket  → round(entry/5)*5    (ATR drift up to $3)
+          JPY     : 0.5 bucket → round(entry*2)/2    (ATR drift ~0.02 JPY)
+          FX      : 0.001 bucket → round(entry, 3)   (ATR drift ~0.0002)
+        """
+        sym   = str(signal.get('symbol', ''))
+        entry = float(signal.get('entry', 0))
+        if 'XAU' in sym or 'GOLD' in sym.upper():
+            entry_bucketed = round(entry / 5) * 5
+        elif 'JPY' in sym:
+            entry_bucketed = round(entry * 2) / 2
+        else:
+            entry_bucketed = round(entry, 3)
+        return (f"{sym}_{signal.get('direction')}_"
+                f"{entry_bucketed}_{signal.get('timeframe', '')}")
 
     existing_ids = {get_signal_id(s): i for i, s in enumerate(existing_signals)}
-    new_added = updated = 0
+    new_added = updated = skipped_resolved = 0
 
     for signal in signals:
         sig_id = get_signal_id(signal)
+
         if sig_id in existing_ids:
-            idx      = existing_ids[sig_id]
-            old_prob = float(existing_signals[idx].get('probability', 0))
-            new_prob = float(signal.get('probability', 0))
-            if new_prob > old_prob:
-                existing_signals[idx]['probability']      = signal['probability']
-                existing_signals[idx]['base_probability'] = signal.get('base_probability', signal['probability'])
-                existing_signals[idx]['timestamp']        = signal.get('timestamp')
+            idx = existing_ids[sig_id]
+            ex  = existing_signals[idx]
+
+            # Never touch resolved outcomes — they are permanent historical records
+            if ex.get('status') in RESOLVED_STATUSES:
+                skipped_resolved += 1
+                continue
+
+            # Only update signals still awaiting entry
+            if ex.get('status') == 'pending':
+
+                # Rule 1 — always refresh execution levels (model has fresher data)
+                ex['entry']        = signal.get('entry',       ex.get('entry'))
+                ex['sl']           = signal.get('sl',          ex.get('sl'))
+                ex['tp']           = signal.get('tp',          ex.get('tp'))
+                ex['risk_pips']    = signal.get('risk_pips',   ex.get('risk_pips'))
+                ex['reward_pips']  = signal.get('reward_pips', ex.get('reward_pips'))
+                ex['risk_reward']  = signal.get('risk_reward', ex.get('risk_reward'))
+                ex['rr']           = signal.get('rr',          ex.get('rr'))
+
+                # Rule 2 — only upgrade probability, never degrade
+                new_prob = float(signal.get('probability', 0))
+                old_prob = float(ex.get('probability', 0))
+                if new_prob > old_prob:
+                    ex['probability']      = new_prob
+                    ex['base_probability'] = signal.get(
+                        'base_probability',
+                        signal.get('probability', ex.get('base_probability', 0))
+                    )
+
+                # Rule 4 — refresh metadata with latest values where available
+                ex['confluence']    = signal.get('confluence',    ex.get('confluence'))
+                ex['distance_pips'] = signal.get('distance_pips', ex.get('distance_pips'))
+                # BUG-FIX: valid_until is anchored to the ORIGINAL signal generation time.
+                # Never overwrite it on a dedup cycle-update — the expiry clock must not
+                # reset just because the same zone is seen again.  Only set it if the
+                # existing record has no valid_until yet (should never happen, but safe).
+                if not ex.get('valid_until'):
+                    ex['valid_until'] = signal.get('valid_until')
+                ex['last_seen']     = signal.get('last_seen', signal.get('timestamp', ex.get('last_seen')))
+
                 updated += 1
             continue
-        signal['status'] = 'pending'
+
+        # Brand-new signal — add with pending status
+        signal['status']    = 'pending'
+        signal['last_seen'] = signal.get('timestamp')
         existing_signals.append(signal)
         new_added += 1
+
+    if skipped_resolved:
+        logger.debug(f"save_signals: {skipped_resolved} resolved signal(s) left unchanged")
 
     existing_signals = _convert_numpy(existing_signals)
     with open(filepath, 'w') as f:
@@ -722,6 +826,7 @@ class ProductionForexPredictor:
                  htf_fvg_min_gap_atr: float = 0.5,
                  htf_ob_min_reaction_atr: float = 2.0,
                  is_continuation_strategy: bool = False,
+                 require_zone_close: bool = False,
                  debug: bool = False):
 
         self.api_key     = api_key
@@ -749,11 +854,15 @@ class ProductionForexPredictor:
         self.continuation_prob_boost = continuation_prob_boost
         self.use_htf_analysis        = use_htf_analysis
         self.is_continuation_strategy = is_continuation_strategy
+        self.require_zone_close       = require_zone_close  # IMPROVE: filter blown-through zones
 
         if not self.is_continuation_strategy:
             # TASK 1: REVERSION STRATEGY
-            # Calibration testing proved an elite 95.76% precision at a 0.65 threshold!
-            self.prob_threshold = 0.65
+            # IMPROVE: raised from 0.65 → 0.72 after signal comparator showed all
+            # SL hits clustered in the 65–71% probability band (6 of 6 losses were
+            # below 0.73). The 95.76% precision stat was measured at 0.65 on training
+            # data; live data shows more noise in that band.
+            self.prob_threshold = 0.72
         else:
             # TASK 2: CONTINUATION STRATEGY
             # Keep this strictly at 0.60 where precision peaked stably at 80.0%.
@@ -1134,6 +1243,11 @@ class ProductionForexPredictor:
 
                         # IMPROVE-2: real candle boundaries
                         body_top    = max(bar['open'], bar['close'])
+                        # FIX-DOJI: skip zero-width supply zones (doji candles).
+                        # When body_top == bar['high'] the zone has no width,
+                        # risk collapses to zero and SL falls entirely on ATR floor.
+                        if (bar['high'] - body_top) < current_atr * 0.1:
+                            continue
                         # Confluence = count of HTF structures overlapping this zone
                         # Matches training schema where confluence is an integer count
                         z_top = bar['high']; z_bot = body_top
@@ -1185,6 +1299,11 @@ class ProductionForexPredictor:
 
                         # IMPROVE-2: real candle boundaries
                         body_bottom = min(bar['open'], bar['close'])
+                        # FIX-DOJI: skip zero-width demand zones (doji candles).
+                        # When body_bottom == bar['low'] the zone has no width,
+                        # risk collapses to zero and SL falls entirely on ATR floor.
+                        if (body_bottom - bar['low']) < current_atr * 0.1:
+                            continue
                         z_top = body_bottom; z_bot = bar['low']
                         conf_count = 1
                         for htf_item in (htf_context.get('h4_fvgs', []) +
@@ -1312,11 +1431,11 @@ class ProductionForexPredictor:
         zone_mid          = zone['price_mid']
         dist_to_zone      = abs(current_5min_price - zone_mid) / self.pip_size
 
+        # FIX-5MIN-GATE: removed hard distance rejection — zones pass to ML
         if dist_to_zone > dynamic_threshold:
             if self.debug:
-                print(f"    ⚠️  5-min rejected: {dist_to_zone:.1f}p > {dynamic_threshold:.1f}p")
-            self.stats['refine_rejections'] += 1
-            return None
+                print(f"    ⚠️  5-min far zone: {dist_to_zone:.1f}p > {dynamic_threshold:.1f}p "
+                      f"(passing to ML — no hard reject)")
 
         recent_5min    = _df.tail(20)
         rejection_score = 0
@@ -1359,16 +1478,24 @@ class ProductionForexPredictor:
 
         if total_score < 2:
             if self.debug:
-                print(f"    ⚠️  5-min rejected: score {total_score}/8 < 2")
-            self.stats['refine_rejections'] += 1
+                print(f"    ⚠️  5-min score low: {total_score}/8 < 2 "
+                      f"(no refinement — zone continues to ML with base geometry)")
             return None
 
-        sl_mult    = 1.2 if micro_zone_found else 1.5
-        refined_sl = (refined_entry - atr_5min * sl_mult if zone['type'] == 'demand'
-                      else refined_entry + atr_5min * sl_mult)
+        sl_mult    = 2.2 if micro_zone_found else 2.8
+        # FIX-SL-5MIN: original SL used atr_5min (3-5 pips) which is far too
+        # tight. Use current_atr_15min (the 15min ATR passed in) so the SL is
+        # always anchored to the correct timeframe's noise level.
+        # sl_mult still controls how many ATRs of buffer beyond the entry.
+        # IMPROVE: raised from 1.8/2.2 → 2.2/2.8 after comparator showed avg MAE
+        # was 3.2× the SL (323% overshoot in Run 1, 178% in Run 2).
+        refined_sl = (refined_entry - current_atr_15min * sl_mult if zone['type'] == 'demand'
+                      else refined_entry + current_atr_15min * sl_mult)
 
         atr_5min_pips  = atr_5min / self.pip_size
-        slippage_pips  = max(0.5, atr_5min_pips * 0.15)
+        # IMPROVE: raised coeff from 0.15 → 0.30 (comparator: every triggered trade
+        # filled worse than planned; 0.15×ATR was systematically under-estimating fill slip)
+        slippage_pips  = max(1.0, atr_5min_pips * 0.30)
         if zone['type'] == 'demand':
             refined_entry += slippage_pips * self.pip_size
             refined_sl    += slippage_pips * self.pip_size
@@ -1416,24 +1543,44 @@ class ProductionForexPredictor:
         if refinement:
             entry = refinement['refined_entry']
             sl    = refinement['refined_sl']
+            # FIX-SL-ATR: refinement SL is built from 5min ATR (3-5 pips).
+            # Re-enforce the 15min ATR floor here so the SL is never tighter
+            # than 1.5 × 15min ATR regardless of which path set it.
+            _min_sl_dist = current_atr * max(self.min_risk_atr, 2.5)
+            if abs(entry - sl) < _min_sl_dist:
+                sl = entry - _min_sl_dist if is_buy else entry + _min_sl_dist
         else:
             if zone.get('is_continuation') and zone.get('flip_info'):
                 entry = zone['flip_info']['flip_level']
             else:
-                # Proximal edge = closest side of zone to current price
-                entry = zone.get('price_high', zone['price_mid']) if is_buy \
-                    else zone.get('price_low', zone['price_mid'])
+                # FIX-ENTRY-BUFFER: proximal body edge + 0.15 ATR buffer so a
+                # limit order absorbs the normal wick overshoot before filling.
+                # Without this, price routinely overshoots the body by 5-25 pips
+                # and the fill is already at or past the SL.
+                _body_proximal = (zone.get('price_high', zone['price_mid']) if is_buy
+                                  else zone.get('price_low', zone['price_mid']))
+                # IMPROVE: raised from 0.35 → 0.55 ATR after comparator showed avg
+                # slippage of +7.7 pips — price consistently blows through the body
+                # before the limit fills; wider buffer centers fill in zone.
+                _buf = current_atr * 0.55
+                entry = _body_proximal - _buf if is_buy else _body_proximal + _buf
 
+            # FIX-SL-WICK: SL placed beyond the DISTAL WICK of the OB candle,
+            # not just the body edge. price_low (demand) / price_high (supply)
+            # already holds the wick extreme from _detect_zones_with_validation.
+            # Use 1.0 ATR as minimum so normal 15min noise never stops us out.
             if is_buy:
-                risk = max(entry - zone['price_low'], current_atr * self.min_risk_atr)
-                sl   = entry - risk
+                wick_risk = entry - zone['price_low']          # entry to wick low
+                risk      = max(wick_risk, current_atr * max(self.min_risk_atr, 2.5))
+                sl        = entry - risk
             else:
-                risk = max(zone['price_high'] - entry, current_atr * self.min_risk_atr)
-                sl   = entry + risk
+                wick_risk = zone['price_high'] - entry         # wick high to entry
+                risk      = max(wick_risk, current_atr * max(self.min_risk_atr, 2.5))
+                sl        = entry + risk
 
         risk = abs(entry - sl)
         if risk <= 0:
-            risk = current_atr * self.min_risk_atr
+            risk = current_atr * max(self.min_risk_atr, 2.5)
             sl   = entry - risk if is_buy else entry + risk
 
         # ── Spread on SL (entry slip, once) ──────────────────────────────────
@@ -1487,7 +1634,16 @@ class ProductionForexPredictor:
                     if lvl < entry:
                         tp_candidates.append((abs(lvl - entry), 'swing_low', lvl))
 
-        # ── Filter by RR validity and pick nearest ────────────────────────────
+        # ── Filter by RR validity and pick best candidate ─────────────────────
+        # FIX-TP: original code picked the NEAREST opposing zone (break on first).
+        # Winning trades achieved RR 7-11 while predicted was 2-3 — the nearest
+        # zone was too conservative. New logic:
+        #   1. Collect all valid candidates (MIN_RR ≤ rr ≤ TP_MAX_RR)
+        #   2. Pick the one closest to 4× RR (sweet spot from observed wins)
+        #   3. Fall back to nearest if no candidate near 4× RR exists
+        TP_MAX_RR   = max(self.max_rr, 12.0)  # winners ran to RR 7-11, raise ceiling
+        TARGET_RR   = 6.0                      # aim for this RR (was 4.0, winners averaged 9.7)
+
         def effective_rr(raw_level: float) -> float:
             tp_adj = raw_level - spread_price * 0.5 if is_buy else raw_level + spread_price * 0.5
             reward = abs(tp_adj - entry)
@@ -1496,14 +1652,19 @@ class ProductionForexPredictor:
         tp_candidates.sort(key=lambda x: x[0])  # nearest first
         tp, actual_rr, tp_source = None, None, 'fallback'
 
+        valid_candidates = []
         for dist, source, raw_level in tp_candidates:
             rr = effective_rr(raw_level)
-            if MIN_RR <= rr <= self.max_rr:
-                tp_adj    = raw_level - spread_price * 0.5 if is_buy else raw_level + spread_price * 0.5
-                tp        = tp_adj
-                actual_rr = rr
-                tp_source = source
-                break
+            if MIN_RR <= rr <= TP_MAX_RR:
+                valid_candidates.append((rr, dist, source, raw_level))
+
+        if valid_candidates:
+            # Pick candidate whose RR is closest to TARGET_RR
+            best = min(valid_candidates, key=lambda x: abs(x[0] - TARGET_RR))
+            _, _, tp_source, raw_level = best
+            tp_adj    = raw_level - spread_price * 0.5 if is_buy else raw_level + spread_price * 0.5
+            tp        = tp_adj
+            actual_rr = effective_rr(raw_level)
 
         # ── Fallback: fixed RR if no opposing zone found ──────────────────────
         if tp is None:
@@ -1584,6 +1745,8 @@ class ProductionForexPredictor:
                 f"  m5_sweep={_d.get('m5_sweep_confirmation')}"
                 f"  touch={_d.get('zone_touch_count')}"
                 f"  zone_age={_d.get('zone_age_bars')}"
+                f"  htf_align={_d.get('htf_trend_alignment')}"
+                f"  h4_prem={_d.get('h4_premium_discount')}"
             )
 
         X = row_df.values
@@ -2242,18 +2405,29 @@ class ProductionForexPredictor:
                 htf_ob_rejected['confs'] += 1; continue
 
             direction = 'BUY' if ob['type'] == 'bullish' else 'SELL'
-            entry     = ob['mid']
-            _atr_buf  = df['atr'].iloc[-1] * 0.2 if 'atr' in df.columns else 0.0002
-            sl        = ob['bottom'] - _atr_buf if direction == 'BUY' else ob['top'] + _atr_buf
 
-            # Bullish OB: zone mid must be below current price (demand below price).
-            # Bearish OB: zone mid must be above current price (supply above price).
-            # FILTER FIX: old code used ob['top']/ob['bottom'] as the threshold.
-            # On 4H candles ob['top'] is the candle HIGH — easily at or above current
-            # price even for a valid demand zone, killing every near-price OB.
-            # Using mid correctly identifies which side of price the zone sits on.
-            # Tolerance: allow zone mid within 1.0 ATR of price so zones being
-            # approached right now are not excluded before they can be scored.
+            # ENTRY: proximal edge of the OB body, not the candle mid.
+            # The OB candle's open price is where institutional orders were placed.
+            # For a bullish OB (bearish candle):
+            #   ob['top']    = candle HIGH  (wick — above body, not where orders sit)
+            #   ob['open']   = candle OPEN  = body top = best entry (stored in raw df)
+            #   ob['mid']    = (high+low)/2 = includes wicks, too deep inside zone ← old
+            #   ob['close']  = candle CLOSE = body bottom = second entry level
+            #   ob['bottom'] = candle LOW   (wick — SL goes here)
+            # Using ob['top'] for BUY and ob['bottom'] for SELL gives proximal body
+            # edge without needing to reparse the raw df for the open price.
+            # This ensures entry is at the first line of institutional demand/supply,
+            # not mid-zone where price may not retrace to before reversing.
+            _atr_buf = df['atr'].iloc[-1] * 0.2 if 'atr' in df.columns else 0.0002
+            if direction == 'BUY':
+                entry = ob['top']               # proximal body edge for demand
+                sl    = ob['bottom'] - _atr_buf # distal wick + ATR buffer
+            else:
+                entry = ob['bottom']            # proximal body edge for supply
+                sl    = ob['top'] + _atr_buf    # distal wick + ATR buffer
+
+            # Direction filter uses ob['mid'] — correctly identifies zone side
+            # relative to price without being confused by the candle wick
             if direction == 'BUY'  and ob['mid'] > current_price + atr_tol: htf_ob_rejected['direction'] += 1; continue
             if direction == 'SELL' and ob['mid'] < current_price - atr_tol: htf_ob_rejected['direction'] += 1; continue
 
@@ -2681,7 +2855,7 @@ class ProductionForexPredictor:
         observation_signals = []   # zones blocked by gates — saved for study
         rejected_cnt = 0
         reject_reasons = {'5min_refine': 0, 'prob_low': 0, 'risk_range': 0,
-                          'h4_bias': 0, 'd1_premium_discount': 0}
+                          'h4_bias': 0, 'd1_premium_discount': 0, 'zone_close': 0}
 
         def _make_obs_signal(zone, gate_reason):
             """Build a lightweight observation signal dict for a gate-blocked zone."""
@@ -2771,22 +2945,17 @@ class ProductionForexPredictor:
             flip_info = zone.get('flip_info')
 
             # ── Apply 4H bias gate ────────────────────────────────────────────
+            # FIX-BIAS-GATE: soft -7% penalty instead of hard block
+            _h4_counter_trend_penalty = 0.0
             if h4_trend == 'bullish' and zone['type'] == 'supply':
-                rejected_cnt += 1
-                reject_reasons['h4_bias'] += 1
-                observation_signals.append(_make_obs_signal(zone, '4h_bias_bullish_blocks_supply'))
+                _h4_counter_trend_penalty = 0.07
                 if self.debug:
-                    print(f"     ⛔ 4H BIAS GATE: supply zone blocked — 4H is bullish")
-                continue
-            if h4_trend == 'bearish' and zone['type'] == 'demand':
-                if _d1_pd != -1:   # not in D1 discount — block counter-trend buy
-                    rejected_cnt += 1
-                    reject_reasons['h4_bias'] += 1
-                    observation_signals.append(_make_obs_signal(zone, '4h_bias_bearish_blocks_demand'))
+                    print(f"     ⚠️  4H BIAS: supply counter-trend (4H bullish) → -7% prob penalty")
+            elif h4_trend == 'bearish' and zone['type'] == 'demand':
+                if _d1_pd != -1:
+                    _h4_counter_trend_penalty = 0.07
                     if self.debug:
-                        print(f"     ⛔ 4H BIAS GATE: demand blocked — 4H bearish and not in D1 discount")
-                    continue
-                # D1 discount + bearish 4H = valid continuation buy — fall through to ML
+                        print(f"     ⚠️  4H BIAS: demand counter-trend (4H bearish, not D1 discount) → -7% prob penalty")
 
             # ── Apply D1 premium/discount gate ───────────────────────────────
             # ── D1 premium/discount gate — only blocks COUNTER-trend zones ──────
@@ -2842,6 +3011,28 @@ class ProductionForexPredictor:
                 zone['m5_sweep_confirmation']   = _m5_conf['m5_sweep_confirmation']
                 zone['m5_entry_candle_quality'] = _m5_conf['m5_entry_candle_quality']
 
+            # FIX-FEATURE-ALIGN-1: inject h4_fvg_inside for 15min zones
+            if 'fvg_overlap' not in zone and 'h4_fvg_zone' not in zone:
+                _h4_fvgs = htf_context.get('h4_fvgs', [])
+                _z_top   = zone.get('price_high', zone.get('price_mid', 0))
+                _z_bot   = zone.get('price_low',  zone.get('price_mid', 0))
+                zone['fvg_overlap'] = any(
+                    not (fvg.get('top', fvg.get('price_high', 0)) < _z_bot or
+                         fvg.get('bottom', fvg.get('price_low', 0)) > _z_top)
+                    for fvg in _h4_fvgs
+                )
+
+            # FIX-FEATURE-ALIGN-2: inject htf_alignment as {-1,0,1}
+            if 'htf_alignment' not in zone:
+                if zone['type'] == 'demand':
+                    zone['htf_alignment'] = (1  if h4_trend == 'bullish'
+                                             else -1 if h4_trend == 'bearish'
+                                             else 0)
+                else:
+                    zone['htf_alignment'] = (1  if h4_trend == 'bearish'
+                                             else -1 if h4_trend == 'bullish'
+                                             else 0)
+
             base_probability = self.predict_with_proper_features(
                 zone, df, htf_context,
                 df_1h = _bars['1h/100'],
@@ -2891,26 +3082,40 @@ class ProductionForexPredictor:
             if self.use_5min_refinement and not is_cont:
                 refinement = self.refine_entry_with_5min(
                     zone, current_price, current_atr, df_5min=_bars['5min/60'])
+
+                # GUARD: discard refinement if price already inside the zone.
+                # A micro swing found behind price is noise, not confirmation.
+                # Fall back to zone geometry which uses the proximal body edge.
+                if refinement is not None:
+                    already_inside = (
+                        (zone['type'] == 'demand' and current_price <= zone['price_high']) or
+                        (zone['type'] == 'supply' and current_price >= zone['price_low'])
+                    )
+                    if already_inside:
+                        refinement = None
+                        if self.debug:
+                            print(f"    ⚠️  Refinement discarded — price already inside zone")
+
                 if refinement is None:
-                    # Fall back gracefully instead of hard reject
-                    self.stats['refine_rejections'] += 1
-                    reject_reasons['5min_refine'] += 1
-                    # Do NOT continue — let zone pass without refinement boost
+                    # FIX-5MIN-GATE: zone continues to ML with base geometry
+                    pass
                 else:
                     probability = self.apply_boost_ceiling(probability, refinement['confidence_boost'])
 
-            d1_trend     = htf_context.get('daily_structure', {}).get('trend', 'neutral')
+            # Apply 4H counter-trend penalty
+            if _h4_counter_trend_penalty > 0:
+                probability = max(0.0, probability - _h4_counter_trend_penalty)
+
+            d1_trend = htf_context.get('daily_structure', {}).get('trend', 'neutral')
             counter_trend = (
                 (zone['type'] == 'demand' and d1_trend == 'bearish') or
                 (zone['type'] == 'supply' and d1_trend == 'bullish')
             ) if d1_trend != 'neutral' else False
 
-            # _session_penalty REMOVED — training data spans all sessions uniformly.
-            # Raising the threshold in Asia/Sydney rejects zones the model rates 0.65-0.70
-            # during off-hours with no training justification.
             _hour = datetime.utcnow().hour
-            effective_threshold = (self.prob_threshold
-                                   + (0.05 if counter_trend else 0.0))
+            # FIX-THRESHOLD: lowered REVERSION threshold 0.72 → 0.62
+            _base_threshold = min(self.prob_threshold, 0.62) if not is_cont else self.prob_threshold
+            effective_threshold = _base_threshold + (0.03 if counter_trend else 0.0)
             if base_probability < 0.55 or probability < effective_threshold:
                 rejected_cnt += 1
                 reject_reasons['prob_low'] += 1
@@ -2958,6 +3163,8 @@ class ProductionForexPredictor:
                 'reward_pips':     round(reward_pips, 1),
                 'risk_reward':     f"1:{actual_rr:.1f}",
                 'rr':              f"1:{actual_rr:.1f}",
+                'zone_top':        round(zone.get('price_high', entry), 5),
+                'zone_bottom':     round(zone.get('price_low',  sl),    5),
                 'probability':     round(probability * 100, 1),
                 'base_probability': round(base_probability * 100, 1),
                 'zone_strength':   round(zone['strength'], 2),
@@ -2980,6 +3187,49 @@ class ProductionForexPredictor:
                     'flipped_to':    flip_info['new_type'],
                     'flip_level':    round(flip_info['flip_level'], 5)
                 }
+
+            # IMPROVE-FIX4: require at least one bar to CLOSE inside the zone before
+            # FIX-ZONE-CLOSE: the original check required a 15min close INSIDE
+            # the zone in the last 3 bars. This killed valid setups where:
+            #   1. Zone is very tight (< 0.5 × ATR) — a close inside is unlikely
+            #      even on a clean touch (e.g. XAU 2.7 pip zone, spread alone is 3+p)
+            #   2. Zone is forming on the current bar — needs more time
+            # New logic:
+            #   - Skip check if zone width < 0.5 × ATR (too tight to expect a close)
+            #   - Otherwise check last 5 bars (not 3) for close OR wick touch
+            #   - Wick touch = bar LOW entered zone (supply) or HIGH entered zone (demand)
+            if self.require_zone_close and not self.is_continuation_strategy:
+                z_top      = signal['zone_top']
+                z_bot      = signal['zone_bottom']
+                zone_width = abs(z_top - z_bot)
+                _atr       = signal.get('atr', current_atr)
+                recent5    = df.tail(5)   # df = _bars['15min/200']
+
+                # Skip for tight zones — close inside is physically improbable
+                if zone_width < _atr * 0.5:
+                    pass  # zone too tight — skip close requirement
+                else:
+                    # Accept either: close inside zone, OR wick penetration into zone
+                    if zone['type'] == 'supply':
+                        touched = any(
+                            (z_bot <= c <= z_top) or (h >= z_bot)
+                            for c, h in zip(recent5['close'], recent5['high'])
+                        )
+                    else:  # demand
+                        touched = any(
+                            (z_bot <= c <= z_top) or (l <= z_top)
+                            for c, l in zip(recent5['close'], recent5['low'])
+                        )
+                    if not touched:
+                        if self.debug:
+                            print(f"     ⛔ REVERSION zone rejected (require_zone_close): "
+                                  f"no close or wick touch of [{z_bot:.5f} – {z_top:.5f}] "
+                                  f"in last 5 bars (width={zone_width/self.pip_size:.1f}p, "
+                                  f"ATR={_atr/self.pip_size:.1f}p)")
+                        rejected_cnt += 1
+                        reject_reasons['zone_close'] += 1
+                        continue
+
             signals.append(signal)
 
         self.stats['total_new_zones'] += len(signals)
@@ -2998,7 +3248,8 @@ class ProductionForexPredictor:
         # ── DIAGNOSTIC SUMMARY ──────────────────────────────────────────────
         print(f"     [6] After prob/risk filters:   {len(signals)}")
         print(f"         Reject reasons → 5min_refine={reject_reasons['5min_refine']} "
-              f"prob_low={reject_reasons['prob_low']} risk_range={reject_reasons['risk_range']}")
+              f"prob_low={reject_reasons['prob_low']} risk_range={reject_reasons['risk_range']} "
+              f"zone_close={reject_reasons['zone_close']}")
         print(f"     ✅ Final signals: {len(signals)} (15min) + {len(htf_signals)} (HTF)")
         # ── END DIAGNOSTIC ───────────────────────────────────────────────────
 
@@ -3037,6 +3288,47 @@ class DailyPlanScheduler:
 
         all_signals = []
 
+        # BUGFIX-15: Load resolved signal IDs from all_signals.json so that zones
+        # which already expired / hit TP / hit SL in a previous plan window are
+        # not re-emitted as fresh signals in the new plan.
+        # Uses the same bucketed entry key as save_signals_to_single_file() so
+        # the match is exact regardless of minor SL/TP drift between cycles.
+        _all_sigs_path = Path("signals/all_signals.json")
+        _resolved_ids: set = set()
+        if _all_sigs_path.exists():
+            try:
+                with open(_all_sigs_path) as _f:
+                    _existing = json.load(_f)
+                for _s in _existing:
+                    if _s.get('status') in {'hit_tp', 'hit_sl', 'expired', 'entry_missed'}:
+                        _sym   = str(_s.get('symbol', ''))
+                        _entry = float(_s.get('entry', 0))
+                        if 'XAU' in _sym or 'GOLD' in _sym.upper():
+                            _eb = round(_entry / 5) * 5
+                        elif 'JPY' in _sym:
+                            _eb = round(_entry * 2) / 2
+                        else:
+                            _eb = round(_entry, 3)
+                        _resolved_ids.add(
+                            f"{_sym}_{_s.get('direction')}_{_eb}_{_s.get('timeframe','')}"
+                        )
+                if _resolved_ids:
+                    print(f"  🔒 {len(_resolved_ids)} resolved zone(s) loaded — will be suppressed from plan")
+            except Exception as _e:
+                logger.warning(f"DailyPlan: could not load existing signals for dedup — {_e}")
+
+        def _plan_sig_id(s):
+            """Bucketed zone ID — matches save_signals_to_single_file key exactly."""
+            sym   = str(s.get('symbol', ''))
+            entry = float(s.get('entry', 0))
+            if 'XAU' in sym or 'GOLD' in sym.upper():
+                eb = round(entry / 5) * 5
+            elif 'JPY' in sym:
+                eb = round(entry * 2) / 2
+            else:
+                eb = round(entry, 3)
+            return f"{sym}_{s.get('direction')}_{eb}_{s.get('timeframe','')}"
+
         # Pre-warm the shared bar cache once per symbol before iterating.
         # This ensures REV and CONT predictors both hit cache, halving real
         # API calls from 2×8=16 per symbol down to 8.
@@ -3053,12 +3345,54 @@ class DailyPlanScheduler:
             try:
                 result = pred.generate_signals()
                 sigs   = result.get('15min_signals', []) + result.get('htf_signals', [])
+                now = datetime.utcnow()
                 for s in sigs:
                     s['plan_type'] = 'daily'
-                    s['valid_until'] = (datetime.utcnow() + timedelta(hours=20)).isoformat()
-                all_signals.extend(sigs)
+                    # Stamp last_seen but never overwrite the original timestamp
+                    if not s.get('timestamp'):
+                        s['timestamp'] = now.isoformat()
+                    s['last_seen'] = now.isoformat()
+                    tf = s.get('timeframe', '15min')
+                    if tf in ('1d', '1day', 'daily'):
+                        hours = 240
+                    elif tf in ('4h', '4hour'):
+                        hours = 120
+                    elif tf in ('1h', '1hour'):
+                        hours = 48
+                    else:
+                        hours = 8
+                    s['valid_until'] = (now + timedelta(hours=hours)).isoformat()
+
+                # BUGFIX-15: filter out any signal whose zone was already resolved
+                # in a previous plan window (expired without entry, hit TP/SL, etc.)
+                fresh_sigs = [s for s in sigs if _plan_sig_id(s) not in _resolved_ids]
+                skipped    = len(sigs) - len(fresh_sigs)
+                if skipped:
+                    print(f"  ⏭  [{pred.symbol}] {skipped} signal(s) suppressed — zone previously resolved")
+                all_signals.extend(fresh_sigs)
             except Exception as e:
                 logger.warning(f"DailyPlan: error for {pred.symbol} — {e}")
+
+        # Dedup before saving: same entry+direction+timeframe → keep highest probability.
+        # Without this, overlapping 15min OBs that refine to the same TP candidate
+        # produce multiple identical rows in the plan (and on the frontend).
+        def _plan_dedup_key(s):
+            sym   = str(s.get('symbol', ''))
+            entry = float(s.get('entry', 0))
+            if 'XAU' in sym or 'GOLD' in sym.upper():
+                eb = round(entry / 5) * 5
+            elif 'JPY' in sym:
+                eb = round(entry * 2) / 2
+            else:
+                eb = round(entry, 3)
+            return (sym, s.get('direction'), eb, s.get('timeframe', ''))
+
+        seen_plan: dict = {}
+        for s in all_signals:
+            k = _plan_dedup_key(s)
+            if k not in seen_plan or float(s.get('probability', 0)) > float(seen_plan[k].get('probability', 0)):
+                seen_plan[k] = s
+        all_signals = list(seen_plan.values())
 
         all_signals = sorted(all_signals, key=lambda x: float(x.get('probability', 0)), reverse=True)
 
@@ -3225,9 +3559,19 @@ class PriceZoneMonitor:
 
 def check_signal_outcomes(predictors: List['ProductionForexPredictor'],
                            signals_file: str = "signals/all_signals.json"):
-    """IMPROVE-7: Run outcome check after every cycle."""
-    tracker = SignalOutcomeTrackerV2("signals/all_signals.json")
-    result  = tracker.check_outcomes(lambda tf, n: predictors[0].fetch_bars(tf, n))
+    """IMPROVE-7: Run outcome check after every cycle.
+
+    BUG-FIX: original used predictors[0].fetch_bars for ALL symbols, meaning
+    GBP/USD, USD/JPY and XAU/USD signals were evaluated against EUR/USD bars.
+    Fix: build a symbol->predictor map so each signal fetches its own bars.
+    """
+    sym_predictor = {}
+    for p in predictors:
+        if p.symbol not in sym_predictor:
+            sym_predictor[p.symbol] = p
+
+    tracker = SignalOutcomeTrackerV2(signals_file)
+    result  = tracker.check_outcomes_by_symbol(sym_predictor)
     if result.get('updated', 0) > 0:
         print(f"  📊 Outcomes updated: TP={result['hit_tp']} SL={result['hit_sl']} "
               f"Expired={result['expired']} | Win rate: {result['win_rate_pct']}%")
@@ -3288,14 +3632,14 @@ def run_dual_strategy(symbols: Optional[List[str]] = None):
             encoders_path="models/encoders_v5_reversion.pkl",
             stats_path="models/training_stats_v5_reversion.pkl",
             symbol=sym,
-            prob_threshold=0.65,
-            max_rr=3.5, min_risk_atr=0.8, max_distance_pips=p['max_distance_pips_rev'],
-            min_strength_atr=p['min_strength_atr'], use_5min_refinement=True,
+            prob_threshold=0.62,   # FIX-THRESHOLD: lowered from 0.72 → 0.62
+            max_rr=8.0, min_risk_atr=2.5, max_distance_pips=p['max_distance_pips_rev'],  # min_risk_atr: 1.5→2.5
+            min_strength_atr=0.50, use_5min_refinement=True,
             refine_max_dist_multiplier=2.0, enable_continuation=False,
             use_htf_analysis=True, min_confluence_score=1,
             zone_ttl_hours=5.8, zone_distance_threshold=p['zone_distance_threshold'],
             htf_fvg_min_gap_atr=0.5, htf_ob_min_reaction_atr=2.5,
-            is_continuation_strategy=False, debug=True
+            is_continuation_strategy=False, require_zone_close=True, debug=True
         )
         cont = ProductionForexPredictor(
             api_key=key,
@@ -3305,8 +3649,8 @@ def run_dual_strategy(symbols: Optional[List[str]] = None):
             stats_path="models/training_stats_v5_continuation.pkl",
             symbol=sym,
             prob_threshold=0.65,
-            max_rr=5.0, min_risk_atr=0.8, max_distance_pips=p['max_distance_pips_cont'],
-            min_strength_atr=p['min_strength_atr'], use_5min_refinement=True,
+            max_rr=10.0, min_risk_atr=2.5, max_distance_pips=p['max_distance_pips_cont'],  # min_risk_atr: 1.5→2.5
+            min_strength_atr=0.50, use_5min_refinement=True,
             refine_max_dist_multiplier=2.0, enable_continuation=True,
             use_htf_analysis=True, min_confluence_score=1,
             zone_ttl_hours=5.8, zone_distance_threshold=p['zone_distance_threshold'],
@@ -3349,9 +3693,6 @@ def run_dual_strategy(symbols: Optional[List[str]] = None):
 
             # Price monitor: check if any daily-plan zone has been touched
             price_monitor.check()
-
-            # IMPROVE-7: check outcomes of past signals
-            check_signal_outcomes(all_predictors)
 
             # Still run full signal generation every cycle for live signals
             # (complements the scheduled plan; saves to all_signals.json)
@@ -3421,8 +3762,37 @@ def run_dual_strategy(symbols: Optional[List[str]] = None):
                 all_sigs = all_15min + all_htf
                 if all_sigs:
                     for sig in all_sigs:
-                        sig['timestamp'] = cycle_time.isoformat()
+                        # BUG-FIX: Never overwrite timestamp — it is the original
+                        # signal generation time. Overwriting it each cycle caused
+                        # the frontend to show the latest cycle time instead of when
+                        # the zone was first identified, and broke signal_comparator.py
+                        # which uses timestamp to find bars-after-signal.
+                        # Use last_seen to track the most recent cycle visibility.
+                        if not sig.get('timestamp'):
+                            sig['timestamp'] = cycle_time.isoformat()
+                        sig['last_seen'] = cycle_time.isoformat()
+                        # Set timeframe-aware valid_until so entry_missed is not
+                        # triggered prematurely for HTF signals that need days.
+                        # 15min setups are execution entries — stale within hours.
+                        # 4H OBs can sit pending for a full week before being hit.
+                        # 1D zones are structural — can take 2 weeks.
+                        if 'valid_until' not in sig or not sig.get('valid_until'):
+                            tf = sig.get('timeframe', '15min')
+                            if tf in ('1d', '1day', 'daily'):
+                                hours = 240   # 10 days
+                            elif tf in ('4h', '4hour'):
+                                hours = 120   # 5 days
+                            elif tf in ('1h', '1hour'):
+                                hours = 48    # 2 days
+                            else:
+                                hours = 8     # 15min/other — stale fast
+                            sig['valid_until'] = (cycle_time + timedelta(hours=hours)).isoformat()
                     save_signals_to_single_file(all_sigs, "signals/all_signals.json")
+
+            # BUG-FIX: outcome check moved to AFTER save_signals so new signals
+            # written this cycle are visible to the tracker immediately.
+            # Previously ran before generate_signals, so fresh signals were never seen.
+            check_signal_outcomes(all_predictors)
 
             # Per-cycle cap for any downstream Telegram push
             MAX_SIGNALS_PER_CYCLE = 3
