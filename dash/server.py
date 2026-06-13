@@ -44,12 +44,47 @@ def _sig(filename: str) -> Path:
     return SIGNALS_DIR / filename
 
 
+def _normalize_signal(s: dict) -> dict:
+    s = dict(s)
+    is_htf = s.get("strategy", "").upper().startswith("HTF") or s.get("timeframe", "") in ("4h", "1d", "1h")
+
+    # ── htf_trend ─────────────────────────────────────────────────────────────
+    # HTF signals store it as "htf_trend"; 15min signals store it as "h4_trend".
+    # Expose both as "h4_trend" so the frontend only needs one key.
+    if "h4_trend" not in s or not s["h4_trend"]:
+        s["h4_trend"] = s.get("htf_trend") or "—"
+    if "htf_trend" not in s or not s["htf_trend"]:
+        s["htf_trend"] = s.get("h4_trend") or "—"
+
+    # ── confluence ────────────────────────────────────────────────────────────
+    # HTF signals: "confluence" is a string like "OB-8.03 1H=✅ 5m=✅"
+    # 15min signals: "confluence_score" is an integer 0–10
+    # Normalise to "confluence_display" (human string) and "confluence_score" (int).
+    raw_conf = s.get("confluence")
+    score    = s.get("confluence_score")
+
+    if raw_conf and isinstance(raw_conf, str):
+        s["confluence_display"] = raw_conf
+        if score is None:
+            import re
+            m = re.search(r"[-](\d+(?:\.\d+)?)", raw_conf)
+            s["confluence_score"] = round(float(m.group(1))) if m else None
+    elif score is not None:
+        s["confluence_display"] = f"{score}/10"
+    else:
+        s["confluence_display"] = "—"
+        s["confluence_score"]   = None
+
+    # ── strategy display ──────────────────────────────────────────────────────
+    # Normalise "HTF_SMC" → "HTF" for the frontend strategy column
+    strat = s.get("strategy", "")
+    if strat.upper() == "HTF_SMC":
+        s["strategy"] = "HTF"
+
+    return s
+
+
 def _merge_signals():
-    """
-    Return live signals + daily plan entries as one unified list.
-    Live signals (all_signals.json) take priority — daily plan entries are
-    added only if no matching entry/direction already exists in live signals.
-    """
     live = _read(_sig("all_signals.json")) or []
     plan = _read(_sig("daily_plan.json"))  or []
 
@@ -58,14 +93,14 @@ def _merge_signals():
         for s in live
     }
 
-    merged = list(live)
+    merged = [_normalize_signal(s) for s in live]
     for p in plan:
         key = (p.get("direction"), round(float(p.get("entry", 0)), 5))
         if key not in live_keys:
             p = dict(p)
             p.setdefault("status", "planned")
             p["source"] = "daily_plan"
-            merged.append(p)
+            merged.append(_normalize_signal(p))
 
     return merged
 
@@ -83,20 +118,6 @@ def index():
 @app.route("/static/<path:fname>")
 def static_files(fname):
     return send_from_directory(BASE_DIR / "static", fname)
-
-
-# ── /api/signals ──────────────────────────────────────────────────────────────
-@app.route("/api/signals")
-def api_signals():
-    data = _merge_signals()
-    return jsonify({
-        "data":        data,
-        "count":       len(data),
-        "live":        len(_read(_sig("all_signals.json")) or []),
-        "planned":     len(_read(_sig("daily_plan.json"))  or []),
-        "observation": len(_observation_signals()),
-        "updated":     _mtime(_sig("all_signals.json")) or _mtime(_sig("daily_plan.json")),
-    })
 
 
 # ── /api/daily_plan ───────────────────────────────────────────────────────────

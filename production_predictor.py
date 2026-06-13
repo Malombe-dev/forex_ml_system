@@ -1,220 +1,3 @@
-"""
-PRODUCTION-READY FOREX PREDICTOR V7 — FULL IMPROVEMENTS
-=========================================================
-CHANGES vs V6:
-
-  IMPROVE-1  WILDER'S ATR (replaces simple rolling mean)
-             ATR now uses exponential smoothing: (prev*13 + TR) / 14.
-             Affects zone strength scoring, refinement thresholds, spread
-             buffers and every other ATR-denominated calculation.
-
-  IMPROVE-2  REAL ZONE BOUNDARIES (replaces symmetric ±0.2 ATR box)
-             Supply zones: price_high = candle high, price_low = candle body top
-             Demand zones: price_high = candle body bottom, price_low = candle low
-             This matches textbook SMC zone definition and improves entry precision.
-
-  IMPROVE-3  ZONE TRACKER PERSISTENCE (survives restarts)
-             ActiveZoneTracker now saves/loads active_zones to zones_state.json
-             on every add/cleanup. Crash or restart no longer wipes zone history,
-             preventing duplicate signals after restarts.
-
-  IMPROVE-4  CACHE BUG FIX — .total_seconds() replaces .seconds
-             timedelta.seconds wraps at 3600 and returns 0 after 1 hour,
-             making the cache appear permanently fresh. Fixed with .total_seconds().
-
-  IMPROVE-5  DEPRECATED PANDAS FILLNA REPLACED
-             fillna(method='bfill/ffill') → .bfill().ffill() to prevent
-             FutureWarning and eventual breakage in pandas ≥ 2.2.
-
-  IMPROVE-6  BARE EXCEPT REPLACED WITH LOGGED EXCEPTIONS
-             All bare `except:` blocks now catch `Exception as e` and log
-             via the module logger so bugs surface instead of being silently swallowed.
-
-  IMPROVE-7  SIGNAL OUTCOME TRACKER
-             New SignalOutcomeTracker class + check_signal_outcomes() function.
-             Runs after every cycle and updates signal status in all_signals.json
-             to hit_tp / hit_sl / expired. Enables live win-rate monitoring.
-
-  IMPROVE-8  DAILY & WEEKLY SCHEDULE (replaces always-on 15-min loop)
-             New DailyPlanScheduler generates a full watchlist once at 06:00 UTC
-             (before London open) and saves to signals/daily_plan.json.
-             New WeeklyPlanScheduler generates HTF context once on Sunday 20:00 UTC
-             and saves to signals/weekly_plan.json.
-             The 15-min loop now only checks if price has entered a pre-flagged zone
-             (price monitor mode) — no zone detection, no model inference each cycle.
-
-  IMPROVE-9  DUPLICATE htf_alignment BLOCK REMOVED
-             predict_with_proper_features() had the htf_alignment block copy-pasted
-             twice (lines 1418-1430 in V6). Second copy removed.
-
-  IMPROVE-10 MULTI-PAIR SUPPORT
-             run_dual_strategy() now accepts a SYMBOLS list. Each symbol gets its
-             own pair of reversion+continuation predictors. Daily plan covers all pairs.
-
-  BUGFIX-1   CONFLUENCE MISMATCH — ROOT CAUSE OF ZERO SIGNALS
-             feature_builder expects zone['confluence'] = raw integer merge-count
-             (training mean=5.0, range 1–20, from smc_detector merge_zones).
-             V7 was storing the HTF confluence DICT {'score':1-10,...} there.
-             feature_builder fell back to raw_conf.get('score',1) = 1..10,
-             out-of-distribution, causing scaler garbage → model sub-threshold.
-             Fix: zone['htf_confluence'] holds the display dict;
-             zone['confluence'] = integer count of overlapping HTF sources.
-
-  BUGFIX-2   _ml_score_htf_zone ALWAYS PASSED confluence=1
-             HTF FVG/OB dicts had no 'confluence' key → zone_confluence=1
-             always → model systematically underscored every HTF setup.
-             Now computes real overlap count before scoring.
-
-  BUGFIX-3   5-MIN REFINEMENT HARD REJECT REMOVED
-             use_5min_refinement=True was killing every zone that failed
-             5-min confirmation with 'continue'. During low-volatility /
-             early-session periods ALL zones fail → zero signals.
-             Now falls back gracefully to zone geometry.
-
-  BUGFIX-4   HTF PROB FILTER NOW LOGS DROPPED SIGNALS  (FIX C1)
-             Previously a signal surviving all bias/direction filters could be
-             silently dropped by the final prob threshold check with zero output.
-             Every drop now prints the direction, entry, and exact probability
-             so the cause of "1 before filter, 0 after" is always visible.
-
-  BUGFIX-5   all_zones HARDCODE REMOVED  (FIX C2)
-             `all_zones = []` was unconditionally zeroing the 15min zone list
-             even when HTF signals existed, permanently killing the 15min
-             scoring pipeline and making the D1-gate + confluence blocks
-             unreachable dead code. Removed. 15min zones now flow through the
-             full gate stack alongside HTF signals.
-
-  BUGFIX-6   ZONE STATE FILE PER PREDICTOR  (FIX C5)
-             All 8 predictor instances previously defaulted to the same
-             signals/zones_state.json, causing cross-pair/cross-strategy
-             dedup collisions. Each predictor now gets its own isolated file:
-             signals/zones_{SYMBOL}_{rev|cont}.json.
-
-  BUGFIX-7   CONFLUENCE INTEGER GUARD  (FIX C4)
-             zone['confluence'] is now explicitly cast to int() and guarded
-             with an assertion before feature_builder receives it. Previously
-             a dict could slip through (display-score 1–10) instead of the
-             integer overlap count the training scaler expects.
-
-  BUGFIX-8   h1_trend_alignment DOUBLE-FLIP DOCUMENTED  (FIX C7)
-             _check_1h_confluence() stores a zone-aligned (already flipped)
-             value in full_ob_zone['h1_trend_alignment']. build_feature_row()
-             takes the pre-computed path and uses it as-is. A guard comment
-             now prevents any future caller from accidentally storing raw_trend
-             (pre-flip) and triggering a second flip in _compute_h1_features.
-
-  NOTE       data_validation.py check_v7_feature_ranges() still references
-             prev_zone_outcome and time_since_last_touch which were removed in
-             v8.  Those checks are harmless no-ops when the columns are absent
-             but should be removed from data_validation.py to avoid confusion.
-
-  BUGFIX-9   h1_liquidity_sweep TRAINING BIAS (Bug 2)
-             _check_1h_confluence used tail(30) to detect sweeps. Training used
-             the full 1H history up to zone_time in smc_detector, so virtually
-             every historical zone had a sweep in range (mean=0.972). Live,
-             tail(30) missed most sweeps → default 0 → z=-5.85.
-             Fix: scan full sub (all available 1H bars) in both live and training.
-
-  BUGFIX-10  zone_touch_count UNDERCOUNT (Bug 3)
-             htf_trade_detect computed touch_count as closes strictly inside
-             the OB box over tail(50). Training used high/low overlap across all
-             bars (mean=11.24). Fresh OBs live scored 0–3 → z=-1.80.
-             Fix: use full df with high/low overlap criterion, matching training.
-
-  BUGFIX-11  m5_micro_bos / m5_sweep_confirmation PRE-TOUCH BIAS (Bug 4)
-             Training scored these at the TOUCH MOMENT (features already fired).
-             Live scoring happens BEFORE price enters the zone, so tail(20) had
-             0 BOS/sweeps → both z≈-2.5 simultaneously.
-             Fix: use tail(60) (5 hours of 5M bars) to capture recent approach.
-
-  BUGFIX-13  MAX_DIST_PIPS SYMBOL-SCALING BUG
-             MAX_DIST_PIPS=80 was applied as raw pips but pip_size varies by
-             symbol. USD/JPY (pip_size=0.01): 80 pips = 0.80 JPY — absurdly
-             tight on a 159-price pair. XAU/USD (pip_size=1.0): 80 pips = $80.
-             Fix: express distance limit as 20 × 4H ATR (scales with volatility).
-
-  BUGFIX-14  OB/FVG DIRECTION FILTER USED EDGE NOT MID
-             Filter checked ob['top'] >= current_price for bullish OBs.
-             ob['top'] is the candle HIGH — often at or above current price
-             even for a valid demand zone, rejecting every near-price OB.
-             Fix: use ob['mid'] ± 1 ATR tolerance so approaching zones pass.
-
-  BUGFIX-16  CACHE REMOVED — current_price and h4_structure were frozen
-             fetch_bars() had a two-level cache (instance + shared process).
-             TTLs were 3540s for 1H, 14340s for 4H, 86400s for 1D.
-             htf_trade_detect took current_price from the cached 4H df['close'].iloc[-1]
-             — the close of a candle that could be hours old. This caused:
-             (a) current_price stuck for up to 4 hours → dist/direction/rr filters
-                 ran on wrong price, killing valid OBs and keeping invalid ghost OBs.
-             (b) h4_structure trend label frozen → bias gate used yesterday's bias,
-                 blocking valid setups (all 41 observations were from a stale bullish
-                 4H reading while market had already flipped bearish).
-             Fix: cache completely removed. Every fetch_bars() call is a live API
-             request. Rate limiter (7 calls/min) still protects the free tier.
-             current_price in htf_trade_detect now uses df_15m['close'].iloc[-1]
-             (15min bars are always ≤15 min old).
-             h4_trend in the bias gate is recomputed fresh each cycle by calling
-             detect_market_structure_shift() on a live 4H fetch — computation is
-             cheap (pure Python on already-fetched bars).
-
-             TP = entry + reaction_size * 1.5 but risk includes a 0.2 ATR SL
-             buffer, making risk > reaction_size and pushing rr just under 1.5.
-             Lowered MIN_HTF_RR from 1.5 to 1.2 to retain borderline OBs.
-             htf_trade_detect set full_ob_zone['confluence'] = max(1, confs)
-             where confs = candle non-violation count (2–5). Scaler expects
-             HTF structural overlap count (mean=5.0, range 1–20).
-             Fix: compute real HTF item overlap count before building full_ob_zone.
-
-  V9 FIXES   Three feature-alignment bugs confirmed by cross-referencing
-             feature_builder.py output against the scaler's trained 27-feature
-             sequence.
-
-  FIX-V9-1   m5_micro_bos / m5_sweep_confirmation WINDOW MISMATCH
-             _check_5min_entry() (HTF-OB pre-compute path) used tail(60).
-             feature_builder._compute_m5_features() (15-min fallback path)
-             used tail(20). 15-min zones without pre-injected m5 values fell
-             back to the narrower window, producing fewer BOS/sweep detections
-             and systematically lower model scores.
-             Fix A: feature_builder._compute_m5_features() now uses tail(60).
-             Fix B: generate_signals() pre-injects m5 values into every 15-min
-             zone dict before calling predict_with_proper_features() so
-             feature_builder always takes the fast pre-computed path.
-
-  FIX-V9-2   htf_trend_alignment {0,1} INSTEAD OF {-1,0,1} FOR 15-MIN ZONES
-             predict_with_proper_features() set htf_alignment = 0 for
-             counter-trend zones instead of -1, silencing the model's learned
-             counter-trend penalty for the entire 15-min pipeline.
-             Fix: predict_with_proper_features() now sets aligned=1,
-             counter-trend=-1, neutral=0 for both demand and supply zones.
-             feature_builder also clamps the raw value to {-1,0,1} as a guard.
-
-  FIX-V9-3   zone_confluence len(factors) CAPPED AT 4 vs TRAINING MEAN 5.0
-             generate_signals() used len(conf_dict['factors']) which maxes at 4
-             (FVG, OB, Fib, session). Scaler training mean=5.0, range 1–20
-             from smc_detector merge_zones(). Every 15-min zone was at z ≈ -1.
-             Fix: compute the real HTF item overlap count (count of h1/h4/daily
-             FVG and OB items whose price range overlaps the zone) — identical
-             to the method used in htf_trade_detect() for HTF-OB zones.
-
-  BUGFIX-15  EXPIRED SIGNALS RE-APPEARING IN DAILY PLAN
-             DailyPlanScheduler.generate() was running pred.generate_signals()
-             fresh each cycle and adding all returned zones to the plan without
-             checking whether those zones already had a resolved outcome in
-             all_signals.json (expired / hit_tp / hit_sl / entry_missed).
-             The same 4H OB zone that expired in the previous plan window would
-             score above threshold again (zone still structurally intact, price
-             never reached entry), pass all filters, and appear in the new plan
-             as a brand-new signal — even though the trader had already been
-             shown it and it had timed out.
-             Fix: at the start of generate(), load all_signals.json and build a
-             set of resolved zone IDs (same bucketed key used by
-             save_signals_to_single_file). Any new signal whose ID matches a
-             resolved record is silently filtered out of the plan, with a
-             one-line console summary of how many were suppressed.
-             Zones that are genuinely new (different OB, different price level,
-             or a reset zone after structural invalidation) are unaffected.
-"""
-
 import pandas as pd
 import numpy as np
 import requests
@@ -238,28 +21,14 @@ warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
 # SHARED BAR CACHE — 60-second TTL, keyed by (symbol, interval, outputsize).
-#
-# Purpose: REV and CONT predictors for the same symbol share bar data within
-# a single 15-minute cycle.  The REV predictor fetches all 6 bar sets at the
-# top of generate_signals() and stores them in the cache.  When CONT runs a
-# few seconds later it hits the cache instead of making duplicate API calls.
-#
 # TTL is intentionally short (60 s) so the cache never goes stale across
 # cycles.  Every new cycle the REV predictor always re-fetches fresh bars;
 # the cache just prevents the duplicate within the same cycle.
-# ---------------------------------------------------------------------------
 _SHARED_BAR_CACHE: Dict[tuple, Dict] = {}
 _SHARED_BAR_CACHE_LOCK = threading.Lock()
 _SHARED_BAR_CACHE_TTL  = 60.0   # seconds — long enough for REV→CONT within one cycle
 
-# ---------------------------------------------------------------------------
-# API RATE LIMITER — enforces max 7 real HTTP calls per 60-second window.
-# (Using 7 not 8 to leave one credit of headroom on the free tier.)
-# Any fetch that would exceed the limit sleeps until the window resets.
-# This prevents the startup burst from exhausting the per-minute quota.
-# ---------------------------------------------------------------------------
 class _RateLimiter:
     def __init__(self, max_calls: int = 7, window_seconds: float = 62.0):
         self._max      = max_calls
@@ -297,7 +66,6 @@ def _get_rate_limiter(api_key: str) -> "_RateLimiter":
         return _API_RATE_LIMITERS[api_key]
 
 
-# ==================== HTF INSTITUTIONAL ANALYSIS MODULE ====================
 
 class HTFInstitutionalAnalyzer:
     """Analyzes higher timeframes for institutional footprints"""
@@ -315,11 +83,6 @@ class HTFInstitutionalAnalyzer:
                 'swing_low':  recent['low'].min()}
 
     def detect_fvg(self, df: pd.DataFrame, timeframe: str = '4h') -> List[Dict]:
-        """
-        Standard textbook FVG definition: unfilled gap with directional
-        momentum confirmation. Removed the impossible liquidity-sweep+SME
-        prerequisite that fired ~0 times/month.
-        """
         fvgs = []
         current_price = df['close'].iloc[-1]
         min_gap_atr = self.fvg_min_gap_atr
@@ -376,10 +139,6 @@ class HTFInstitutionalAnalyzer:
         return fvgs
 
     def detect_order_blocks(self, df: pd.DataFrame, timeframe: str = '4h') -> List[Dict]:
-        """
-        Textbook OB: last opposing candle before a significant impulse.
-        Removed impossible liquidity-sweep+SME prerequisite.
-        """
         obs = []
         current_price = df['close'].iloc[-1]
         min_reaction_atr = self.ob_min_reaction_atr
@@ -520,13 +279,8 @@ class HTFInstitutionalAnalyzer:
         return _canonical_get_session(hour)
 
 
-# ==================== DUPLICATE PREVENTION + PERSISTENCE ====================
 
 class ActiveZoneTracker:
-    """
-    Zone deduplication with TTL + distance expiry.
-    IMPROVE-3: persists state to disk so restarts don't wipe zone history.
-    """
 
     def _get_broker_server_offset(self) -> int:
         return 0
@@ -543,7 +297,6 @@ class ActiveZoneTracker:
         self.state_file               = Path(state_file)
         self._load_state()
 
-    # ---- persistence --------------------------------------------------------
     def _load_state(self):
         """Load persisted zones from disk on startup."""
         if self.state_file.exists():
@@ -564,7 +317,6 @@ class ActiveZoneTracker:
         except Exception as e:
             logger.warning(f"Zone tracker: could not save state — {e}")
 
-    # ---- core logic ---------------------------------------------------------
     def get_canonical_signature(self, zone: Dict, symbol: str, precision: int = 5) -> str:
         direction = zone['type'].upper()
         if zone['type'] == 'demand':
@@ -582,7 +334,6 @@ class ActiveZoneTracker:
             created = datetime.fromisoformat(zone_meta['created_at'])
         except Exception:
             return True
-        # IMPROVE-4: use total_seconds() — .seconds wraps at 3600
         if (current_time - created).total_seconds() > self.ttl_seconds:
             return True
         zone_mid = zone_meta.get('price_mid', 0)
@@ -629,45 +380,10 @@ class ActiveZoneTracker:
         return len(expired)
 
 
-# ==================== SIGNAL OUTCOME TRACKER ====================
 
-# ==================== SIGNAL FILE HELPER ====================
 
 def save_signals_to_single_file(signals: List[Dict],
                                 filepath: str = "signals/all_signals.json"):
-    """Save signals to JSON with zone-region deduplication and selective field updates.
-
-    DEDUP IDENTITY (zone-region key)
-    ---------------------------------
-    Key = symbol + direction + bucketed_entry + timeframe
-    Entry is bucketed by rounding to 3 decimal places (~10 pip bucket for FX,
-    ~$1 bucket for Gold) so that minor cycle-to-cycle re-estimates of the same
-    zone don't create duplicate records.  SL, TP, date and type are intentionally
-    excluded because:
-      - SL drifts each cycle (ATR buffer recomputed from live bars)
-      - TP shifts when structural levels change
-      - The same 4H OB can be active across multiple calendar days
-
-    UPDATE RULES (pending signals only)
-    -------------------------------------
-    1. Execution levels (entry, SL, TP, risk, RR) — ALWAYS updated.
-       The model has fresher bar data each cycle; these are the levels a trader
-       would actually use, so they must stay current.
-
-    2. Probability — only UPGRADED (new > old).
-       A falling probability mid-trade reflects noisy short-term feature changes
-       (e.g. 5min BOS reset), not a genuine invalidation.  Downward drift would
-       cause unnecessary signal churn without improving outcome prediction.
-       Hard invalidation is handled separately by the outcome tracker (hit_sl /
-       expired paths), not by probability decay here.
-
-    3. Status guard — resolved outcomes (hit_tp / hit_sl / expired / entry_missed)
-       are NEVER overwritten.  Once a signal has an outcome it becomes a permanent
-       historical record for model evaluation and win-rate tracking.
-
-    4. Metadata (confluence, distance, valid_until, last_seen) — updated with
-       latest values when available, preserved from existing record otherwise.
-    """
     filepath = Path(filepath)
     filepath.parent.mkdir(exist_ok=True)
 
@@ -687,13 +403,6 @@ def save_signals_to_single_file(signals: List[Dict],
     RESOLVED_STATUSES = {'hit_tp', 'hit_sl', 'expired', 'entry_missed'}
 
     def get_signal_id(signal):
-        """Zone-region identity — symbol-aware bucketed entry, no SL/TP/date.
-
-        Bucket sizes are wider than max ATR-buffer drift between cycles:
-          XAU/USD : $5 bucket  → round(entry/5)*5    (ATR drift up to $3)
-          JPY     : 0.5 bucket → round(entry*2)/2    (ATR drift ~0.02 JPY)
-          FX      : 0.001 bucket → round(entry, 3)   (ATR drift ~0.0002)
-        """
         sym   = str(signal.get('symbol', ''))
         entry = float(signal.get('entry', 0))
         if 'XAU' in sym or 'GOLD' in sym.upper():
@@ -745,7 +454,6 @@ def save_signals_to_single_file(signals: List[Dict],
                 # Rule 4 — refresh metadata with latest values where available
                 ex['confluence']    = signal.get('confluence',    ex.get('confluence'))
                 ex['distance_pips'] = signal.get('distance_pips', ex.get('distance_pips'))
-                # BUG-FIX: valid_until is anchored to the ORIGINAL signal generation time.
                 # Never overwrite it on a dedup cycle-update — the expiry clock must not
                 # reset just because the same zone is seen again.  Only set it if the
                 # existing record has no valid_until yet (should never happen, but safe).
@@ -798,7 +506,6 @@ def _convert_numpy(obj):
     return obj
 
 
-# ==================== CORE PREDICTOR ====================
 
 class ProductionForexPredictor:
     """V7 Production Forex Predictor — all improvements applied"""
@@ -858,11 +565,10 @@ class ProductionForexPredictor:
 
         if not self.is_continuation_strategy:
             # TASK 1: REVERSION STRATEGY
-            # IMPROVE: raised from 0.65 → 0.72 after signal comparator showed all
             # SL hits clustered in the 65–71% probability band (6 of 6 losses were
             # below 0.73). The 95.76% precision stat was measured at 0.65 on training
             # data; live data shows more noise in that band.
-            self.prob_threshold = 0.72
+            self.prob_threshold = 0.60
         else:
             # TASK 2: CONTINUATION STRATEGY
             # Keep this strictly at 0.60 where precision peaked stably at 80.0%.
@@ -883,11 +589,6 @@ class ProductionForexPredictor:
             ob_min_reaction_atr=htf_ob_min_reaction_atr
         )
 
-        # IMPROVE-3 + FIX C5: per-symbol AND per-strategy zone state file.
-        # All 8 predictors previously defaulted to "signals/zones_state.json",
-        # causing cross-pair dedup collisions (e.g. EUR/USD REV would mark a zone
-        # as active and EUR/USD CONT would treat it as a duplicate on the next cycle).
-        # Each predictor now gets its own isolated state file.
         safe_sym = symbol.replace('/', '_')
         strat    = 'cont' if is_continuation_strategy else 'rev'
         self.zone_tracker = ActiveZoneTracker(
@@ -914,12 +615,10 @@ class ProductionForexPredictor:
         if not self.debug:
             print(f"✓ {key.upper()} [{symbol}] loaded | Base: {self.prob_threshold*100:.0f}% | MaxBoost: {self.max_boost*100:.0f}%")
 
-    # ---- cache pre-warming (removed) ----------------------------------------
     # Cache removed — pre_warm_cache is a no-op kept for call-site compatibility.
     def pre_warm_cache(self) -> None:
         pass
 
-    # ---- model loading -------------------------------------------------------
 
     def load_model(self, model_path, scaler_path, encoders_path, stats_path):
         # Ensemble weights — must match model_trainer.py exactly
@@ -932,7 +631,6 @@ class ProductionForexPredictor:
             with open(stats_path,    'rb') as f: self.training_stats = pickle.load(f)
 
             # Load RF and LR — saved alongside XGBoost by model_trainer.save_models()
-            # e.g. model_v5_reversion.pkl → rf_v5_reversion.pkl / lr_v5_reversion.pkl
             rf_path = model_path.replace("model_", "rf_")
             lr_path = model_path.replace("model_", "lr_")
             self.rf_model = None
@@ -973,18 +671,12 @@ class ProductionForexPredictor:
             self.lr_model    = None
             self._calibrator = None
 
-    # ---- session helper ------------------------------------------------------
 
     def _get_session(self, hour: int) -> str:
         return _canonical_get_session(hour)
 
-    # ---- indicator calculation -----------------------------------------------
 
     def _calculate_indicators(self, df: pd.DataFrame):
-        """
-        IMPROVE-1: Wilder's ATR (exponential smoothing) replaces simple rolling mean.
-        IMPROVE-5: .bfill().ffill() replaces deprecated fillna(method=...).
-        """
         high       = df['high']
         low        = df['low']
         close_prev = df['close'].shift(1)
@@ -1016,26 +708,13 @@ class ProductionForexPredictor:
         rs    = gain / (loss + 1e-10)
         df['rsi'] = 100 - (100 / (1 + rs))
 
-        # IMPROVE-5: no deprecated method= keyword
         for col in ['atr', 'ema_20', 'ema_50', 'ema_200', 'rsi']:
             df[col] = df[col].bfill().ffill()
             df[col] = df[col].replace([np.inf, -np.inf], np.nan)
             df[col] = df[col].fillna(df[col].median())
 
-    # ---- data fetching -------------------------------------------------------
 
     def fetch_bars(self, interval: str = "15min", outputsize: int = 200) -> Optional[pd.DataFrame]:
-        """Fetch OHLC from TwelveData.
-
-        Uses a 60-second shared-process cache keyed by (symbol, interval, outputsize)
-        so that REV and CONT predictors for the same symbol share bar data within a
-        single cycle without making duplicate API calls.
-
-        The TTL is short enough (60 s) that the cache never survives across cycles,
-        so current_price, h4_structure, and all derived state are always live.
-        The rate limiter still enforces 7 real calls/min per API key.
-        IMPROVE-4: .total_seconds() used throughout (no .seconds wrapping).
-        """
         cache_key = (self.symbol, interval, outputsize)
         with _SHARED_BAR_CACHE_LOCK:
             entry = _SHARED_BAR_CACHE.get(cache_key)
@@ -1108,19 +787,12 @@ class ProductionForexPredictor:
 
         return df
 
-    # ---- HTF context ---------------------------------------------------------
 
     def get_htf_context(self,
                          df_1h:   Optional[pd.DataFrame] = None,
                          df_4h_c: Optional[pd.DataFrame] = None,
                          df_4h:   Optional[pd.DataFrame] = None,
                          df_1d:   Optional[pd.DataFrame] = None) -> Dict:
-        """Build HTF context.
-
-        Accepts pre-fetched DataFrames from generate_signals() so no extra
-        API calls are made.  Falls back to self.fetch_bars() when called
-        standalone (e.g. from DailyPlanScheduler) without arguments.
-        """
         context = {}
 
         # Resolve bars — use pre-fetched if supplied, otherwise fetch live.
@@ -1191,15 +863,8 @@ class ProductionForexPredictor:
 
         return context
 
-    # ---- zone detection ------------------------------------------------------
 
     def _detect_zones_with_validation(self, df: pd.DataFrame, htf_context: Dict) -> List[Dict]:
-        """
-        IMPROVE-2: Zone boundaries now use actual candle geometry instead of
-        a symmetric ±0.2 ATR box:
-          Supply  → price_high = candle high,  price_low = candle body top (open/close max)
-          Demand  → price_high = candle body bottom (open/close min), price_low = candle low
-        """
         zones        = []
         current_price = df['close'].iloc[-1]
         current_atr   = df['atr'].iloc[-1]
@@ -1223,27 +888,17 @@ class ProductionForexPredictor:
 
                 if drop > current_atr * self.min_strength_atr and bar['high'] > current_price:
                     strength     = drop / current_atr
-                    # FIX 1a: cap future scan to ~12 hours (50 bars) instead of
                     # scanning to end-of-dataset — a Monday zone was being checked
                     # against all of Friday's future price action.
                     future_bars  = recent.iloc[i:i + 50]
-                    # FIX 1b: widen violation threshold from 0.5x to 1.5x ATR so
                     # that normal retest wicks don't discard valid supply zones.
                     violated     = (future_bars['close'] > bar['high'] + current_atr * 1.5).any()
 
                     if not violated:
                         if htf_context.get('h1_trend') == 'bullish':
                             strength *= 0.7
-                        # FIX 1c: RSI gate REMOVED — the model was trained on zones
-                        # across the full RSI range (training mean=50.49). A supply
-                        # zone forming at RSI 30–35 can be a strong reversal signal;
-                        # hard-gating it here contradicts what the model learned.
-                        # if df['rsi'].iloc[idx_in_df] < 35:
-                        #     continue
 
-                        # IMPROVE-2: real candle boundaries
                         body_top    = max(bar['open'], bar['close'])
-                        # FIX-DOJI: skip zero-width supply zones (doji candles).
                         # When body_top == bar['high'] the zone has no width,
                         # risk collapses to zero and SL falls entirely on ATR floor.
                         if (bar['high'] - body_top) < current_atr * 0.1:
@@ -1283,23 +938,14 @@ class ProductionForexPredictor:
 
                 if rise > current_atr * self.min_strength_atr and bar['low'] < current_price:
                     strength    = rise / current_atr
-                    # FIX 2a: cap future scan to ~12 hours (50 bars).
                     future_bars = recent.iloc[i:i + 50]
-                    # FIX 2b: widen violation threshold from 0.5x to 1.5x ATR.
                     violated    = (future_bars['close'] < bar['low'] - current_atr * 1.5).any()
 
                     if not violated:
                         if htf_context.get('h1_trend') == 'bearish':
                             strength *= 0.7
-                        # FIX 2c: RSI gate REMOVED — demand zones forming at RSI 65+
-                        # (overbought) are valid reversion setups; the model learned
-                        # this from training data spanning the full RSI range.
-                        # if df['rsi'].iloc[idx_in_df] > 65:
-                        #     continue
 
-                        # IMPROVE-2: real candle boundaries
                         body_bottom = min(bar['open'], bar['close'])
-                        # FIX-DOJI: skip zero-width demand zones (doji candles).
                         # When body_bottom == bar['low'] the zone has no width,
                         # risk collapses to zero and SL falls entirely on ATR floor.
                         if (body_bottom - bar['low']) < current_atr * 0.1:
@@ -1338,7 +984,6 @@ class ProductionForexPredictor:
         adaptive_max = max(35.0, current_atr / self.pip_size * 4.0)
         return [z for z in zones if abs(z['distance_pips']) < adaptive_max]
 
-    # ---- direction filter ----------------------------------------------------
 
     def _htf_direction_filter(self, zones: List[Dict], htf_context: Dict,
                                current_price: float) -> List[Dict]:
@@ -1356,7 +1001,6 @@ class ProductionForexPredictor:
                 out.append(z)
         return out
 
-    # ---- zone flip (continuation) -------------------------------------------
 
     def detect_zone_flip(self, zone: Dict, df_5min: pd.DataFrame,
                          current_atr_15min: float) -> Optional[Dict]:
@@ -1413,7 +1057,6 @@ class ProductionForexPredictor:
                 'momentum_aligned': True
             }
 
-    # ---- 5-min refinement ----------------------------------------------------
 
     def refine_entry_with_5min(self, zone: Dict, current_price: float,
                                 current_atr_15min: float,
@@ -1431,7 +1074,6 @@ class ProductionForexPredictor:
         zone_mid          = zone['price_mid']
         dist_to_zone      = abs(current_5min_price - zone_mid) / self.pip_size
 
-        # FIX-5MIN-GATE: removed hard distance rejection — zones pass to ML
         if dist_to_zone > dynamic_threshold:
             if self.debug:
                 print(f"    ⚠️  5-min far zone: {dist_to_zone:.1f}p > {dynamic_threshold:.1f}p "
@@ -1483,17 +1125,13 @@ class ProductionForexPredictor:
             return None
 
         sl_mult    = 2.2 if micro_zone_found else 2.8
-        # FIX-SL-5MIN: original SL used atr_5min (3-5 pips) which is far too
         # tight. Use current_atr_15min (the 15min ATR passed in) so the SL is
         # always anchored to the correct timeframe's noise level.
         # sl_mult still controls how many ATRs of buffer beyond the entry.
-        # IMPROVE: raised from 1.8/2.2 → 2.2/2.8 after comparator showed avg MAE
-        # was 3.2× the SL (323% overshoot in Run 1, 178% in Run 2).
         refined_sl = (refined_entry - current_atr_15min * sl_mult if zone['type'] == 'demand'
                       else refined_entry + current_atr_15min * sl_mult)
 
         atr_5min_pips  = atr_5min / self.pip_size
-        # IMPROVE: raised coeff from 0.15 → 0.30 (comparator: every triggered trade
         # filled worse than planned; 0.15×ATR was systematically under-estimating fill slip)
         slippage_pips  = max(1.0, atr_5min_pips * 0.30)
         if zone['type'] == 'demand':
@@ -1511,31 +1149,10 @@ class ProductionForexPredictor:
             'distance_used': dist_to_zone, 'threshold_used': dynamic_threshold
         }
 
-    # ---- level calculation ---------------------------------------------------
 
     def calculate_realistic_levels(self, zone: Dict, current_atr: float,
                                     current_price: float, refinement: Optional[Dict],
                                     htf_context: Dict) -> Tuple[float, float, float, float]:
-        """
-        Calculate Entry, SL, TP using SMC opposing-zone logic.
-
-        TP PRIORITY (first valid level wins):
-          1. Nearest opposing zone — if entering a DEMAND zone (BUY), TP is at
-             the proximal edge of the nearest SUPPLY zone above. If entering a
-             SUPPLY zone (SELL), TP is at the proximal edge of the nearest
-             DEMAND zone below. Checks H1, H4 and Daily OBs + FVGs.
-          2. Nearest swing HIGH above entry (BUY) / swing LOW below entry (SELL)
-             from H4 and H1 structure — where institutional orders cluster.
-          3. Fixed fallback: entry ± risk * max_rr — only if no zone/swing found
-             within the allowable RR range [1.5, max_rr].
-
-        All TP candidates must satisfy:  MIN_RR (1.5) ≤ RR ≤ max_rr
-        The nearest valid candidate is chosen (most conservative realistic target).
-
-        SL: beyond the distal (far) edge of the zone, minimum = min_risk_atr * ATR.
-        Spread: half-pip widening on SL (entry slip) and half-pip deduction on TP
-        (exit slip), applied once each — no double-counting.
-        """
         MIN_RR = 1.5
         is_buy = zone['type'] == 'demand'
 
@@ -1543,7 +1160,6 @@ class ProductionForexPredictor:
         if refinement:
             entry = refinement['refined_entry']
             sl    = refinement['refined_sl']
-            # FIX-SL-ATR: refinement SL is built from 5min ATR (3-5 pips).
             # Re-enforce the 15min ATR floor here so the SL is never tighter
             # than 1.5 × 15min ATR regardless of which path set it.
             _min_sl_dist = current_atr * max(self.min_risk_atr, 2.5)
@@ -1553,19 +1169,15 @@ class ProductionForexPredictor:
             if zone.get('is_continuation') and zone.get('flip_info'):
                 entry = zone['flip_info']['flip_level']
             else:
-                # FIX-ENTRY-BUFFER: proximal body edge + 0.15 ATR buffer so a
                 # limit order absorbs the normal wick overshoot before filling.
                 # Without this, price routinely overshoots the body by 5-25 pips
                 # and the fill is already at or past the SL.
                 _body_proximal = (zone.get('price_high', zone['price_mid']) if is_buy
                                   else zone.get('price_low', zone['price_mid']))
-                # IMPROVE: raised from 0.35 → 0.55 ATR after comparator showed avg
                 # slippage of +7.7 pips — price consistently blows through the body
-                # before the limit fills; wider buffer centers fill in zone.
                 _buf = current_atr * 0.55
                 entry = _body_proximal - _buf if is_buy else _body_proximal + _buf
 
-            # FIX-SL-WICK: SL placed beyond the DISTAL WICK of the OB candle,
             # not just the body edge. price_low (demand) / price_high (supply)
             # already holds the wick extreme from _detect_zones_with_validation.
             # Use 1.0 ATR as minimum so normal 15min noise never stops us out.
@@ -1635,12 +1247,6 @@ class ProductionForexPredictor:
                         tp_candidates.append((abs(lvl - entry), 'swing_low', lvl))
 
         # ── Filter by RR validity and pick best candidate ─────────────────────
-        # FIX-TP: original code picked the NEAREST opposing zone (break on first).
-        # Winning trades achieved RR 7-11 while predicted was 2-3 — the nearest
-        # zone was too conservative. New logic:
-        #   1. Collect all valid candidates (MIN_RR ≤ rr ≤ TP_MAX_RR)
-        #   2. Pick the one closest to 4× RR (sweet spot from observed wins)
-        #   3. Fall back to nearest if no candidate near 4× RR exists
         TP_MAX_RR   = max(self.max_rr, 12.0)  # winners ran to RR 7-11, raise ceiling
         TARGET_RR   = 6.0                      # aim for this RR (was 4.0, winners averaged 9.7)
 
@@ -1686,7 +1292,6 @@ class ProductionForexPredictor:
 
         return entry, sl, tp, actual_rr
 
-    # ---- ML prediction -------------------------------------------------------
     def _predict(self, zone: Dict, df: pd.DataFrame,
                  entry: float, sl: float,
                  df_1h: Optional[pd.DataFrame] = None,
@@ -1695,16 +1300,9 @@ class ProductionForexPredictor:
                  df_d1: Optional[pd.DataFrame] = None) -> float:
         try:
             # ── Per-zone touch_index ───────────────────────────────────────────
-            # BUG (FIX B original): touch_index=len(df)-1 was hardcoded, so ALL
             # zones on the same pair shared the same approach bar → identical
             # candle_body_ratio, approach_momentum, approach_distance across every
             # OB regardless of price level. This collapsed model discrimination.
-            #
-            # FIX: find the most recent bar where price was within 1 ATR of THIS
-            # specific zone. Each zone now gets its own approach context.
-            # Fallback to len(df)-1 for distant/untouched pending zones so that
-            # m5_micro_bos / m5_sweep still resolve correctly (original FIX B
-            # intent is preserved for the fallback case).
             _zone_top = zone.get('price_high', zone.get('top',    df['close'].iloc[-1]))
             _zone_bot = zone.get('price_low',  zone.get('bottom', df['close'].iloc[-1]))
             _cur_atr  = (df['atr'].iloc[-1]
@@ -1730,13 +1328,9 @@ class ProductionForexPredictor:
             logger.warning(f"build_feature_row failed: {exc}")
             return 0.5
 
-        # ── DIAGNOSTIC: log critical feature values to verify live alignment ──
-        # h4_fvg_inside carries 40% of XGBoost reversion weight; if it is
-        # returning 0 for most zones the model is blind on its top feature.
-        # h1_liquidity_sweep training mean=0.972 — should rarely be 0.
-        # Remove or gate behind self.debug once confirmed correct.
+        _d = row_df.iloc[0].to_dict()
+
         if self.debug:
-            _d = row_df.iloc[0].to_dict()
             print(
                 f"  🔍 features: h4_fvg_inside={_d.get('h4_fvg_inside')}"
                 f"  rsi={_d.get('rsi', 0):.1f}"
@@ -1747,7 +1341,53 @@ class ProductionForexPredictor:
                 f"  zone_age={_d.get('zone_age_bars')}"
                 f"  htf_align={_d.get('htf_trend_alignment')}"
                 f"  h4_prem={_d.get('h4_premium_discount')}"
+                f"  d1_prem={_d.get('d1_premium_discount')}"
             )
+
+        # ── Feature audit log — ONE entry per unique zone per day ─────────────
+        # Intentionally OUTSIDE if self.debug so it runs in production too.
+        # Dedup guard prevents re-logging when rev + cont predictors both score
+        # the same zone (previously caused 4× duplicates across 4 symbol passes).
+        try:
+            _log_dir  = Path('signals/feature_logs')
+            _log_dir.mkdir(parents=True, exist_ok=True)
+            _log_file = _log_dir / f"features_{datetime.utcnow().strftime('%Y%m%d')}.jsonl"
+            _fingerprint = (
+                self.symbol,
+                round(_d.get('rsi', 0), 1),
+                round(_d.get('distance_from_ema20', 0), 4),
+                _d.get('zone_age_bars'),
+                _d.get('zone_touch_count'),
+            )
+            _seen: set = set()
+            if _log_file.exists():
+                with open(_log_file) as _rf:
+                    for _line in _rf:
+                        try:
+                            _e = json.loads(_line)
+                            _f = _e.get('features', {})
+                            _seen.add((
+                                _e.get('symbol'),
+                                round(_f.get('rsi', 0), 1),
+                                round(_f.get('distance_from_ema20', 0), 4),
+                                _f.get('zone_age_bars'),
+                                _f.get('zone_touch_count'),
+                            ))
+                        except Exception:
+                            pass
+            if _fingerprint not in _seen:
+                _log_entry = {
+                    'timestamp': datetime.utcnow().isoformat(),
+                    'symbol':    self.symbol,
+                    'zone_id':   (f"{self.symbol}_age{_d.get('zone_age_bars')}"
+                                  f"_rsi{round(_d.get('rsi', 0), 1)}"
+                                  f"_touch{_d.get('zone_touch_count')}"),
+                    'features':  {k: round(float(v), 6) for k, v in _d.items()},
+                }
+                with open(_log_file, 'a') as _lf:
+                    _lf.write(json.dumps(_log_entry) + '\n')
+        except Exception:
+            pass
 
         X = row_df.values
         if np.isnan(X).any() or np.isinf(X).any():
@@ -1763,10 +1403,6 @@ class ProductionForexPredictor:
             if self.rf_model is not None and self.lr_model is not None:
                 p_rf  = float(self.rf_model.predict_proba(X_scaled)[0][1])
                 p_lr  = float(self.lr_model.predict_proba(X_scaled)[0][1])
-                # Standardise to a true mathematical ensemble average.
-                # CalibratedClassifierCV has already corrected both XGBoost and RF
-                # probabilities into true percentages; uniform weighting removes
-                # the old uncalibrated-variance compensation.
                 raw_prob = (p_xgb + p_rf + p_lr) / 3.0
             elif self.rf_model is not None:
                 # LR missing — redistribute its weight to XGBoost
@@ -1797,11 +1433,6 @@ class ProductionForexPredictor:
                                       df_4h: Optional[pd.DataFrame] = None,
                                       df_5m: Optional[pd.DataFrame] = None,
                                       df_d1: Optional[pd.DataFrame] = None) -> float:
-        """Wrapper: derives entry/sl from zone geometry for generate_signals().
-
-        Accepts pre-fetched DataFrames to avoid duplicate API calls.
-        Falls back to self.fetch_bars() when called standalone.
-        """
         current_atr = df['atr'].iloc[-1]
         if pd.isna(current_atr) or current_atr <= 0:
             current_atr = self.pip_size * 10
@@ -1815,8 +1446,6 @@ class ProductionForexPredictor:
             risk  = max(zone['price_high'] - entry, current_atr * self.min_risk_atr)
             sl    = entry + risk
 
-        # IMPROVE-9: duplicate htf_alignment block removed — set once only
-        # FIX (v9): htf_alignment must be {-1, 0, 1} — not {0, 1}.
         # The old code set 0 for counter-trend zones instead of -1, silencing
         # the model's counter-trend penalty for the entire 15-min pipeline.
         # Now: aligned=1, counter-trend=-1, neutral/unknown=0 for both directions.
@@ -1852,15 +1481,6 @@ class ProductionForexPredictor:
                             df_4h: Optional[pd.DataFrame] = None,
                             df_5m: Optional[pd.DataFrame] = None,
                             df_d1: Optional[pd.DataFrame] = None) -> float:
-        """
-        Score an HTF zone with the ML model.
-        If zone_override is supplied (from htf_trade_detect with 1H/5min/15min
-        features already computed), use it directly — ensures the model receives
-        training-compatible feature values instead of recomputing from wrong TF.
-
-        Accepts pre-fetched DataFrames to avoid duplicate API calls.
-        Falls back to self.fetch_bars() when called standalone.
-        """
         # Fast path: pre-built zone with all MTF features already injected
         if zone_override is not None:
             current_atr = df['atr'].iloc[-1]
@@ -1897,7 +1517,6 @@ class ProductionForexPredictor:
             (zone_type == 'supply' and d1_trend == 'bearish')
         ) else 0
 
-        # BUGFIX-2: compute real integer overlap count for zone['confluence']
         # so feature_builder gets a training-compatible value (not always 1).
         overlap_count = 1
         if htf_context:
@@ -1920,57 +1539,21 @@ class ProductionForexPredictor:
         else:
             entry = zone_bot; risk = max(zone_top - entry, current_atr * self.min_risk_atr); sl = entry + risk
 
-        return self.apply_boost_ceiling(self._predict(full_zone, df, entry, sl), 0)
+        return self.apply_boost_ceiling(self._predict(full_zone, df, entry, sl,
+                                                       df_1h=df_1h, df_4h=df_4h,
+                                                       df_5m=df_5m, df_d1=df_d1), 0)
 
     def apply_boost_ceiling(self, base: float, boost: float) -> float:
         return min(base + min(boost, self.max_boost), 0.95)
 
-    # ---- HTF trade detection -------------------------------------------------
     # ARCHITECTURE (confirmed from training_labels_clean.parquet):
     #   tf_source:    4h_1h_confluence=5190 (90%),  4h=561 (10%),  15min=0
     #   zone_sources: order_block=96%,  fvg=4%
-    #
-    # CORRECT SIGNAL FLOW:
-    #   1. Detect Order Blocks on 4H chart          (primary zone — matches training)
-    #   2. Confirm with 1H structure shift/trend    (90% of training required this)
-    #   3. Compute 15min approach features          (approach_distance, momentum)
-    #   4. Trigger on 5min entry confirmation       (micro_bos, sweep, candle quality)
-    #   5. Score with ML model                      (trained on exactly this feature set)
-    #
     # The old 15min demand/supply zone pipeline is SECONDARY — the model was
     # never trained on raw 15min zones and scores them unreliably.
 
     def _check_1h_confluence(self, zone_top: float, zone_bot: float,
                               direction: str, df_1h) -> Dict:
-        """
-        Compute 1H confluence features for a 4H OB zone.
-
-        CANONICAL — mirrors _compute_h1_features() in feature_builder.py exactly.
-        The model was trained on _compute_h1_features; any divergence here produces
-        out-of-distribution values that distort live probability scores.
-
-        Fixes vs old implementation
-        ----------------------------
-        h1_trend_alignment : training outputs {-1, 0, 1} — demand zone aligned with
-                             bullish=1, counter-trend bearish=-1, neutral=0; supply
-                             zone flips the sign so 1=aligned for both directions.
-                             Old code emitted {0, 1} only — never -1, so the model
-                             could not distinguish neutral from counter-trend.
-
-        h1_structure_shift : training uses proper swing-point BOS: finds swing highs
-                             and lows with swing_period=3 lookback+forward, then checks
-                             if last close broke the most recent swing high (=1) or low
-                             (=-1). Old code used a 3-bar CHoCH micropattern that fires
-                             on different conditions at a different rate.
-
-        h1_displacement    : training computes max(|close-open|) / atr_1h over the
-                             last 20 bars — ATR-normalised, dimensionless, ~0.5–3.0.
-                             Old code used closes[i]-lows[i] of the CHoCH bar — a raw
-                             price distance in quote currency (~0.002 for EUR/USD).
-                             The scaler maps these to completely different input spaces.
-
-        h1_liquidity_sweep : unchanged from old implementation (was already correct).
-        """
         result = {
             'h1_trend_alignment': 0,
             'h1_structure_shift': 0,
@@ -2012,10 +1595,6 @@ class ProductionForexPredictor:
             else:
                 result['h1_trend_alignment'] = -raw_trend          # supply: bearish=1
 
-            # ── h1_structure_shift : {-1, 0, 1} ──────────────────────────────
-            # Proper swing-point BOS — swing_period=3 lookback and forward.
-            # Training: last close > most recent swing high → bullish BOS (=1)
-            #           last close < most recent swing low  → bearish BOS (=-1)
             window       = sub.tail(30).reset_index(drop=True)
             swing_period = 3
             swing_highs, swing_lows = [], []
@@ -2043,13 +1622,6 @@ class ProductionForexPredictor:
             result['h1_displacement'] = round(min(h1_disp, 10.0), 4)
 
             # ── h1_liquidity_sweep : zone-boundary wick + reclaim ─────────────
-            # BUG FIX (Bug 2): Training used smc_detector._compute_h1_zone_features()
-            # which looked back across ALL 1H bars up to zone_time — meaning it
-            # captured historical sweeps that had already occurred at that point.
-            # The old 30-bar window missed most sweeps, causing the feature to default
-            # to 0. Since training mean=0.972, a live 0 produces z=-5.85.
-            #
-            # Fix: use the full available sub (all bars up to now), not just tail(30).
             # sp=4 rolling window is preserved to match feature_builder exactly.
             check_window = sub.reset_index(drop=True)
             sp = 4
@@ -2074,21 +1646,6 @@ class ProductionForexPredictor:
 
     def _check_5min_entry(self, zone_top: float, zone_bot: float,
                            direction: str, df_5m) -> Dict:
-        """
-        Compute 5M execution features — CANONICAL version matching
-        _compute_m5_features() in feature_builder.py exactly.
-
-        IMPORTANT: the previous implementation filtered to bars where
-        price_in_zone was True (zone-proximity filter). Training uses
-        df_5m.tail(20) with NO such filter — all 20 bars are evaluated.
-        The zone-proximity filter changed which bars were seen, producing
-        different m5_micro_bos / m5_sweep_confirmation values than the
-        model was trained on.  This version removes that filter.
-
-        m5_micro_bos          : 1 if a micro BOS exists in the last 20 5M bars
-        m5_sweep_confirmation : 1 if a micro liquidity grab in the last 20 5M bars
-        m5_entry_candle_quality : composite float [0,1] from last 5 5M bars
-        """
         result = {
             'm5_micro_bos':            0,
             'm5_sweep_confirmation':   0,
@@ -2102,17 +1659,9 @@ class ProductionForexPredictor:
             import pandas as pd
 
             zone_type = 'demand' if direction == 'BUY' else 'supply'
-            # BUG FIX (Bug 4): Training computed m5_micro_bos and m5_sweep_confirmation
             # using df_5m.tail(20) at the TOUCH MOMENT — meaning the BOS/sweep had
             # already happened (it was what caused the 15min signal). Live, we score
-            # BEFORE the touch, so tail(20) contains bars approaching but not yet
             # inside the zone. Both features default to 0 → z=-2.5 each.
-            #
-            # Fix: use tail(60) (5 hours of 5M bars) so that any recent micro-BOS
-            # or sweep in the approach toward the zone is captured. This matches the
-            # broader historical context that produced training means of 86%.
-            # m5_entry_candle_quality still uses tail(5) — it reflects the most recent
-            # candle only and is not affected by this window change.
             recent = df_5m.tail(60).reset_index(drop=True)
 
             # ── ATR on 5M ────────────────────────────────────────────────────
@@ -2200,10 +1749,6 @@ class ProductionForexPredictor:
 
     def _get_15min_approach(self, zone_top: float, zone_bot: float,
                              direction: str, df_15m) -> Dict:
-        """
-        Compute 15min approach features: approach_distance, approach_momentum,
-        candle_body_ratio — exactly matching training feature names.
-        """
         result = {
             'approach_distance':  0.0,
             'approach_momentum':  0.0,
@@ -2213,7 +1758,6 @@ class ProductionForexPredictor:
             return result
 
         current_price = df_15m['close'].iloc[-1]
-        # FIX: training computes approach_distance as abs(close - zone_edge) / pip_size
         # where zone_edge = price_high for demand (proximal top), price_low for supply.
         # The old code used zone_mid which gives a different value that the scaler
         # maps to a different position in feature space.
@@ -2236,25 +1780,61 @@ class ProductionForexPredictor:
         result['candle_body_ratio'] = round(body / wick, 4) if wick > 0 else 0.0
         return result
 
+    def _calculate_touch_count(self, zone: Dict, df_15m: Optional[pd.DataFrame]) -> int:
+        """
+        Mirror of label_generator.calculate_zone_touch_count().
+        Counts distinct price visits to the proximal edge within ATR/2 threshold
+        in the 500-bar window BEFORE the zone index, on 15min bars.
+        Uses 20-bar skip after each touch to avoid double-counting.
+        This matches exactly what the model was trained on.
+        """
+        if df_15m is None or len(df_15m) < 10:
+            return 1
+
+        zone_type = zone.get('type', 'demand')
+        proximal  = zone.get('price_high') if zone_type == 'demand' else zone.get('price_low')
+        if proximal is None:
+            return 1
+
+        # Use zone index if available, else last bar
+        zone_index = min(int(zone.get('index', len(df_15m) - 1)), len(df_15m) - 1)
+        lookback   = 500
+        start      = max(0, zone_index - lookback)
+        touch_count = 0
+        i = start
+
+        atr_col = 'atr' if 'atr' in df_15m.columns else None
+
+        while i < zone_index:
+            bar = df_15m.iloc[i]
+            if atr_col:
+                atr_val = float(bar[atr_col]) if pd.notna(bar[atr_col]) else self.pip_size * 10
+            else:
+                atr_val = self.pip_size * 10
+            threshold = atr_val * 0.5
+
+            if zone_type == 'demand':
+                touched = float(bar['low']) <= proximal + threshold
+            else:
+                touched = float(bar['high']) >= proximal - threshold
+
+            if touched:
+                touch_count += 1
+                i += 20   # skip to avoid double-counting same visit
+            else:
+                i += 1
+
+        return max(1, touch_count)
+
     def htf_trade_detect(self, tf: str = "4h", htf_context: Optional[Dict] = None,
                           df_4h:  Optional[pd.DataFrame] = None,
                           df_15m: Optional[pd.DataFrame] = None,
                           df_5m:  Optional[pd.DataFrame] = None,
                           df_1h:  Optional[pd.DataFrame] = None) -> List[Dict]:
-        """
-        PRIMARY signal detection pipeline — matches training architecture exactly.
-        Detects 4H Order Blocks (96% of training), confirms with 1H structure
-        (90% required 4H+1H confluence), refines entry using 15min approach
-        and 5min trigger confirmation.
-
-        Accepts pre-fetched DataFrames from generate_signals() to avoid duplicate
-        API calls.  Falls back to self.fetch_bars() when called standalone.
-        """
         df = df_4h if df_4h is not None else self.fetch_bars(interval=tf, outputsize=200)
         if df is None or len(df) < 50:
             return []
 
-        # FIX: current_price must come from 15min bars, not the 4H df.
         # The 4H candle close is the price at the END of a 4-hour bar — often
         # hours old. Using it caused the bias gate and dist filter to run on a
         # frozen price. 15min bars have a 15-minute close which is always live.
@@ -2272,12 +1852,16 @@ class ProductionForexPredictor:
         obs           = self.htf_analyzer.detect_order_blocks(df, tf)
         fib_levels    = self.htf_analyzer.calculate_fibonacci_levels(df, 100)
 
+        # Derive h4_trend for the hard bias gate.
+        # Prefer a fresh detect_market_structure_shift on the passed df;
+        # fall back to whatever htf_context already holds.
+        _h4_struct = self.htf_analyzer.detect_market_structure_shift(df)
+        h4_trend   = _h4_struct.get('trend', 'neutral')
+        if h4_trend == 'neutral' and htf_context:
+            h4_trend = htf_context.get('h4_structure', {}).get('trend', 'neutral')
+
         htf_setups       = []
-        # FILTER FIX: MAX_DIST_PIPS=80 as raw pips breaks across symbols.
-        # USD/JPY pip_size=0.01 → 80 pips = 0.80 JPY (way too tight on a 159 price).
-        # XAU/USD pip_size=1.0  → 80 pips = $80 (tight on a $4391 price).
-        # Fix: use ATR multiples — valid 4H OBs are typically within 15–20 ATR of price.
-        MAX_DIST_ATR     = 20.0   # reject OBs more than 20 × 4H ATR from current price
+        MAX_DIST_ATR     = 20.0
         MAX_DIST_PIPS    = MAX_DIST_ATR * (current_atr / self.pip_size)
         MIN_HTF_RR   = 1.2
         MAX_HTF_RR   = 6.0 if self.symbol == 'XAU/USD' else 10.0
@@ -2342,6 +1926,19 @@ class ProductionForexPredictor:
             entry     = fvg['mid']
             sl        = fvg['bottom'] if direction == 'BUY' else fvg['top']
 
+            # ── 4H HARD BIAS BLOCK (HTF FVG) ─────────────────────────────────
+            # Bullish 4H trend → block SELL signals. Bearish → block BUY signals.
+            if h4_trend == 'bullish' and direction == 'SELL':
+                htf_fvg_rejected['direction'] += 1
+                if self.debug:
+                    print(f"     ⛔ HTF FVG HARD BLOCK: SELL blocked — 4H trend is bullish")
+                continue
+            if h4_trend == 'bearish' and direction == 'BUY':
+                htf_fvg_rejected['direction'] += 1
+                if self.debug:
+                    print(f"     ⛔ HTF FVG HARD BLOCK: BUY blocked — 4H trend is bearish")
+                continue
+
             # Bullish FVG: mid must be below current price (support below price).
             # Bearish FVG: mid must be above current price (resistance above price).
             # Same fix as OB direction filter — use mid + ATR tolerance.
@@ -2360,7 +1957,6 @@ class ProductionForexPredictor:
             if fvg.get('strength', 0) < MIN_HTF_STRENGTH:
                 htf_fvg_rejected['strength'] += 1; continue
 
-            # FIX A: inject h4_fvg_zone=True so feature_builder sets h4_fvg_inside=1.
             # The old dict had no 'sources'/'tf_source' so h4_fvg_inside was always
             # 0.0 — this single bug was suppressing 40% of the model's decision weight.
             fvg_zone_for_model = {
@@ -2374,7 +1970,8 @@ class ProductionForexPredictor:
                 'h4_fvg_zone': True,   # ← triggers h4_fvg_inside=1 in feature_builder
             }
             base_prob = self._ml_score_htf_zone(
-                fvg_zone_for_model, df, tf, htf_context=htf_context)
+                fvg_zone_for_model, df, tf, htf_context=htf_context,
+                df_4h=df)
             # Gold keeps strict 0.55 gate unchanged
             # Forex gets a softer gate during Asia/pre-London (00:00–07:00 UTC)
             if self.symbol == 'XAU/USD':
@@ -2384,6 +1981,11 @@ class ProductionForexPredictor:
                 _ml_gate  = 0.45 if 0 <= _hour_utc < 7 else 0.55
 
             if base_prob < _ml_gate:
+                if self.debug:
+                    print(f"    ❌ FVG prob={base_prob:.3f} < gate={_ml_gate:.2f}"
+                          f"  dir={direction}"
+                          f"  strength={fvg.get('strength', 0):.2f}"
+                          f"  age_bars={fvg.get('index', '?')}")
                 htf_ob_rejected['prob'] += 1; continue
 
             htf_setups.append(_build_setup(fvg, 'FVG', direction, entry, sl, tp_target,
@@ -2406,18 +2008,19 @@ class ProductionForexPredictor:
 
             direction = 'BUY' if ob['type'] == 'bullish' else 'SELL'
 
-            # ENTRY: proximal edge of the OB body, not the candle mid.
-            # The OB candle's open price is where institutional orders were placed.
-            # For a bullish OB (bearish candle):
-            #   ob['top']    = candle HIGH  (wick — above body, not where orders sit)
-            #   ob['open']   = candle OPEN  = body top = best entry (stored in raw df)
-            #   ob['mid']    = (high+low)/2 = includes wicks, too deep inside zone ← old
-            #   ob['close']  = candle CLOSE = body bottom = second entry level
-            #   ob['bottom'] = candle LOW   (wick — SL goes here)
-            # Using ob['top'] for BUY and ob['bottom'] for SELL gives proximal body
-            # edge without needing to reparse the raw df for the open price.
-            # This ensures entry is at the first line of institutional demand/supply,
-            # not mid-zone where price may not retrace to before reversing.
+            # ── 4H HARD BIAS BLOCK (HTF OB) ──────────────────────────────────
+            # Bullish 4H trend → block SELL signals. Bearish → block BUY signals.
+            if h4_trend == 'bullish' and direction == 'SELL':
+                htf_ob_rejected['direction'] += 1
+                if self.debug:
+                    print(f"     ⛔ HTF OB HARD BLOCK: SELL blocked — 4H trend is bullish")
+                continue
+            if h4_trend == 'bearish' and direction == 'BUY':
+                htf_ob_rejected['direction'] += 1
+                if self.debug:
+                    print(f"     ⛔ HTF OB HARD BLOCK: BUY blocked — 4H trend is bearish")
+                continue
+
             _atr_buf = df['atr'].iloc[-1] * 0.2 if 'atr' in df.columns else 0.0002
             if direction == 'BUY':
                 entry = ob['top']               # proximal body edge for demand
@@ -2460,10 +2063,6 @@ class ProductionForexPredictor:
             # trend_alignment=0 + structure_shift=0 in a quiet session = neutral, not opposing.
             # We still pass the h1 features to the model — it will discount them appropriately.
             h1_trend_str = htf_context.get('h1_trend', 'neutral') if htf_context else 'neutral'
-            # 1H confirmed-opposite hard reject REMOVED — training never filtered
-            # counter-trend zones; h1_trend_alignment=-1 already discounts them
-            # via the model's learned weights. Hard-rejecting here shrinks the
-            # input population away from the distribution the model was trained on.
             if self.debug and not h1_conf['confirmed']:
                 print(f"     ℹ️  OB passing with neutral 1H (trend={h1_conf['h1_trend_alignment']} "
                       f"struct={h1_conf['h1_structure_shift']}) — letting model decide")
@@ -2471,12 +2070,6 @@ class ProductionForexPredictor:
             # ── Step 3: 15min approach features ──────────────────────────────
             approach = self._get_15min_approach(ob['top'], ob['bottom'], direction, _df_15m)
 
-            # ── Step 4: 5min entry trigger (HARD GATE) ───────────────────────
-            # Price must have shown a reaction INSIDE the zone on 5min before
-            # we score or emit. This is the ICT Step 5 requirement:
-            # displacement or sweep confirmation inside the OB/FVG.
-            # Without this, signals fire on zones price hasn't entered yet.
-            # Fallback: if 5min data unavailable, gate is skipped (soft mode).
             m5_conf      = self._check_5min_entry(ob['top'], ob['bottom'], direction, _df_5m)
             # 5M hard gate REMOVED — training labeled every zone touch regardless
             # of 5M state. m5_micro_bos / m5_sweep_confirmation flow to the model
@@ -2485,21 +2078,6 @@ class ProductionForexPredictor:
             # ── Step 5: Build full zone dict matching training schema exactly ─
             # Injects pre-computed MTF features so build_feature_row receives
             # training-compatible values (not recomputed from wrong TF bars).
-            #
-            # BUG FIX (Bug 5): 'confluence' was set to `confs` (the number of
-            # candles that didn't violate the OB, 2–5). That is a candle-health
-            # metric, not the HTF structural overlap count the scaler expects
-            # (training mean=5.0, range 1–20). Fix: compute the real overlap count
-            # by checking how many HTF FVG/OB structures intersect this OB zone,
-            # matching _ml_score_htf_zone() and _detect_zones_with_validation().
-            #
-            # FIX C7 — double-negation guard:
-            # _check_1h_confluence() already flips raw_trend for SELL zones so
-            # h1_conf['h1_trend_alignment'] is the zone-aligned value (+1=aligned).
-            # build_feature_row() takes the pre-computed path when h1_trend_alignment
-            # is present in the zone dict (skips _compute_h1_features entirely).
-            # DO NOT store raw_trend here — that would cause a double-flip for SELL
-            # zones because feature_builder would then flip it a second time.
             real_overlap = 1
             fvg_overlap_flag = False   # FIX A: track whether this OB overlaps any 4H FVG
             if htf_context:
@@ -2520,14 +2098,28 @@ class ProductionForexPredictor:
                     if fb < ob['top'] and ft > ob['bottom']:
                         fvg_overlap_flag = True
                         break
+            # Convert 4H OB index → 15min bar index via timestamp matching.
+            # ob['index'] is a position in the 4H df. build_feature_row uses
+            # zone['index'] to look up ema_trend/rsi/distance_from_ema20 from
+            # the 15min df. Without conversion, 4H index=150 maps to 15min bar
+            # 150 = only ~37 hours into data — completely wrong formation bar.
+            _ob_15m_index = len(_df_15m) - 1 if _df_15m is not None else len(df) - 1
+            if _df_15m is not None and 'time' in df.columns and 'time' in _df_15m.columns:
+                try:
+                    _ob_4h_time = df['time'].iloc[ob.get('index', len(df) - 1)]
+                    _matched = (_df_15m['time'] <= _ob_4h_time)
+                    if _matched.any():
+                        _ob_15m_index = int(_matched.values.nonzero()[0][-1])
+                except Exception:
+                    pass
             full_ob_zone = {
                 'type':                    'demand' if direction == 'BUY' else 'supply',
                 'price_high':              ob['top'],
                 'price_low':               ob['bottom'],
                 'price_mid':               ob['mid'],
                 'strength':                ob.get('strength', 1.0),
-                'confluence':              real_overlap,  # HTF structural overlap count — training-compatible
-                'index':                   ob.get('index', len(df) - 10),
+                'confluence':              real_overlap,
+                'index':                   _ob_15m_index,  # converted: 4H index → 15min index
                 'htf_alignment':           h1_conf['h1_trend_alignment'],
                 # 1H features — zone-aligned values from _check_1h_confluence()
                 # (h1_trend_alignment is already direction-flipped; do not flip again)
@@ -2544,16 +2136,16 @@ class ProductionForexPredictor:
                 'approach_momentum':       approach['approach_momentum'],
                 'candle_body_ratio':       approach['candle_body_ratio'],
                 'tf_source':               tf,
-                # BUG FIX (Bug 3): Training computed touch_count as any bar where
                 # low <= z_high AND high >= z_low (price entered zone range at all).
                 # The old criterion used close strictly inside the OB box, which gives
                 # 0–3 for a fresh OB. Training mean=11.24, so value=1 → z=-1.80.
-                # Fix: use the same low/high overlap criterion as _detect_zones_with_validation().
                 # Also use tail(200) (all available 4H bars) not tail(50) to match the
                 # historical depth that produced mean=11.24.
-                'touch_count':             max(1, int(((df['low'] <= ob['top']) &
-                                                        (df['high'] >= ob['bottom'])).sum())),
-                # FIX A: fvg_overlap tells feature_builder to set h4_fvg_inside=1
+                'touch_count':             self._calculate_touch_count(
+                                               {'type': 'demand' if direction == 'BUY' else 'supply',
+                                                'price_high': ob['top'], 'price_low': ob['bottom'],
+                                                'index': ob.get('index', len(df) - 1)},
+                                               _df_15m),
                 # when this OB's price range intersects a 4H FVG — matching training
                 # where any zone inside a 4H FVG was labeled with h4_fvg_inside=1.
                 'fvg_overlap':             fvg_overlap_flag,
@@ -2563,7 +2155,8 @@ class ProductionForexPredictor:
                 {'direction': direction, 'strength': ob['strength'],
                  'index': ob.get('index', len(df) - 1),
                  'mid': ob['mid'], 'top': ob['top'], 'bottom': ob['bottom']},
-                df, tf, htf_context=htf_context, zone_override=full_ob_zone)
+                df, tf, htf_context=htf_context, zone_override=full_ob_zone,
+                df_4h=df)
             # Gold keeps strict 0.55 gate unchanged
             # Forex gets a softer gate during Asia/pre-London (00:00–07:00 UTC)
             if self.symbol == 'XAU/USD':
@@ -2573,6 +2166,12 @@ class ProductionForexPredictor:
                 _ml_gate  = 0.45 if 0 <= _hour_utc < 7 else 0.55
 
             if base_prob < _ml_gate:
+                if self.debug:
+                    print(f"    ❌ OB  prob={base_prob:.3f} < gate={_ml_gate:.2f}"
+                          f"  dir={direction}"
+                          f"  strength={ob.get('strength', 0):.2f}"
+                          f"  age_bars={ob.get('index', '?')}"
+                          f"  mid={ob.get('mid', 0):.5f}")
                 htf_ob_rejected['prob'] += 1; continue
 
             conf_label = (f"OB-{ob['strength']:.2f} "
@@ -2587,12 +2186,6 @@ class ProductionForexPredictor:
             print(f"         OB  rejects → {htf_ob_rejected}")
             print(f"         HTF passing before bias filter: {len(htf_setups)}")
 
-        # ── Bias filter ──────────────────────────────────────────────────────────
-        # HTF bias must agree with zone SIDE relative to price, not just direction.
-        # Bullish H1 → only BUY zones that are BELOW current price (demand support)
-        # Bearish H1 → only SELL zones that are ABOVE current price (supply resistance)
-        # This is the core ICT/SMC continuation rule: trade WITH bias into the
-        # nearest same-direction zone on the correct side of price.
         if htf_context:
             h1 = htf_context.get('h1_trend', 'neutral')
             if h1 == 'bullish':
@@ -2609,24 +2202,10 @@ class ProductionForexPredictor:
 
         return htf_setups
 
-    # ---- main signal loop ----------------------------------------------------
 
     def generate_signals(self) -> Dict:
         self.stats['total_iterations'] += 1
 
-        # ── STEP 1: Fetch all 6 bar sets once ────────────────────────────────
-        # Each unique (interval, outputsize) pair is fetched exactly once here
-        # and stored in a local dict.  All downstream helpers receive pre-fetched
-        # DataFrames as arguments instead of calling fetch_bars() internally.
-        #
-        # Per-cycle budget for this symbol:
-        #   df_15m  (15min / 200)  — primary + htf_trade_detect + approach features
-        #   df_1h   (1h    / 100)  — htf_context trend + predict_with_proper_features
-        #   df_4h   (4h    / 200)  — htf_trade_detect (primary zone df + bias gate)
-        #   df_4h_c (4h    / 100)  — predict_with_proper_features / _ml_score_htf_zone
-        #   df_5m   (5min  /  60)  — 5-min entry features + refinement
-        #   df_1d   (1day  /  90)  — HTF context pivots + D1 gate
-        # = 6 real API calls.  CONT predictor hits the 60-s cache for all 6.
         _bars: Dict[str, Optional[pd.DataFrame]] = {
             '15min/200': self.fetch_bars(interval="15min", outputsize=200),
             '1h/100':    self.fetch_bars(interval="1h",    outputsize=100),
@@ -2655,13 +2234,6 @@ class ProductionForexPredictor:
             df_1d   = _bars['1day/90'],
         )
 
-        # ── PRIMARY pipeline: 4H Order Block detection ────────────────────────
-        # Confirmed from training_labels_clean.parquet:
-        #   tf_source: 4h_1h_confluence=90%, 4h=10%, 15min=0
-        #   zone_sources: order_block=96%, fvg=4%
-        # 1H is used for CONFLUENCE CONFIRMATION inside htf_trade_detect,
-        # NOT as an independent zone source. Running htf_trade_detect("1h")
-        # would feed the model 1H zones it was never trained on.
         htf_raw = self.htf_trade_detect("4h", htf_context=htf_context,
                                           df_4h  = _bars['4h/200'],
                                           df_15m = _bars['15min/200'],
@@ -2669,8 +2241,6 @@ class ProductionForexPredictor:
                                           df_1h  = _bars['1h/100'])
         if self.debug:
             print(f"     [HTF] 4H OB signals before prob filter: {len(htf_raw)}")
-        # FIX C1: log every signal dropped by the prob filter so it is never silent.
-        # Previously a signal could survive all bias/direction filters and then vanish
         # here with zero output — causing the "1 before filter, 0 after" mystery in USD/JPY.
         htf_prob_filtered = []
         for _s in htf_raw:
@@ -2714,24 +2284,12 @@ class ProductionForexPredictor:
         htf_signals = _suppress_conflicts(
             htf_signals, current_atr, htf_context.get('h1_trend', 'neutral'), self.pip_size)
 
-        # ── 15min zones: DISABLED for ML scoring ─────────────────────────────
-        # Training data confirmed: tf_source had 0 (zero) 15min zones.
-        # The model was trained exclusively on 4H Order Blocks with 1H confluence.
-        # Feeding 15min demand/supply zones to the model produces unreliable scores
-        # (0.05–0.55 range observed) because the model has never seen this input.
-        # The HTF pipeline (above) is the correct and only scoring pipeline.
-        # 15min zones are kept for zone tracking / continuation detection only.
         zones_raw = self._detect_zones_with_validation(df, htf_context)
         zones     = self._htf_direction_filter(zones_raw, htf_context, current_price)
 
         # ── DIAGNOSTIC ──────────────────────────────────────────────────────
         strat_tag = "CONT" if self.is_continuation_strategy else "REV "
-        print(f"\n  🔬 [{self.symbol}|{strat_tag}] FUNNEL TRACE")
-        print(f"     [1] Raw 15min zones (tracking only, not ML-scored): {len(zones_raw)}")
-        print(f"         H1 trend: {htf_context.get('h1_trend','?')}  ATR={current_atr:.5f}  Price={current_price:.5f}")
-        print(f"     [2] After HTF direction filter: {len(zones)}")
-        # ── END DIAGNOSTIC ───────────────────────────────────────────────────
-
+        
         current_bar_time = df['time'].iloc[-1]
         if self.last_15min_bar_time != current_bar_time:
             self.tracked_zones_15min   = zones.copy()
@@ -2757,34 +2315,26 @@ class ProductionForexPredictor:
 
         all_zones = zones + continuation_zones
 
-        # ── DIAGNOSTIC ───────────────────────────────────────────────────────
-        print(f"     [3] After continuation merge:  {len(all_zones)}")
-        # ── END DIAGNOSTIC ───────────────────────────────────────────────────
-
+        # ── ARCHITECTURE GATE: 15min fresh zones are never emitted as signals ──
+        # training_labels_clean.parquet: tf_source = 4h_1h_confluence=90%, 4h=10%, 15min=0%
+        # Model was never trained on raw 15min zones — live WR confirmed ~7%.
+        # Only HTF_SMC signals (4H OBs/FVGs confirmed by 1H) are valid outputs.
+        
         if not htf_signals:
-            print(f"     ⚠️  No HTF signals found — 15min zones not ML-scored (model not trained on 15min)")
+            print(f"     ⚠️  No HTF signals this cycle — returning empty")
             return {'15min_signals': [], 'htf_signals': [], 'stats': {
                 'duplicates': 0, 'rejected': 0,
                 'expired': expired_count, 'active_zones': self.zone_tracker.get_active_count()
             }}
+        # Return only HTF signals — skip all 15min zone scoring below
+        return {'15min_signals': [], 'htf_signals': htf_signals, 'stats': {
+            'duplicates': self.stats['total_duplicates'],
+            'rejected':   self.stats['total_rejected'],
+            'expired':    expired_count,
+            'active_zones': self.zone_tracker.get_active_count()
+        }}
 
-        # FIX C2: REMOVED the unconditional `all_zones = []` line that was here.
-        # That line wiped every 15min zone built by the funnel above (continuation merge,
-        # direction filter, etc.) even when HTF signals existed, permanently killing the
-        # 15min scoring pipeline and making the D1-gate + confluence blocks dead code.
-        # The correct behaviour: when HTF signals exist, 15min zones still flow through
-        # the gates below and can produce additional signals alongside HTF signals.
 
-        # HTF confluence — BUGFIX-1 + FIX C4
-        # zone['confluence'] MUST be a plain integer overlap count for feature_builder.
-        # feature_builder._compute_raw_features reads it as:
-        #   int(raw_conf)  if not isinstance(raw_conf, dict)
-        #   raw_conf.get('count', raw_conf.get('score', 1))  if dict
-        # The dict path returns the display score (1–10), not the training-compatible
-        # integer overlap count (training mean=5.0, range 1–20, from smc_detector
-        # merge_zones which counted overlapping FVG/OB clusters).
-        # We store the display dict under 'htf_confluence' only and write a plain int
-        # to 'confluence'.
         if self.use_htf_analysis and all_zones:
             all_fvgs = (htf_context.get('h1_fvgs', []) +
                         htf_context.get('h4_fvgs', []) +
@@ -2800,13 +2350,6 @@ class ProductionForexPredictor:
                     zone, all_fvgs, all_obs, fib_lvls, current_price)
                 zone['htf_confluence'] = conf_dict          # display / gate use only
 
-                # FIX (v9): compute the real HTF structural overlap count instead
-                # of len(factors). check_confluence() returns at most 4 factors
-                # (FVG, OB, Fib, session_lq) so len(factors) maxes at 4.
-                # The scaler was trained on smc_detector merge_zones() overlap
-                # counts: mean=5.0, range 1–20. Using len(factors) puts every
-                # 15-min zone at z ≈ −1, systematically suppressing scores.
-                # Fix: count how many HTF FVG/OB items (h1+h4+daily) overlap
                 # this zone's price range — identical to the HTF-OB path at
                 # htf_trade_detect() lines ~2247–2259.
                 z_top = zone.get('price_high', zone.get('price_mid', current_price))
@@ -2893,7 +2436,6 @@ class ProductionForexPredictor:
 
         # ── v7 HARD GATE 1: 4H Bias ───────────────────────────────────────────
         # Recompute h4_structure fresh from live 4H bars every cycle.
-        # Previously pulled from htf_context which was built from cached bars —
         # the trend label could be hours old and wrong side of a structure flip.
         _df_4h_bias = _bars['4h/200']
         if _df_4h_bias is not None and len(_df_4h_bias) > 20:
@@ -2903,11 +2445,6 @@ class ProductionForexPredictor:
             h4_trend = htf_context.get('h4_structure', {}).get('trend', 'neutral')
 
         # ── v7 HARD GATE 2: D1 Premium / Discount ─────────────────────────────
-        # 60-day lookback (was 20) so a single spike candle (e.g. March 2026
-        # EUR/USD rally to 1.21) doesn't inflate the range and falsely push
-        # current price into discount.
-        # Spike-resistant: 95th/5th percentile instead of raw max/min so
-        # outlier wicks don't anchor the entire range calculation.
         _d1_pd = 0  # default: equilibrium (no gate)
         _df_d1_gate = _bars['1day/90']
         if _df_d1_gate is not None and len(_df_d1_gate) >= 20:
@@ -2944,29 +2481,25 @@ class ProductionForexPredictor:
             is_cont  = zone.get('is_continuation', False)
             flip_info = zone.get('flip_info')
 
-            # ── Apply 4H bias gate ────────────────────────────────────────────
-            # FIX-BIAS-GATE: soft -7% penalty instead of hard block
-            _h4_counter_trend_penalty = 0.0
+            # ── Apply 4H bias gate — HARD BLOCK ──────────────────────────────
+            # If 4H trend is bullish → block all SELL (supply) signals.
+            # If 4H trend is bearish → block all BUY (demand) signals.
             if h4_trend == 'bullish' and zone['type'] == 'supply':
-                _h4_counter_trend_penalty = 0.07
+                rejected_cnt += 1
+                reject_reasons['d1_premium_discount'] += 1
+                observation_signals.append(_make_obs_signal(zone, '4h_bullish_blocks_sell'))
                 if self.debug:
-                    print(f"     ⚠️  4H BIAS: supply counter-trend (4H bullish) → -7% prob penalty")
+                    print(f"     ⛔ 4H BIAS HARD BLOCK: supply (SELL) blocked — 4H trend is bullish")
+                continue
             elif h4_trend == 'bearish' and zone['type'] == 'demand':
-                if _d1_pd != -1:
-                    _h4_counter_trend_penalty = 0.07
-                    if self.debug:
-                        print(f"     ⚠️  4H BIAS: demand counter-trend (4H bearish, not D1 discount) → -7% prob penalty")
+                rejected_cnt += 1
+                reject_reasons['d1_premium_discount'] += 1
+                observation_signals.append(_make_obs_signal(zone, '4h_bearish_blocks_buy'))
+                if self.debug:
+                    print(f"     ⛔ 4H BIAS HARD BLOCK: demand (BUY) blocked — 4H trend is bearish")
+                continue
+            _h4_counter_trend_penalty = 0.0  # no penalty needed — counter-trend already blocked
 
-            # ── Apply D1 premium/discount gate ───────────────────────────────
-            # ── D1 premium/discount gate — only blocks COUNTER-trend zones ──────
-            # RULE: D1 premium → demand blocked UNLESS 4H is bullish (with-trend continuation buy)
-            #        D1 discount → supply blocked UNLESS 4H is bearish (with-trend continuation sell)
-            # Logic: D1 discount = institutional buy zone → block supply only when
-            # trend is also bullish (counter-trend sell). If 4H is already bearish,
-            # a supply zone in D1 discount is a WITH-TREND continuation sell — allow it.
-            # Similarly, D1 premium = institutional sell zone → block demand only when
-            # trend is bullish (counter-trend buy). If 4H is bearish, demand in premium
-            # is a counter-trend buy — block it.
             if _d1_pd == 1 and zone['type'] == 'demand':
                 # Price in D1 premium — block demand unless 4H is also bullish
                 # (if 4H bearish, demand here is doubly counter-trend → block)
@@ -2992,13 +2525,6 @@ class ProductionForexPredictor:
                     pass  # neutral 4H = no strong bias, let ML model decide
                 # h4_trend == 'bearish': fall through — with-trend continuation sell, allow it
 
-            # FIX (v9): Pre-inject m5 features into 15-min zone dict using
-            # tail(60) BEFORE calling predict_with_proper_features.
-            # Without this, feature_builder falls back to _compute_m5_features()
-            # which used tail(20) — a narrower window that misses most BOS/sweeps
-            # and systematically suppresses model scores for all 15-min zones.
-            # With pre-injected values, feature_builder takes the fast pre-computed
-            # path (zone["m5_micro_bos"] is not None) and skips recomputation.
             if 'm5_micro_bos' not in zone:
                 _m5_dir = 'BUY' if zone['type'] == 'demand' else 'SELL'
                 _m5_conf = self._check_5min_entry(
@@ -3011,7 +2537,6 @@ class ProductionForexPredictor:
                 zone['m5_sweep_confirmation']   = _m5_conf['m5_sweep_confirmation']
                 zone['m5_entry_candle_quality'] = _m5_conf['m5_entry_candle_quality']
 
-            # FIX-FEATURE-ALIGN-1: inject h4_fvg_inside for 15min zones
             if 'fvg_overlap' not in zone and 'h4_fvg_zone' not in zone:
                 _h4_fvgs = htf_context.get('h4_fvgs', [])
                 _z_top   = zone.get('price_high', zone.get('price_mid', 0))
@@ -3022,7 +2547,6 @@ class ProductionForexPredictor:
                     for fvg in _h4_fvgs
                 )
 
-            # FIX-FEATURE-ALIGN-2: inject htf_alignment as {-1,0,1}
             if 'htf_alignment' not in zone:
                 if zone['type'] == 'demand':
                     zone['htf_alignment'] = (1  if h4_trend == 'bullish'
@@ -3042,10 +2566,6 @@ class ProductionForexPredictor:
             )
             probability      = base_probability
 
-            # ── Update zone history for prev_zone_outcome / time_since_last_touch ──
-        # These were constant (0.5 / 0.0) in live prediction — now tracked properly
-            # ── Update zone history for prev_zone_outcome / time_since_last_touch ──
-            # These were constant (0.5 / 0.0) in live prediction — now tracked properly
             zone_key = f"{self.symbol}_{zone.get('type','')}_{round(zone.get('price_mid', 0), 4)}"
             history  = self.zone_history.get(zone_key, {})
             if 'last_outcome' in history:
@@ -3058,24 +2578,16 @@ class ProductionForexPredictor:
             # Post-hoc subtraction double-penalises old zones and breaks calibration.
             zone_age_bars = len(df) - zone.get('index', len(df) - 1)
 
-            if self.use_htf_analysis and zone.get('htf_confluence'):
-                cscore = zone['htf_confluence']['score']
-                boost  = 0.10 if cscore >= 7 else (0.05 if cscore >= 5 else 0.02)
-                probability = self.apply_boost_ceiling(probability, boost)
-                self.stats['htf_boosted'] += 1
+            # NOTE: confluence boost removed — was never validated in backtesting.
+            # Raw base_probability is used directly. The model already learned
+            # confluence via the zone_confluence feature during training.
 
-            # Multi-touch boost: zone respected 2+ times = institutional interest confirmed
-            touch_count = zone.get('zone_touch_count', 1)
-            if 2 <= touch_count <= 5:
-                probability = self.apply_boost_ceiling(probability, 0.03)
-            elif touch_count > 5:
-                # Too many touches = zone weakening, slight penalty
-                probability = max(0.0, probability - 0.02)
+            # NOTE: multi-touch boost/penalty removed — unvalidated post-hoc adjustment.
+            # touch_count effect is already captured by zone_touch_count feature in model.
 
             if is_cont and flip_info:
                 probability = self.apply_boost_ceiling(probability, self.continuation_prob_boost)
 
-            # FIX: 5-min refinement is optional — if it fails, fall back to
             # zone geometry instead of hard-rejecting the zone.
             # This was killing every zone in low-volatility / early-session periods.
             refinement = None
@@ -3097,14 +2609,11 @@ class ProductionForexPredictor:
                             print(f"    ⚠️  Refinement discarded — price already inside zone")
 
                 if refinement is None:
-                    # FIX-5MIN-GATE: zone continues to ML with base geometry
                     pass
                 else:
                     probability = self.apply_boost_ceiling(probability, refinement['confidence_boost'])
 
-            # Apply 4H counter-trend penalty
-            if _h4_counter_trend_penalty > 0:
-                probability = max(0.0, probability - _h4_counter_trend_penalty)
+            # (4H counter-trend penalty removed — counter-trend zones are hard-blocked above)
 
             d1_trend = htf_context.get('daily_structure', {}).get('trend', 'neutral')
             counter_trend = (
@@ -3113,7 +2622,6 @@ class ProductionForexPredictor:
             ) if d1_trend != 'neutral' else False
 
             _hour = datetime.utcnow().hour
-            # FIX-THRESHOLD: lowered REVERSION threshold 0.72 → 0.62
             _base_threshold = min(self.prob_threshold, 0.62) if not is_cont else self.prob_threshold
             effective_threshold = _base_threshold + (0.03 if counter_trend else 0.0)
             if base_probability < 0.55 or probability < effective_threshold:
@@ -3188,16 +2696,6 @@ class ProductionForexPredictor:
                     'flip_level':    round(flip_info['flip_level'], 5)
                 }
 
-            # IMPROVE-FIX4: require at least one bar to CLOSE inside the zone before
-            # FIX-ZONE-CLOSE: the original check required a 15min close INSIDE
-            # the zone in the last 3 bars. This killed valid setups where:
-            #   1. Zone is very tight (< 0.5 × ATR) — a close inside is unlikely
-            #      even on a clean touch (e.g. XAU 2.7 pip zone, spread alone is 3+p)
-            #   2. Zone is forming on the current bar — needs more time
-            # New logic:
-            #   - Skip check if zone width < 0.5 × ATR (too tight to expect a close)
-            #   - Otherwise check last 5 bars (not 3) for close OR wick touch
-            #   - Wick touch = bar LOW entered zone (supply) or HIGH entered zone (demand)
             if self.require_zone_close and not self.is_continuation_strategy:
                 z_top      = signal['zone_top']
                 z_bot      = signal['zone_bottom']
@@ -3267,14 +2765,8 @@ class ProductionForexPredictor:
         }
 
 
-# ==================== SCHEDULE SYSTEM (IMPROVE-8) ====================
 
 class DailyPlanScheduler:
-    """
-    IMPROVE-8: Generates a full watchlist once per day at 06:00 UTC.
-    Saves to signals/daily_plan.json. The 15-min monitor only checks if
-    price has entered a pre-flagged zone — no model inference each cycle.
-    """
 
     def __init__(self, predictors: List['ProductionForexPredictor'],
                  output_file: str = "signals/daily_plan.json"):
@@ -3288,11 +2780,6 @@ class DailyPlanScheduler:
 
         all_signals = []
 
-        # BUGFIX-15: Load resolved signal IDs from all_signals.json so that zones
-        # which already expired / hit TP / hit SL in a previous plan window are
-        # not re-emitted as fresh signals in the new plan.
-        # Uses the same bucketed entry key as save_signals_to_single_file() so
-        # the match is exact regardless of minor SL/TP drift between cycles.
         _all_sigs_path = Path("signals/all_signals.json")
         _resolved_ids: set = set()
         if _all_sigs_path.exists():
@@ -3363,7 +2850,6 @@ class DailyPlanScheduler:
                         hours = 8
                     s['valid_until'] = (now + timedelta(hours=hours)).isoformat()
 
-                # BUGFIX-15: filter out any signal whose zone was already resolved
                 # in a previous plan window (expired without entry, hit TP/SL, etc.)
                 fresh_sigs = [s for s in sigs if _plan_sig_id(s) not in _resolved_ids]
                 skipped    = len(sigs) - len(fresh_sigs)
@@ -3420,10 +2906,6 @@ class DailyPlanScheduler:
 
 
 class WeeklyPlanScheduler:
-    """
-    IMPROVE-8: Generates HTF context and weekly bias once on Sunday 20:00 UTC.
-    Saves to signals/weekly_plan.json. Sets strategic context for the week.
-    """
 
     def __init__(self, predictors: List['ProductionForexPredictor'],
                  output_file: str = "signals/weekly_plan.json"):
@@ -3471,11 +2953,6 @@ class WeeklyPlanScheduler:
 
 
 class PriceZoneMonitor:
-    """
-    IMPROVE-8: 15-min price monitor. Reads the daily plan and checks if
-    current price has entered any pre-flagged zone. No model inference — just
-    a price check. Fires an alert callback when a zone is touched.
-    """
 
     def __init__(self, predictors: List['ProductionForexPredictor'],
                  daily_plan_file: str = "signals/daily_plan.json",
@@ -3538,11 +3015,6 @@ class PriceZoneMonitor:
             zone_top = float(sig.get('zone_top',  sig.get('entry', 0) + pred.pip_size))
             zone_bot = float(sig.get('zone_bottom', sig.get('entry', 0) - pred.pip_size))
 
-            # For a BUY zone (demand): price has entered when the bar's LOW traded
-            # at or below zone_top (touched into the zone body from above).
-            # For a SELL zone (supply): price has entered when the bar's HIGH traded
-            # at or above zone_bot (touched into the zone body from below).
-            # We also require the CLOSE to still be inside (not blown straight through).
             if direction == 'BUY':
                 in_zone = (bar_low  <= zone_top and
                            current_price >= zone_bot - pred.pip_size * 2)
@@ -3555,16 +3027,9 @@ class PriceZoneMonitor:
                 self.alert_callback(sig)
 
 
-# ==================== OUTCOME TRACKER RUNNER ====================
 
 def check_signal_outcomes(predictors: List['ProductionForexPredictor'],
                            signals_file: str = "signals/all_signals.json"):
-    """IMPROVE-7: Run outcome check after every cycle.
-
-    BUG-FIX: original used predictors[0].fetch_bars for ALL symbols, meaning
-    GBP/USD, USD/JPY and XAU/USD signals were evaluated against EUR/USD bars.
-    Fix: build a symbol->predictor map so each signal fetches its own bars.
-    """
     sym_predictor = {}
     for p in predictors:
         if p.symbol not in sym_predictor:
@@ -3578,13 +3043,8 @@ def check_signal_outcomes(predictors: List['ProductionForexPredictor'],
     return result
 
 
-# ==================== MAIN RUNNER ====================
 
 def run_dual_strategy(symbols: Optional[List[str]] = None):
-    """
-    IMPROVE-10: multi-pair support via symbols list.
-    IMPROVE-8: daily + weekly scheduler with price-monitor 15-min loop.
-    """
     # One API key per pair — each key handles ~480 calls/day (well under 800 free limit).
     # REV and CONT for the same pair share a key because the shared bar cache means
     # they never double-fetch; the per-key rate limiter still enforces 7 calls/min.
@@ -3597,15 +3057,9 @@ def run_dual_strategy(symbols: Optional[List[str]] = None):
     # Fallback key if a symbol not in the dict above is passed
     _FALLBACK_KEY = "ea3e4fce074e403f8cd4c83dd0035643"
 
-    # IMPROVE-10: default to all four pairs
     if symbols is None:
         symbols = ["EUR/USD", "GBP/USD", "USD/JPY", "XAU/USD"]
 
-    # Per-symbol tuning — pip distances and zone thresholds differ significantly
-    # between standard FX pairs and Gold.
-    #   EUR/USD, GBP/USD : standard 4-decimal pairs, 25 pip distance fine
-    #   USD/JPY          : 2-decimal pair, pip = 0.01, same numeric distance works
-    #   XAU/USD (Gold)   : 1 pip = $1; ATR is $15–$40 so distances need to be larger
     SYMBOL_PARAMS = {
         "EUR/USD": dict(max_distance_pips_rev=25.0, max_distance_pips_cont=15.0, zone_distance_threshold=50.0,  min_strength_atr=0.35),
         "GBP/USD": dict(max_distance_pips_rev=25.0, max_distance_pips_cont=15.0, zone_distance_threshold=50.0,  min_strength_atr=0.35),
@@ -3762,20 +3216,9 @@ def run_dual_strategy(symbols: Optional[List[str]] = None):
                 all_sigs = all_15min + all_htf
                 if all_sigs:
                     for sig in all_sigs:
-                        # BUG-FIX: Never overwrite timestamp — it is the original
-                        # signal generation time. Overwriting it each cycle caused
-                        # the frontend to show the latest cycle time instead of when
-                        # the zone was first identified, and broke signal_comparator.py
-                        # which uses timestamp to find bars-after-signal.
-                        # Use last_seen to track the most recent cycle visibility.
                         if not sig.get('timestamp'):
                             sig['timestamp'] = cycle_time.isoformat()
                         sig['last_seen'] = cycle_time.isoformat()
-                        # Set timeframe-aware valid_until so entry_missed is not
-                        # triggered prematurely for HTF signals that need days.
-                        # 15min setups are execution entries — stale within hours.
-                        # 4H OBs can sit pending for a full week before being hit.
-                        # 1D zones are structural — can take 2 weeks.
                         if 'valid_until' not in sig or not sig.get('valid_until'):
                             tf = sig.get('timeframe', '15min')
                             if tf in ('1d', '1day', 'daily'):
@@ -3789,9 +3232,7 @@ def run_dual_strategy(symbols: Optional[List[str]] = None):
                             sig['valid_until'] = (cycle_time + timedelta(hours=hours)).isoformat()
                     save_signals_to_single_file(all_sigs, "signals/all_signals.json")
 
-            # BUG-FIX: outcome check moved to AFTER save_signals so new signals
             # written this cycle are visible to the tracker immediately.
-            # Previously ran before generate_signals, so fresh signals were never seen.
             check_signal_outcomes(all_predictors)
 
             # Per-cycle cap for any downstream Telegram push
