@@ -1332,7 +1332,11 @@ class ProductionForexPredictor:
             )
         except ValueError as exc:
             print(f"  ❌ build_feature_row FAILED: {exc}")
-            logger.warning(f"build_feature_row failed: {exc}")
+            logger.error(f"Feature extraction failed for {zone.get('id','unknown')} ({self.symbol}): {exc}", exc_info=True)
+            return 0.5
+        except Exception as exc:
+            print(f"  ❌ build_feature_row ERROR: {exc}")
+            logger.error(f"Unexpected error building features for {zone.get('id','unknown')} ({self.symbol}): {exc}", exc_info=True)
             return 0.5
 
         _d = row_df.iloc[0].to_dict()
@@ -1393,11 +1397,29 @@ class ProductionForexPredictor:
                 }
                 with open(_log_file, 'a') as _lf:
                     _lf.write(json.dumps(_log_entry) + '\n')
+
+                # ── DISTRIBUTION TRACKING for zone_touch_count & h1_structure_shift ──
+                zone_touch = _d.get('zone_touch_count', 0)
+                h1_structure = _d.get('h1_structure_shift', 0)
+
+                # Log distribution every 100 signals (roughly hourly)
+                if hasattr(self, '_signal_count'):
+                    self._signal_count += 1
+                    if self._signal_count % 100 == 0:
+                        logger.info(f"Distribution snapshot ({self.symbol}, {self._signal_count} signals): "
+                                  f"zone_touch_count={zone_touch}, h1_structure_shift={h1_structure} "
+                                  f"(zero={1 if h1_structure==0 else 0})")
+                else:
+                    self._signal_count = 1
         except Exception:
             pass
 
         X = row_df.values
         if np.isnan(X).any() or np.isinf(X).any():
+            bad_features = {row_df.columns[i]: str(X[0][i])
+                          for i in range(len(row_df.columns))
+                          if np.isnan(X[0][i]) or np.isinf(X[0][i])}
+            logger.warning(f"NaN/Inf detected in features for {zone.get('id','unknown')} ({self.symbol}): {bad_features}")
             return 0.5
         try:
             X_scaled = self.scaler.transform(X)
@@ -1430,7 +1452,7 @@ class ProductionForexPredictor:
             return float(np.clip(raw_prob, 0.0, 1.0))
         except Exception as exc:
             print(f"  ❌ model.predict FAILED: {exc}")
-            logger.warning(f"model.predict failed: {exc}")
+            logger.error(f"Model prediction failed for {zone.get('id','unknown')} ({self.symbol}, task={task}): {exc}", exc_info=True)
             return 0.5
             
     
