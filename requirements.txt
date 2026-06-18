@@ -18,6 +18,7 @@ dukascopy-python>=0.2.0  # For downloading tick data
 # Utilities
 requests>=2.31.0
 python-dateutil>=2.8.0
+schedule>=1.2.0  # For scheduling live prediction cycles
 
 # Optional: Visualization
 matplotlib>=3.7.0
