@@ -52,26 +52,74 @@ def phase1_ingest(csv_path: str) -> bool:
         return False
 
 
-def phase2_features() -> bool:
-    """SMC zone detection → merged_zones.parquet."""
-    logger.info("PHASE 2 — FEATURE ENGINEERING (SMC detection)")
+SYMBOLS = ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"]
+
+
+def phase2_features(symbols: list = None) -> bool:
+    """SMC zone detection (multi-timeframe) → merged_zones_{SYMBOL}.parquet, per symbol."""
+    logger.info("PHASE 2 — FEATURE ENGINEERING (SMC detection, MTF, per-symbol)")
+    symbols = symbols or SYMBOLS
     try:
         import pandas as pd
         from smc_detector import SMCDetector
 
-        df = pd.read_parquet("data/bars_15min.parquet")
-        if "time" not in df.columns:
-            df = df.reset_index().rename(columns={"index": "time"})
-
-        detector = SMCDetector(pip_size=0.0001)
-        features = detector.extract_all_features(df)
-
         out = Path("data/features")
         out.mkdir(parents=True, exist_ok=True)
-        for name, lst in features.items():
-            if lst:
-                pd.DataFrame(lst).to_parquet(out / f"{name}.parquet")
+        any_ok = False
 
+        for sym in symbols:
+            path_15m = Path(f"data/bars_15min_{sym}.parquet")
+            if not path_15m.exists():
+                logger.warning(f"  {sym}: no 15min bars at {path_15m} — skipping")
+                continue
+
+            df_15 = pd.read_parquet(path_15m)
+            if "time" not in df_15.columns:
+                df_15 = df_15.reset_index().rename(columns={"index": "time"})
+            df_15["time"] = pd.to_datetime(df_15["time"])
+
+            # Load or resample 4H/1H; load D1 if present (optional)
+            def _load_or_resample(tf_path: Path, tf_label: str):
+                if tf_path.exists():
+                    d = pd.read_parquet(tf_path)
+                    if "time" not in d.columns:
+                        d = d.reset_index().rename(columns={"index": "time"})
+                    d["time"] = pd.to_datetime(d["time"])
+                    return d
+                logger.info(f"  {sym}: {tf_label} bars not found — resampling from 15min")
+                d = SMCDetector.resample_bars(df_15, tf_label)
+                d.to_parquet(tf_path, index=False)
+                return d
+
+            df_4h = _load_or_resample(Path(f"data/bars_4h_{sym}.parquet"), "4h")
+            df_1h = _load_or_resample(Path(f"data/bars_1h_{sym}.parquet"), "1h")
+
+            df_d1 = None
+            for p in [Path(f"data/bars_1d_{sym}.parquet"), Path(f"data/bars_d1_{sym}.parquet")]:
+                if p.exists():
+                    df_d1 = pd.read_parquet(p)
+                    if "time" not in df_d1.columns:
+                        df_d1 = df_d1.reset_index().rename(columns={"index": "time"})
+                    df_d1["time"] = pd.to_datetime(df_d1["time"])
+                    break
+            if df_d1 is None:
+                logger.warning(f"  {sym}: D1 bars not found — htf_alignment will be 0 for all zones")
+
+            detector = SMCDetector(pip_size=0.01 if "JPY" in sym else 0.0001)
+            features = detector.extract_all_features_mtf(
+                df_4h=df_4h, df_1h=df_1h, df_15min=df_15, df_d1=df_d1
+            )
+
+            for name, lst in features.items():
+                if lst:
+                    pd.DataFrame(lst).to_parquet(out / f"{name}_{sym}.parquet")
+
+            logger.info(f"  ✅ {sym}: {len(features.get('merged_zones', []))} merged zones")
+            any_ok = True
+
+        if not any_ok:
+            logger.error("❌  Phase 2 failed: no symbol produced output (check data/bars_15min_{SYMBOL}.parquet)")
+            return False
         logger.info("✅  Phase 2 complete")
         return True
     except Exception as exc:
@@ -79,39 +127,78 @@ def phase2_features() -> bool:
         return False
 
 
-def phase3_labels() -> bool:
-    """Dual label generation → training_labels_dual.parquet."""
-    logger.info("PHASE 3 — LABEL GENERATION")
+def phase3_labels(symbols: list = None) -> bool:
+    """Dual label generation → training_labels_{SYMBOL}.parquet, per symbol."""
+    logger.info("PHASE 3 — LABEL GENERATION (per-symbol, MTF)")
+    symbols = symbols or SYMBOLS
     try:
         import pandas as pd
-        # ✅ Correct class name — DualLabelGenerator (not LabelGenerator)
         from label_generator import DualLabelGenerator
 
-        df = pd.read_parquet("data/bars_15min.parquet")
-        if "time" not in df.columns:
-            df = df.reset_index().rename(columns={"index": "time"})
+        out = Path("data/labels")
+        out.mkdir(parents=True, exist_ok=True)
+        all_frames = []
 
-        zones_df = pd.read_parquet("data/features/merged_zones.parquet")
-        zones    = zones_df.to_dict("records")
+        for sym in symbols:
+            path_15m = Path(f"data/bars_15min_{sym}.parquet")
+            zones_path = Path(f"data/features/merged_zones_{sym}.parquet")
+            if not path_15m.exists() or not zones_path.exists():
+                logger.warning(f"  {sym}: missing bars or zones — skipping "
+                               f"(need {path_15m} and {zones_path})")
+                continue
 
-        generator = DualLabelGenerator(
-            risk_reward            = 1.5,
-            horizon_bars           = 60,
-            sl_atr_multiple        = 1.5,
-            continuation_break_atr = 1.0,
-            pip_size               = 0.0001,
-        )
+            df_15 = pd.read_parquet(path_15m)
+            if "time" not in df_15.columns:
+                df_15 = df_15.reset_index().rename(columns={"index": "time"})
+            df_15["time"] = pd.to_datetime(df_15["time"])
 
-        labels_df = generator.generate_labels_from_zones(zones, df)
+            zones_df = pd.read_parquet(zones_path)
+            zones = zones_df.to_dict("records")
 
-        if labels_df.empty:
-            logger.error("❌  No labels generated — check zones and bar data")
+            def _load(tf_path: Path):
+                if not tf_path.exists():
+                    return None
+                d = pd.read_parquet(tf_path)
+                if "time" not in d.columns:
+                    d = d.reset_index().rename(columns={"index": "time"})
+                d["time"] = pd.to_datetime(d["time"])
+                return d
+
+            df_4h = _load(Path(f"data/bars_4h_{sym}.parquet"))
+            df_1h = _load(Path(f"data/bars_1h_{sym}.parquet"))
+            df_d1 = _load(Path(f"data/bars_1d_{sym}.parquet")) or _load(Path(f"data/bars_d1_{sym}.parquet"))
+
+            generator = DualLabelGenerator(
+                risk_reward            = 1.5,
+                horizon_bars           = 60,
+                sl_atr_multiple        = 1.5,
+                continuation_break_atr = 1.0,
+                pip_size               = 0.01 if "JPY" in sym else 0.0001,
+            )
+
+            labels_df = generator.generate_labels_from_zones(
+                zones, df_15, df_d1=df_d1, df_1h=df_1h, df_4h=df_4h
+            )
+
+            if labels_df.empty:
+                logger.warning(f"  {sym}: no labels generated — check zones and bar data")
+                continue
+
+            labels_df = generator.add_context_features(labels_df, df_15)
+            sym_path = out / f"training_labels_{sym}.parquet"
+            generator.save_labels(labels_df, str(sym_path))
+            logger.info(f"  ✅ {sym}: {len(labels_df)} labels → {sym_path}")
+            all_frames.append(labels_df)
+
+        if not all_frames:
+            logger.error("❌  Phase 3 failed: no symbol produced labels")
             return False
 
-        labels_df = generator.add_context_features(labels_df, df)
-        generator.save_labels(labels_df,
-                              "data/labels/training_labels_dual.parquet")
-        logger.info("✅  Phase 3 complete")
+        # Combined dual-label file for downstream phases that expect it
+        combined = pd.concat(all_frames, ignore_index=True)
+        combined.to_parquet("data/labels/training_labels_dual.parquet")
+        logger.info(f"✅  Phase 3 complete — {len(combined)} total labels across "
+                    f"{len(all_frames)} symbol(s)")
         return True
     except Exception as exc:
         logger.error(f"❌  Phase 3 failed: {exc}")
@@ -151,8 +238,8 @@ def phase4_train(skip_if_exists: bool = False) -> bool:
     """Model training → models/*.pkl."""
     logger.info("PHASE 4 — MODEL TRAINING")
 
-    model_exists = (Path("models/model_v4_reversion.pkl").exists() and
-                    Path("models/model_v4_continuation.pkl").exists())
+    model_exists = (Path("models/model_v5_reversion.pkl").exists() and
+                    Path("models/model_v5_continuation.pkl").exists())
 
     if skip_if_exists and model_exists:
         logger.info("✅  Phase 4 skipped — models already exist")
@@ -179,7 +266,7 @@ def phase4_train(skip_if_exists: bool = False) -> bool:
         df = load_with_outcomes(
             labels_path    = labels_path,
             outcomes_path  = outcomes_path,
-            rolling_months = 6,
+            rolling_months = 300,
         )
 
         logger.info(f"Training on {len(df)} examples")

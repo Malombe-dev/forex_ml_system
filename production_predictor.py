@@ -565,15 +565,22 @@ class ProductionForexPredictor:
 
         if not self.is_continuation_strategy:
             # TASK 1: REVERSION STRATEGY
-            # SL hits clustered in the 65–71% probability band (6 of 6 losses were
-            # below 0.73). The 95.76% precision stat was measured at 0.65 on training
-            # data; live data shows more noise in that band.
-            self.prob_threshold = 0.60
+            # NOTE (was hardcoded to 0.60 here, silently overriding the constructor
+            # arg passed by run_dual_strategy, e.g. 0.62). That override is removed —
+            # prob_threshold now respects whatever the caller passes in.
+            # Prior rationale for 0.60 (kept for reference, not applied):
+            #   SL hits clustered in the 65-71% probability band (6 of 6 losses were
+            #   below 0.73). The 95.76% precision stat was measured at 0.65 on training
+            #   data; live data showed more noise in that band.
+            pass
         else:
             # TASK 2: CONTINUATION STRATEGY
-            # Keep this strictly at 0.60 where precision peaked stably at 80.0%.
-            # Pushing continuation to 0.65 caused a severe sample-scarcity collapse.
-            self.prob_threshold = 0.60
+            # NOTE: previously hardcoded to 0.60 here too, overriding the constructor
+            # arg (e.g. 0.65). Removed for the same reason as above.
+            # Prior rationale (kept for reference, not applied):
+            #   Precision peaked stably at 80.0% at 0.60; pushing to 0.65 caused a
+            #   severe sample-scarcity collapse.
+            pass
         self.min_confluence_score     = min_confluence_score
 
         # Symbol-specific pip size (JPY pairs, Gold)
@@ -1403,7 +1410,7 @@ class ProductionForexPredictor:
             if self.rf_model is not None and self.lr_model is not None:
                 p_rf  = float(self.rf_model.predict_proba(X_scaled)[0][1])
                 p_lr  = float(self.lr_model.predict_proba(X_scaled)[0][1])
-                raw_prob = (p_xgb + p_rf + p_lr) / 3.0
+                raw_prob = (p_xgb * w['xgb']) + (p_rf * w['rf']) + (p_lr * w['lr'])
             elif self.rf_model is not None:
                 # LR missing — redistribute its weight to XGBoost
                 raw_prob = p_xgb * (w['xgb'] + w['lr']) + \
@@ -1551,6 +1558,38 @@ class ProductionForexPredictor:
     #   zone_sources: order_block=96%,  fvg=4%
     # The old 15min demand/supply zone pipeline is SECONDARY — the model was
     # never trained on raw 15min zones and scores them unreliably.
+
+    def _check_d1_alignment(self, direction: str, df_d1) -> int:
+        """
+        Returns 1 if the D1 EMA20/50 trend aligns with the zone direction,
+        else 0 (counter-trend OR D1 data unavailable).
+
+        Mirrors smc_detector.SMCDetector.get_d1_trend() / label_generator's
+        calculate_htf_trend_alignment() exactly, so the live htf_alignment
+        feature matches what the model was trained on:
+          - binary {0, 1}, NOT {-1, 0, 1}
+          - computed from D1 close EMA20 vs EMA50, not from H1 data
+          - requires >= 50 D1 bars, else neutral (0)
+        """
+        if df_d1 is None or len(df_d1) < 50:
+            return 0
+        try:
+            ema20 = float(df_d1['close'].ewm(span=20, adjust=False).mean().iloc[-1])
+            ema50 = float(df_d1['close'].ewm(span=50, adjust=False).mean().iloc[-1])
+        except Exception:
+            return 0
+
+        if ema20 > ema50:
+            d1_trend = 'up'
+        elif ema20 < ema50:
+            d1_trend = 'down'
+        else:
+            d1_trend = 'neutral'
+
+        if direction == 'BUY':
+            return 1 if d1_trend == 'up' else 0
+        else:
+            return 1 if d1_trend == 'down' else 0
 
     def _check_1h_confluence(self, zone_top: float, zone_bot: float,
                               direction: str, df_1h) -> Dict:
@@ -1830,7 +1869,8 @@ class ProductionForexPredictor:
                           df_4h:  Optional[pd.DataFrame] = None,
                           df_15m: Optional[pd.DataFrame] = None,
                           df_5m:  Optional[pd.DataFrame] = None,
-                          df_1h:  Optional[pd.DataFrame] = None) -> List[Dict]:
+                          df_1h:  Optional[pd.DataFrame] = None,
+                          df_d1:  Optional[pd.DataFrame] = None) -> List[Dict]:
         df = df_4h if df_4h is not None else self.fetch_bars(interval=tf, outputsize=200)
         if df is None or len(df) < 50:
             return []
@@ -1838,9 +1878,10 @@ class ProductionForexPredictor:
         # The 4H candle close is the price at the END of a 4-hour bar — often
         # hours old. Using it caused the bias gate and dist filter to run on a
         # frozen price. 15min bars have a 15-minute close which is always live.
-        _df_15m = df_15m if df_15m is not None else self.fetch_bars(interval="15min", outputsize=200)
+        _df_15m = df_15m if df_15m is not None else self.fetch_bars(interval="15min", outputsize=700)
         _df_5m  = df_5m  if df_5m  is not None else self.fetch_bars(interval="5min",  outputsize=60)
         _df_1h  = df_1h  if df_1h  is not None else self.fetch_bars(interval="1h",    outputsize=100)
+        _df_d1  = df_d1  if df_d1  is not None else self.fetch_bars(interval="1day",  outputsize=90)
 
         if _df_15m is not None and len(_df_15m) > 0:
             current_price = _df_15m['close'].iloc[-1]
@@ -2120,7 +2161,7 @@ class ProductionForexPredictor:
                 'strength':                ob.get('strength', 1.0),
                 'confluence':              real_overlap,
                 'index':                   _ob_15m_index,  # converted: 4H index → 15min index
-                'htf_alignment':           h1_conf['h1_trend_alignment'],
+                'htf_alignment':           self._check_d1_alignment(direction, _df_d1),
                 # 1H features — zone-aligned values from _check_1h_confluence()
                 # (h1_trend_alignment is already direction-flipped; do not flip again)
                 'h1_trend_alignment':      h1_conf['h1_trend_alignment'],
@@ -2144,7 +2185,7 @@ class ProductionForexPredictor:
                 'touch_count':             self._calculate_touch_count(
                                                {'type': 'demand' if direction == 'BUY' else 'supply',
                                                 'price_high': ob['top'], 'price_low': ob['bottom'],
-                                                'index': ob.get('index', len(df) - 1)},
+                                                'index': _ob_15m_index},
                                                _df_15m),
                 # when this OB's price range intersects a 4H FVG — matching training
                 # where any zone inside a 4H FVG was labeled with h4_fvg_inside=1.
@@ -2207,7 +2248,7 @@ class ProductionForexPredictor:
         self.stats['total_iterations'] += 1
 
         _bars: Dict[str, Optional[pd.DataFrame]] = {
-            '15min/200': self.fetch_bars(interval="15min", outputsize=200),
+            '15min/200': self.fetch_bars(interval="15min", outputsize=700),
             '1h/100':    self.fetch_bars(interval="1h",    outputsize=100),
             '4h/200':    self.fetch_bars(interval="4h",    outputsize=200),
             '4h/100':    self.fetch_bars(interval="4h",    outputsize=100),
@@ -2238,7 +2279,8 @@ class ProductionForexPredictor:
                                           df_4h  = _bars['4h/200'],
                                           df_15m = _bars['15min/200'],
                                           df_5m  = _bars['5min/60'],
-                                          df_1h  = _bars['1h/100'])
+                                          df_1h  = _bars['1h/100'],
+                                          df_d1  = _bars['1day/90'])
         if self.debug:
             print(f"     [HTF] 4H OB signals before prob filter: {len(htf_raw)}")
         # here with zero output — causing the "1 before filter, 0 after" mystery in USD/JPY.
