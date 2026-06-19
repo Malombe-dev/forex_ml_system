@@ -3113,13 +3113,13 @@ def run_dual_strategy(symbols: Optional[List[str]] = None):
     # REV and CONT for the same pair share a key because the shared bar cache means
     # they never double-fetch; the per-key rate limiter still enforces 7 calls/min.
     PAIR_API_KEYS = {
-        "EUR/USD": "ea3e4fce074e403f8cd4c83dd0035643",
-        "GBP/USD": "2522b470eba249f88d2e29575035914e",
-        "USD/JPY": "5bb48b4211144b92a4487ce7c63d1b7a",
-        "XAU/USD": "63a513bb7eb848748d28d3deb64c1b59",
+        "EUR/USD": os.getenv("TWELVE_KEY_EURUSD", "ea3e4fce074e403f8cd4c83dd0035643"),
+        "GBP/USD": os.getenv("TWELVE_KEY_GBPUSD", "2522b470eba249f88d2e29575035914e"),
+        "USD/JPY": os.getenv("TWELVE_KEY_USDJPY", "5bb48b4211144b92a4487ce7c63d1b7a"),
+        "XAU/USD": os.getenv("TWELVE_KEY_XAUUSD", "63a513bb7eb848748d28d3deb64c1b59"),
     }
     # Fallback key if a symbol not in the dict above is passed
-    _FALLBACK_KEY = "ea3e4fce074e403f8cd4c83dd0035643"
+    _FALLBACK_KEY = os.getenv("TWELVE_KEY_EURUSD", "ea3e4fce074e403f8cd4c83dd0035643")
 
     if symbols is None:
         symbols = ["EUR/USD", "GBP/USD", "USD/JPY", "XAU/USD"]

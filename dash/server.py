@@ -11,6 +11,7 @@ Usage:
 """
 
 import json
+import os
 from pathlib import Path
 from datetime import datetime
 from flask import Flask, jsonify, send_from_directory
@@ -20,7 +21,7 @@ app = Flask(__name__, static_folder="static")
 CORS(app)
 
 BASE_DIR    = Path(__file__).resolve().parent
-SIGNALS_DIR = Path(__file__).resolve().parent.parent / "signals"
+SIGNALS_DIR = Path(os.getenv("SIGNALS_DIR", str(Path(__file__).resolve().parent.parent / "signals")))
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────

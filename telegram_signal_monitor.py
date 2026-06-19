@@ -320,8 +320,8 @@ def main():
     # CONFIGURATION
     # ═══════════════════════════════════════════════════════════════════════
     
-    TELEGRAM_TOKEN = "8584114284:AAGSa38ZQvFd2qUQSqqCpF-a22ZahzIh8FQ"
-    TELEGRAM_CHAT_ID = "6523358903"
+    TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8584114284:AAGSa38ZQvFd2qUQSqqCpF-a22ZahzIh8FQ")
+    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "6523358903")
     
     # Single JSON file that contains ALL signals
     SIGNALS_FILE = "signals/all_signals.json"

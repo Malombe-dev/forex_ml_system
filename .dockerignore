@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+data/
+chat.txt
+*.bak
+
+notes/
+signal_report.csv
+.git/

@@ -14,11 +14,7 @@ data/
 *.json
 
 # --- Models (DO NOT COMMIT) ---
-models/
-*.pkl
-*.joblib
-*.h5
-*.pt
+
 
 # --- Logs & temp ---
 *.log
