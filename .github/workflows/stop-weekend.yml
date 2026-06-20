@@ -1,0 +1,21 @@
+# Stops the forex-ml-monitor machine every Friday at 21:00 UTC,
+# ahead of the weekend when forex markets are closed and the
+# predictor has nothing useful to do.
+name: Stop Machine for Weekend
+
+on:
+  schedule:
+    # Cron is UTC. Runs every Friday at 21:00 UTC.
+    - cron: '0 21 * * 5'
+  workflow_dispatch: {}   # allows manual trigger from the Actions tab too
+
+jobs:
+  stop:
+    name: Stop Fly machine
+    runs-on: ubuntu-latest
+    steps:
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Stop machine
+        run: flyctl machine stop d895791c43d028
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

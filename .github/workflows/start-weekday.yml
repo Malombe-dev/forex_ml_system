@@ -1,0 +1,20 @@
+# Starts the forex-ml-monitor machine every Sunday at 22:00 UTC,
+# shortly after Sydney/Asia forex session opens for the new trading week.
+name: Start Machine for Weekday
+
+on:
+  schedule:
+    # Cron is UTC. Runs every Sunday at 22:00 UTC.
+    - cron: '0 22 * * 0'
+  workflow_dispatch: {}   # allows manual trigger from the Actions tab too
+
+jobs:
+  start:
+    name: Start Fly machine
+    runs-on: ubuntu-latest
+    steps:
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Start machine
+        run: flyctl machine start d895791c43d028
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
