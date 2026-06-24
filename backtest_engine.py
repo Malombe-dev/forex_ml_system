@@ -84,7 +84,7 @@ PIP_SIZE_MAP = {
     "EUR/USD": 0.0001, "EURUSD": 0.0001,
     "GBP/USD": 0.0001, "GBPUSD": 0.0001,
     "USD/JPY": 0.01,   "USDJPY": 0.01,
-    "XAU/USD": 0.01,   "XAUUSD": 0.01,
+    "XAU/USD": 1.0,    "XAUUSD": 1.0,
 }
 
 # Kenya = UTC+3 (EAT). All internal processing uses UTC.
@@ -390,9 +390,11 @@ class BacktestEngine:
         entry_raw = float(sig["entry"])
         sl        = float(sig["sl"])
         tp        = float(sig["tp"])
+        symbol    = str(sig.get("symbol", ""))
+        pip_size  = PIP_SIZE_MAP.get(symbol.upper(), self.pip_size)
 
         # Apply slippage to fill price (adverse for the trader)
-        slip  = self.slippage_pips * self.pip_size
+        slip  = self.slippage_pips * pip_size
         entry = entry_raw + slip if direction == "BUY" else entry_raw - slip
 
         # PRICE-SIDE GUARD
@@ -475,8 +477,8 @@ class BacktestEngine:
             f"  FILL [{direction}] bar#{entry_bar_num} "
             f"H={fill_row['high']:.5f} L={fill_row['low']:.5f} | "
             f"entry={entry:.5f} sl={sl:.5f} tp={tp:.5f} | "
-            f"risk={abs(entry-sl)/self.pip_size:.1f}p "
-            f"reward={abs(tp-entry)/self.pip_size:.1f}p"
+            f"risk={abs(entry-sl)/pip_size:.1f}p "
+            f"reward={abs(tp-entry)/pip_size:.1f}p"
         )
 
         # Sanity check: if SL is on the wrong side of entry the trade geometry
@@ -536,9 +538,9 @@ class BacktestEngine:
 
         # ── P&L (only for filled+closed trades) ──────────────────────────────
         if direction == "BUY":
-            pips = (exit_price - entry) / self.pip_size
+            pips = (exit_price - entry) / pip_size
         else:
-            pips = (entry - exit_price) / self.pip_size
+            pips = (entry - exit_price) / pip_size
         pips -= self.commission_pips
 
         pnl = pips * 10.0 * pos_size if outcome in ("win", "loss") else 0.0

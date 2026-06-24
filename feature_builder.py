@@ -246,21 +246,17 @@ def _compute_raw_features(
     # h1_confluence REMOVED — replaced by granular features below
 
     sources = zone.get("sources", [])
-    # FIX A: h4_fvg_inside was always 0.0 live because htf_trade_detect() built
-    # zone dicts with no 'sources', 'source', or 'tf_source'='fvg' fields.
-    # Two new explicit flags are now injected upstream in production_predictor:
-    #   h4_fvg_zone  — set True on every FVG zone entering _ml_score_htf_zone
-    #   fvg_overlap  — set True on OB zones whose price range overlaps a 4H FVG
-    # Original string-match checks kept as fallback for training-path zones
-    # from smc_detector which carry 'sources' / 'tf_source'.
-    h4_fvg_inside = 1.0 if (
-        zone.get("h4_fvg_zone", False)
-        or zone.get("fvg_overlap", False)
-        or "fvg" in sources
-        or zone.get("source", "") == "fvg"
-        or "fvg" in str(zone.get("tf_source", ""))
-        or any("fvg" in str(s) for s in sources)
-    ) else 0.0
+    # ── h4_fvg_inside (leakage fix) ──────────────────────────────────────────
+    # OLD BUG: checked zone["sources"]/zone["tf_source"] to detect FVG membership
+    # making the feature circular — zones that ARE 4H FVGs always scored 1.0,
+    # producing 95%+ win rates on tf_source='4h' rows (data leakage confirmed).
+    #
+    # CORRECT: only fire when this OB zone overlaps a SEPARATE 4H FVG.
+    # fvg_overlap is injected by production_predictor on OB zones whose price
+    # range overlaps a distinct 4H FVG — never on the FVG zone itself.
+    # h4_fvg_zone is excluded (it marks the zone AS the FVG — circular).
+    # Training rows default to 0.0 (label_generator does not inject fvg_overlap).
+    h4_fvg_inside = 1.0 if zone.get("fvg_overlap", False) else 0.0
 
     d1_ema_distance = _compute_d1_ema_distance(
         touch_bar=t_bar,

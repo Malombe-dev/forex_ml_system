@@ -661,6 +661,16 @@ class SMCDetector:
             h1_trend_val, h1_mss_val, h1_disp_val, h1_sweep_val = \
                 self._compute_h1_zone_features(df_1h, zone_time, zone.get('type', 'demand'))
 
+            # FVG overlap check (v9 alignment)
+            fvg_overlap_flag = False
+            if 'order_block' in zone.get('sources', []):
+                for fvg_item in h4_fvgs:
+                    fb = fvg_item.get('price_low', 0)
+                    ft = fvg_item.get('price_high', 0)
+                    if fb < zone['price_high'] and ft > zone['price_low']:
+                        fvg_overlap_flag = True
+                        break
+
             annotated_zones.append({
                 **zone,
                 'index':            idx_15min,
@@ -671,6 +681,7 @@ class SMCDetector:
                 'd1_trend':         d1_trend,
                 'htf_alignment':    d1_aligned,
                 'confluence':       final_confluence,
+                'fvg_overlap':      fvg_overlap_flag,
                 # v7: granular 1H fields consumed by feature_builder
                 'h1_trend_alignment':    h1_trend_val,
                 'h1_structure_shift':    h1_mss_val,

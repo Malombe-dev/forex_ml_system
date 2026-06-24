@@ -42,6 +42,10 @@ class SmartTelegramMonitor:
         # Ensure signals directory exists
         self.signals_file.parent.mkdir(exist_ok=True)
         
+        # Track already sent signals to avoid duplicate messages
+        self.sent_file = Path("signals/monitor_sent_ids.json")
+        self.sent_ids = self._load_sent_ids()
+        
         # Create empty file if it doesn't exist
         if not self.signals_file.exists():
             with open(self.signals_file, 'w') as f:
@@ -56,6 +60,25 @@ class SmartTelegramMonitor:
         print(f"  Check Interval:  {check_interval} seconds")
         print(f"  Mode:            Send ALL active signals")
         print(f"{'='*80}\n")
+
+    def _load_sent_ids(self) -> set:
+        """Load sent signal IDs from disk."""
+        if self.sent_file.exists():
+            try:
+                with open(self.sent_file, 'r') as f:
+                    return set(json.load(f))
+            except Exception as e:
+                print(f"  ⚠️ Error loading sent IDs: {e}")
+        return set()
+
+    def _save_sent_ids(self):
+        """Save sent signal IDs to disk."""
+        try:
+            self.sent_file.parent.mkdir(exist_ok=True)
+            with open(self.sent_file, 'w') as f:
+                json.dump(list(self.sent_ids), f, indent=2)
+        except Exception as e:
+            print(f"  ⚠️ Error saving sent IDs: {e}")
     
     def send_message(self, text: str, parse_mode: str = "Markdown") -> bool:
         """Send message to Telegram"""
@@ -163,7 +186,7 @@ Probability: `{signal['probability']}%`
         
         for signal in all_signals:
             status = signal.get('status', 'active')
-            if status == 'active':
+            if status in ('active', 'pending', 'triggered'):
                 active_signals.append(signal)
         
         return active_signals
@@ -236,45 +259,46 @@ Watching for new signals...
                 active_signals = self.get_active_signals(all_signals)
                 print(f"  Active signals: {len(active_signals)}")
                 
-                # Check if these are NEW signals (different timestamp from last batch)
+                # Check for unsent active signals
                 if active_signals:
-                    latest_timestamp = self.get_latest_timestamp(active_signals)
+                    unsent_signals = []
+                    for s in active_signals:
+                        sig_id = f"{s.get('symbol')}_{s.get('direction')}_{s.get('entry')}_{s.get('timestamp')}"
+                        if sig_id not in self.sent_ids:
+                            unsent_signals.append((sig_id, s))
                     
-                    # If this is a new batch (different timestamp), send all active signals
-                    if latest_timestamp != self.last_processed_timestamp:
-                        print(f"  🆕 New batch detected!")
-                        print(f"     Previous: {self.last_processed_timestamp}")
-                        print(f"     Current:  {latest_timestamp}")
-                        
-                        self.last_processed_timestamp = latest_timestamp
+                    if unsent_signals:
+                        print(f"  🆕 {len(unsent_signals)} new/unsent signal(s) detected!")
                         
                         # Send header message
                         header_msg = f"""📊 *NEW SIGNAL BATCH*
 
-{len(active_signals)} signal(s) generated
+{len(unsent_signals)} new signal(s) detected
 
 `{datetime.now().strftime('%Y-%m-%d %H:%M:%S GMT')}`"""
                         self.send_message(header_msg)
                         time.sleep(1)
                         
-                        # Send each active signal
-                        for i, signal in enumerate(active_signals, 1):
+                        # Send each unsent signal
+                        for i, (sig_id, signal) in enumerate(unsent_signals, 1):
                             msg = self.format_signal(signal)
                             success = self.send_message(msg)
                             
                             if success:
-                                print(f"  ✅ Signal #{i}/{len(active_signals)} sent to Telegram")
+                                print(f"  ✅ Signal #{i}/{len(unsent_signals)} sent to Telegram")
+                                self.sent_ids.add(sig_id)
+                                self._save_sent_ids()
                                 total_signals_sent += 1
                             else:
-                                print(f"  ❌ Signal #{i}/{len(active_signals)} failed to send")
+                                print(f"  ❌ Signal #{i}/{len(unsent_signals)} failed to send")
                             
                             # Delay between messages
-                            if i < len(active_signals):
+                            if i < len(unsent_signals):
                                 time.sleep(1.5)
                         
-                        print(f"  📤 Complete: {len(active_signals)} signal(s) sent")
+                        print(f"  📤 Complete: {len(unsent_signals)} new signal(s) sent")
                     else:
-                        print(f"  ℹ️  Same batch as before (timestamp unchanged)")
+                        print(f"  ℹ️  All active signals already sent")
                 else:
                     print(f"  ℹ️  No active signals in file")
                 

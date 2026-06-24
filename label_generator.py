@@ -1400,6 +1400,7 @@ class DualLabelGenerator:
                 'zone_price_low':       zone['price_low'],
                 'zone_price_mid':       zone.get('price_mid',
                                             (zone['price_high'] + zone['price_low']) / 2),
+                'fvg_overlap':          bool(zone.get('fvg_overlap', False)),
             }
 
             candidates.append(candidate)
@@ -1588,6 +1589,7 @@ class DualLabelGenerator:
                 "h1_confluence": bool(row.get("h1_confluence", False)),
                 "sources":       row.get("zone_sources", ["order_block"]),
                 "tf_source":     row.get("tf_source", "4h"),
+                "fvg_overlap":   bool(row.get("fvg_overlap", False)),
             }
             entry = float(row.get("entry", 0.0))
             sl    = float(row.get("sl",    0.0))

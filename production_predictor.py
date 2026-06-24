@@ -52,6 +52,28 @@ class _RateLimiter:
                   f"({len(self._calls)}/{self._max} calls in window)...")
             time.sleep(sleep_secs)
 
+    def try_acquire(self) -> bool:
+        """Non-blocking: take a slot now if one is free, else return False
+        immediately without sleeping. Used for fallback-key probing."""
+        with self._lock:
+            now    = time.time()
+            cutoff = now - self._window
+            self._calls = [t for t in self._calls if t > cutoff]
+            if len(self._calls) < self._max:
+                self._calls.append(now)
+                return True
+            return False
+
+    def next_free_in(self) -> float:
+        """Seconds until this limiter will next have a free slot (0 if free now)."""
+        with self._lock:
+            now    = time.time()
+            cutoff = now - self._window
+            self._calls = [t for t in self._calls if t > cutoff]
+            if len(self._calls) < self._max:
+                return 0.0
+            return max(0.0, (self._calls[0] + self._window) - now)
+
 # Per-API-key rate limiters — each key gets its own 7-call/min budget.
 # If you use two keys (one for REV, one for CONT), each gets independent
 # throttling so combined throughput is 14 real calls/min instead of 7.
@@ -64,6 +86,54 @@ def _get_rate_limiter(api_key: str) -> "_RateLimiter":
         if api_key not in _API_RATE_LIMITERS:
             _API_RATE_LIMITERS[api_key] = _RateLimiter(max_calls=7, window_seconds=62.0)
         return _API_RATE_LIMITERS[api_key]
+
+# ---------------------------------------------------------------------------
+# DYNAMIC FALLBACK POOL
+# ---------------------------------------------------------------------------
+# A shared pool of "spare" API keys any symbol can borrow from when its own
+# primary key's 7-call/min budget is full. Populated at startup in
+# run_dual_strategy() from TWELVE_KEY_SPARE_1, TWELVE_KEY_SPARE_2, etc.
+_SPARE_KEY_POOL: List[str] = []
+
+def _register_spare_keys(keys: List[str]):
+    """Call once at startup with the list of unused/spare API keys."""
+    for k in keys:
+        if k and k not in _SPARE_KEY_POOL:
+            _SPARE_KEY_POOL.append(k)
+
+def acquire_any(primary_key: str) -> str:
+    """
+    Acquire a rate-limit slot for a call, trying the primary key first and
+    falling back to any free spare key if the primary is currently full.
+    Returns the API key whose slot was actually taken — callers MUST use
+    this returned key for the actual HTTP request (not the original
+    primary_key), since a different account's key may have been used.
+    """
+    primary_limiter = _get_rate_limiter(primary_key)
+
+    # Fast path — primary key has room right now.
+    if primary_limiter.try_acquire():
+        return primary_key
+
+    # Primary is full — try every registered spare key, in order.
+    for spare_key in _SPARE_KEY_POOL:
+        if spare_key == primary_key:
+            continue
+        spare_limiter = _get_rate_limiter(spare_key)
+        if spare_limiter.try_acquire():
+            print(f"  🔁 Rate limit: primary key full — borrowed spare key "
+                  f"...{spare_key[-6:]} instead")
+            return spare_key
+
+    # Everyone is full — block on whichever (primary or spare) frees up soonest.
+    candidates = [primary_key] + [k for k in _SPARE_KEY_POOL if k != primary_key]
+    waits = [(_get_rate_limiter(k).next_free_in(), k) for k in candidates]
+    waits.sort(key=lambda pair: pair[0])
+    soonest_wait, soonest_key = waits[0]
+    print(f"  ⏳ Rate limit: all keys full — waiting {soonest_wait:.1f}s "
+          f"on key ...{soonest_key[-6:]}...")
+    _get_rate_limiter(soonest_key).acquire()
+    return soonest_key
 
 
 
@@ -303,7 +373,6 @@ class ActiveZoneTracker:
             try:
                 with open(self.state_file, 'r') as f:
                     self.active_zones = json.load(f)
-                logger.info(f"Zone tracker: loaded {len(self.active_zones)} zones from disk")
             except Exception as e:
                 logger.warning(f"Zone tracker: could not load state — {e}. Starting fresh.")
                 self.active_zones = {}
@@ -344,7 +413,8 @@ class ActiveZoneTracker:
         return False
 
     def is_duplicate(self, signature: str, current_time: datetime,
-                     current_price: float) -> Tuple[bool, Optional[str]]:
+                      current_price: float) -> Tuple[bool, Optional[str]]:
+        self._load_state()  # Reload disk state before query
         if signature not in self.active_zones:
             return False, None
         meta = self.active_zones[signature]
@@ -352,25 +422,47 @@ class ActiveZoneTracker:
             del self.active_zones[signature]
             self._save_state()
             return False, None
+        
+        # Zone still active — increment touch count
+        touch_count = meta.get('touch_count', 1)
+        meta['touch_count'] = min(touch_count + 1, 15)
+        meta['last_touch'] = current_time.isoformat()
+        self._save_state()
+
         created = datetime.fromisoformat(meta['created_at'])
         age_m   = int((current_time - created).total_seconds() / 60)
-        return True, f"Active zone (age: {age_m}m, status: {meta.get('status','active')})"
+        touches = meta.get('touch_count', 1)
+        return True, f"Active zone (age: {age_m}m, touches: {touches}, status: {meta.get('status','active')})"
 
     def add_zone(self, signature: str, zone: Dict, status: str = 'active'):
-        self.active_zones[signature] = {
-            'signature':  signature,
-            'status':     status,
-            'created_at': datetime.utcnow().isoformat(),
-            'price_mid':  zone.get('price_mid'),
-            'zone_type':  zone.get('type'),
-            'probability': zone.get('probability', 0)
-        }
+        self._load_state()  # Reload disk state before addition/update
+        if signature in self.active_zones:
+            # Zone already tracked — increment touch count
+            self.active_zones[signature]['touch_count'] = min(
+                self.active_zones[signature].get('touch_count', 1) + 1,
+                15  # Cap at 15 to match training ceiling
+            )
+            self.active_zones[signature]['last_touch'] = datetime.utcnow().isoformat()
+        else:
+            # New zone
+            self.active_zones[signature] = {
+                'signature':  signature,
+                'status':     status,
+                'created_at': datetime.utcnow().isoformat(),
+                'last_touch': datetime.utcnow().isoformat(),
+                'price_mid':  zone.get('price_mid'),
+                'zone_type':  zone.get('type'),
+                'probability': zone.get('probability', 0),
+                'touch_count': 1
+            }
         self._save_state()
 
     def get_active_count(self) -> int:
+        self._load_state()
         return len(self.active_zones)
 
     def cleanup_expired(self, current_time: datetime, current_price: float) -> int:
+        self._load_state()
         expired = [s for s, m in self.active_zones.items()
                    if self._should_expire(m, current_time, current_price)]
         for s in expired:
@@ -513,8 +605,8 @@ class ProductionForexPredictor:
     def __init__(self,
                  api_key: str,
                  model_path: str = "models/model_v5_reversion.pkl",
-                 scaler_path: str = "models/scaler_preprocessing.pkl",
-                 encoders_path: str = "models/encoders_preprocessing.pkl",
+                 scaler_path: str = "models/scaler_v5_reversion.pkl",
+                 encoders_path: str = "models/encoders_v5_reversion.pkl",
                  stats_path: str = "models/training_stats_v5_reversion.pkl",
                  symbol: str = "EUR/USD",
                  prob_threshold: float = None,
@@ -597,12 +689,11 @@ class ProductionForexPredictor:
         )
 
         safe_sym = symbol.replace('/', '_')
-        strat    = 'cont' if is_continuation_strategy else 'rev'
         self.zone_tracker = ActiveZoneTracker(
             ttl_hours=zone_ttl_hours,
             distance_threshold_pips=zone_distance_threshold,
             broker_offset=self.broker_offset,
-            state_file=f"signals/zones_{safe_sym}_{strat}.json"
+            state_file=f"signals/zones_{safe_sym}.json"
         )
 
         self.load_model(model_path, scaler_path, encoders_path, stats_path)
@@ -671,8 +762,8 @@ class ProductionForexPredictor:
         except FileNotFoundError:
             logger.warning("Model files not found, falling back to reversion model")
             with open("models/model_v5_reversion.pkl",          'rb') as f: self.model          = pickle.load(f)
-            with open("models/scaler_preprocessing.pkl",         'rb') as f: self.scaler         = pickle.load(f)
-            with open("models/encoders_preprocessing.pkl",       'rb') as f: self.encoders       = pickle.load(f)
+            with open("models/scaler_v5_reversion.pkl",         'rb') as f: self.scaler         = pickle.load(f)
+            with open("models/encoders_v5_reversion.pkl",       'rb') as f: self.encoders       = pickle.load(f)
             with open("models/training_stats_v5_reversion.pkl", 'rb') as f: self.training_stats = pickle.load(f)
             self.rf_model    = None
             self.lr_model    = None
@@ -738,8 +829,10 @@ class ProductionForexPredictor:
             "outputsize": outputsize, "apikey": self.api_key, "format": "JSON"
         }
 
-        # Acquire a rate-limit slot for this specific API key
-        _get_rate_limiter(self.api_key).acquire()
+        # Acquire a rate-limit slot — tries this predictor's own key first,
+        # then falls back to any free spare key if the primary is full.
+        call_key = acquire_any(self.api_key)
+        params["apikey"] = call_key
 
         last_error = None
         for attempt in range(3):
@@ -1494,7 +1587,7 @@ class ProductionForexPredictor:
                                          else 0)
 
         # Use pre-fetched bars if supplied; fall back to live fetch only when
-        # called standalone (e.g. from DailyPlanScheduler).
+        # called standalone (e.g. outside the main per-cycle batch path).
         _df_1h = df_1h if df_1h is not None else self.fetch_bars(interval="1h",   outputsize=100)
         _df_4h = df_4h if df_4h is not None else self.fetch_bars(interval="4h",   outputsize=100)
         _df_5m = df_5m if df_5m is not None else self.fetch_bars(interval="5min", outputsize=60)
@@ -1923,6 +2016,20 @@ class ProductionForexPredictor:
         if h4_trend == 'neutral' and htf_context:
             h4_trend = htf_context.get('h4_structure', {}).get('trend', 'neutral')
 
+        # D1 Premium / Discount gate calculation
+        _d1_pd = 0
+        if _df_d1 is not None and len(_df_d1) >= 20:
+            _tail60  = _df_d1.tail(60)
+            _d1_high = float(np.percentile(_tail60["high"], 95))
+            _d1_low  = float(np.percentile(_tail60["low"],   5))
+            _d1_rng  = _d1_high - _d1_low
+            _d1_pos  = (current_price - _d1_low) / _d1_rng if _d1_rng > 0 else 0.5
+            if _d1_rng > 0:
+                if _d1_pos > 0.6:
+                    _d1_pd = 1   # premium
+                elif _d1_pos < 0.4:
+                    _d1_pd = -1  # discount
+
         htf_setups       = []
         MAX_DIST_ATR     = 20.0
         MAX_DIST_PIPS    = MAX_DIST_ATR * (current_atr / self.pip_size)
@@ -1933,8 +2040,8 @@ class ProductionForexPredictor:
         if self.debug:
             print(f"\n  🔍 HTF [{self.symbol}|{tf}] current_price={current_price:.5f} "
                   f"ATR={current_atr:.5f}  FVGs={len(fvgs)}  OBs={len(obs)}")
-        htf_fvg_rejected = {'dist': 0, 'confs': 0, 'direction': 0, 'rr': 0, 'strength': 0, 'prob': 0}
-        htf_ob_rejected  = {'dist': 0, 'confs': 0, 'direction': 0, 'rr': 0, 'strength': 0, 'prob': 0}
+        htf_fvg_rejected = {'dist': 0, 'confs': 0, 'direction': 0, 'rr': 0, 'strength': 0, 'prob': 0, 'd1_pd': 0}
+        htf_ob_rejected  = {'dist': 0, 'confs': 0, 'direction': 0, 'rr': 0, 'strength': 0, 'prob': 0, 'd1_pd': 0}
 
         # ATR tolerance for direction filter: zones whose mid is within 1 ATR of
         # current price are still valid candidates (price is approaching them).
@@ -1949,7 +2056,7 @@ class ProductionForexPredictor:
                 'symbol':       self.symbol,
                 'timeframe':    tf,
                 'type':         zone_type_str,
-                'strategy':     'HTF_SMC',
+                'strategy':     'CONTINUATION' if self.is_continuation_strategy else 'REVERSION',
                 'direction':    direction,
                 'entry':        round(entry, 5),
                 'sl':           round(sl, 5),
@@ -2002,6 +2109,20 @@ class ProductionForexPredictor:
                     print(f"     ⛔ HTF FVG HARD BLOCK: BUY blocked — 4H trend is bearish")
                 continue
 
+            # ── D1 Premium / Discount Gate (HTF FVG) ───────────────────────────
+            if _d1_pd == 1 and direction == 'BUY':
+                if h4_trend != 'bullish':
+                    htf_fvg_rejected['d1_pd'] += 1
+                    if self.debug:
+                        print(f"     ⛔ HTF FVG D1 PREMIUM BLOCK: BUY blocked — price in D1 premium and 4H={h4_trend}")
+                    continue
+            if _d1_pd == -1 and direction == 'SELL':
+                if h4_trend == 'bullish':
+                    htf_fvg_rejected['d1_pd'] += 1
+                    if self.debug:
+                        print(f"     ⛔ HTF FVG D1 DISCOUNT BLOCK: SELL blocked — price in D1 discount and 4H is bullish")
+                    continue
+
             # Bullish FVG: mid must be below current price (support below price).
             # Bearish FVG: mid must be above current price (resistance above price).
             # Same fix as OB direction filter — use mid + ATR tolerance.
@@ -2049,7 +2170,7 @@ class ProductionForexPredictor:
                           f"  dir={direction}"
                           f"  strength={fvg.get('strength', 0):.2f}"
                           f"  age_bars={fvg.get('index', '?')}")
-                htf_ob_rejected['prob'] += 1; continue
+                htf_fvg_rejected['prob'] += 1; continue
 
             htf_setups.append(_build_setup(fvg, 'FVG', direction, entry, sl, tp_target,
                                            risk, reward, rr, base_prob,
@@ -2083,6 +2204,20 @@ class ProductionForexPredictor:
                 if self.debug:
                     print(f"     ⛔ HTF OB HARD BLOCK: BUY blocked — 4H trend is bearish")
                 continue
+
+            # ── D1 Premium / Discount Gate (HTF OB) ────────────────────────────
+            if _d1_pd == 1 and direction == 'BUY':
+                if h4_trend != 'bullish':
+                    htf_ob_rejected['d1_pd'] += 1
+                    if self.debug:
+                        print(f"     ⛔ HTF OB D1 PREMIUM BLOCK: BUY blocked — price in D1 premium and 4H={h4_trend}")
+                    continue
+            if _d1_pd == -1 and direction == 'SELL':
+                if h4_trend == 'bullish':
+                    htf_ob_rejected['d1_pd'] += 1
+                    if self.debug:
+                        print(f"     ⛔ HTF OB D1 DISCOUNT BLOCK: SELL blocked — price in D1 discount and 4H is bullish")
+                    continue
 
             _atr_buf = df['atr'].iloc[-1] * 0.2 if 'atr' in df.columns else 0.0002
             if direction == 'BUY':
@@ -2383,7 +2518,7 @@ class ProductionForexPredictor:
         # training_labels_clean.parquet: tf_source = 4h_1h_confluence=90%, 4h=10%, 15min=0%
         # Model was never trained on raw 15min zones — live WR confirmed ~7%.
         # Only HTF_SMC signals (4H OBs/FVGs confirmed by 1H) are valid outputs.
-        
+
         if not htf_signals:
             print(f"     ⚠️  No HTF signals this cycle — returning empty")
             return {'15min_signals': [], 'htf_signals': [], 'stats': {
@@ -2830,145 +2965,6 @@ class ProductionForexPredictor:
 
 
 
-class DailyPlanScheduler:
-
-    def __init__(self, predictors: List['ProductionForexPredictor'],
-                 output_file: str = "signals/daily_plan.json"):
-        self.predictors  = predictors
-        self.output_file = Path(output_file)
-
-    def generate(self):
-        print(f"\n{'═'*80}")
-        print(f"📅 DAILY PLAN — {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
-        print(f"{'═'*80}")
-
-        all_signals = []
-
-        _all_sigs_path = Path("signals/all_signals.json")
-        _resolved_ids: set = set()
-        if _all_sigs_path.exists():
-            try:
-                with open(_all_sigs_path) as _f:
-                    _existing = json.load(_f)
-                for _s in _existing:
-                    if _s.get('status') in {'hit_tp', 'hit_sl', 'expired', 'entry_missed'}:
-                        _sym   = str(_s.get('symbol', ''))
-                        _entry = float(_s.get('entry', 0))
-                        if 'XAU' in _sym or 'GOLD' in _sym.upper():
-                            _eb = round(_entry / 5) * 5
-                        elif 'JPY' in _sym:
-                            _eb = round(_entry * 2) / 2
-                        else:
-                            _eb = round(_entry, 3)
-                        _resolved_ids.add(
-                            f"{_sym}_{_s.get('direction')}_{_eb}_{_s.get('timeframe','')}"
-                        )
-                if _resolved_ids:
-                    print(f"  🔒 {len(_resolved_ids)} resolved zone(s) loaded — will be suppressed from plan")
-            except Exception as _e:
-                logger.warning(f"DailyPlan: could not load existing signals for dedup — {_e}")
-
-        def _plan_sig_id(s):
-            """Bucketed zone ID — matches save_signals_to_single_file key exactly."""
-            sym   = str(s.get('symbol', ''))
-            entry = float(s.get('entry', 0))
-            if 'XAU' in sym or 'GOLD' in sym.upper():
-                eb = round(entry / 5) * 5
-            elif 'JPY' in sym:
-                eb = round(entry * 2) / 2
-            else:
-                eb = round(entry, 3)
-            return f"{sym}_{s.get('direction')}_{eb}_{s.get('timeframe','')}"
-
-        # Pre-warm the shared bar cache once per symbol before iterating.
-        # This ensures REV and CONT predictors both hit cache, halving real
-        # API calls from 2×8=16 per symbol down to 8.
-        seen_symbols: set = set()
-        for pred in self.predictors:
-            if pred.symbol not in seen_symbols:
-                try:
-                    pred.pre_warm_cache()
-                except Exception as e:
-                    logger.warning(f"DailyPlan pre_warm_cache failed for {pred.symbol}: {e}")
-                seen_symbols.add(pred.symbol)
-
-        for pred in self.predictors:
-            try:
-                result = pred.generate_signals()
-                sigs   = result.get('15min_signals', []) + result.get('htf_signals', [])
-                now = datetime.utcnow()
-                for s in sigs:
-                    s['plan_type'] = 'daily'
-                    # Stamp last_seen but never overwrite the original timestamp
-                    if not s.get('timestamp'):
-                        s['timestamp'] = now.isoformat()
-                    s['last_seen'] = now.isoformat()
-                    tf = s.get('timeframe', '15min')
-                    if tf in ('1d', '1day', 'daily'):
-                        hours = 240
-                    elif tf in ('4h', '4hour'):
-                        hours = 120
-                    elif tf in ('1h', '1hour'):
-                        hours = 48
-                    else:
-                        hours = 8
-                    s['valid_until'] = (now + timedelta(hours=hours)).isoformat()
-
-                # in a previous plan window (expired without entry, hit TP/SL, etc.)
-                fresh_sigs = [s for s in sigs if _plan_sig_id(s) not in _resolved_ids]
-                skipped    = len(sigs) - len(fresh_sigs)
-                if skipped:
-                    print(f"  ⏭  [{pred.symbol}] {skipped} signal(s) suppressed — zone previously resolved")
-                all_signals.extend(fresh_sigs)
-            except Exception as e:
-                logger.warning(f"DailyPlan: error for {pred.symbol} — {e}")
-
-        # Dedup before saving: same entry+direction+timeframe → keep highest probability.
-        # Without this, overlapping 15min OBs that refine to the same TP candidate
-        # produce multiple identical rows in the plan (and on the frontend).
-        def _plan_dedup_key(s):
-            sym   = str(s.get('symbol', ''))
-            entry = float(s.get('entry', 0))
-            if 'XAU' in sym or 'GOLD' in sym.upper():
-                eb = round(entry / 5) * 5
-            elif 'JPY' in sym:
-                eb = round(entry * 2) / 2
-            else:
-                eb = round(entry, 3)
-            return (sym, s.get('direction'), eb, s.get('timeframe', ''))
-
-        seen_plan: dict = {}
-        for s in all_signals:
-            k = _plan_dedup_key(s)
-            if k not in seen_plan or float(s.get('probability', 0)) > float(seen_plan[k].get('probability', 0)):
-                seen_plan[k] = s
-        all_signals = list(seen_plan.values())
-
-        all_signals = sorted(all_signals, key=lambda x: float(x.get('probability', 0)), reverse=True)
-
-        self.output_file.parent.mkdir(exist_ok=True)
-        with open(self.output_file, 'w') as f:
-            json.dump(_convert_numpy(all_signals), f, indent=2)
-
-        print(f"✅ Daily plan: {len(all_signals)} signals saved → {self.output_file}")
-        self._print_plan_table(all_signals)
-        return all_signals
-
-    def _print_plan_table(self, signals: List[Dict]):
-        if not signals:
-            print("  ⚠️  No signals in daily plan")
-            return
-        print(f"\n{'Symbol':<10} {'Dir':<5} {'TF':<5} {'Entry':<10} {'SL':<10} "
-              f"{'TP':<10} {'R:R':<7} {'Prob%':<7} {'Valid Until'}")
-        print("─" * 85)
-        for s in signals[:15]:
-            print(f"  {s.get('symbol',''):<8} {s.get('direction',''):<5} "
-                  f"{s.get('timeframe',''):<5} {s.get('entry',0):<10.5f} "
-                  f"{s.get('sl',0):<10.5f} {s.get('tp',0):<10.5f} "
-                  f"{s.get('rr',''):<7} {s.get('probability',0):<7} "
-                  f"{s.get('valid_until','')[:16]}")
-
-
 class WeeklyPlanScheduler:
 
     def __init__(self, predictors: List['ProductionForexPredictor'],
@@ -3019,10 +3015,10 @@ class WeeklyPlanScheduler:
 class PriceZoneMonitor:
 
     def __init__(self, predictors: List['ProductionForexPredictor'],
-                 daily_plan_file: str = "signals/daily_plan.json",
+                 signals_file: str = "signals/all_signals.json",
                  alert_callback=None):
         self.predictors       = predictors
-        self.daily_plan_file  = Path(daily_plan_file)
+        self.signals_file     = Path(signals_file)
         self.alert_callback   = alert_callback or self._default_alert
         self.alerted_signals  = set()
 
@@ -3033,14 +3029,17 @@ class PriceZoneMonitor:
               f"| Prob: {signal['probability']}%")
 
     def check(self):
-        if not self.daily_plan_file.exists():
+        if not self.signals_file.exists():
             return
 
         try:
-            with open(self.daily_plan_file, 'r') as f:
-                plan = json.load(f)
+            with open(self.signals_file, 'r') as f:
+                all_sigs = json.load(f)
         except Exception as e:
-            logger.warning(f"PriceMonitor: could not load plan — {e}"); return
+            logger.warning(f"PriceMonitor: could not load signals — {e}"); return
+
+        # Only watch zones still awaiting entry — resolved/expired signals are skipped.
+        plan = [s for s in all_sigs if s.get('status') == 'pending']
 
         # Group predictors by symbol for current-price lookup
         pred_map = {p.symbol: p for p in self.predictors}
@@ -3121,6 +3120,13 @@ def run_dual_strategy(symbols: Optional[List[str]] = None):
     # Fallback key if a symbol not in the dict above is passed
     _FALLBACK_KEY = os.getenv("TWELVE_KEY_EURUSD", "ea3e4fce074e403f8cd4c83dd0035643")
 
+    # Register spare key(s) any symbol can dynamically borrow from when its
+    # own primary key's 7-call/min budget is full. Add more TWELVE_KEY_SPARE_N
+    # entries here later if you get more keys.
+    _register_spare_keys([
+        os.getenv("TWELVE_KEY_SPARE_1", "152db33cd9e64bd4976cbbc0264bc753"),
+    ])
+
     if symbols is None:
         symbols = ["EUR/USD", "GBP/USD", "USD/JPY", "XAU/USD"]
 
@@ -3177,16 +3183,12 @@ def run_dual_strategy(symbols: Optional[List[str]] = None):
         )
         all_predictors.extend([rev, cont])
 
-    daily_scheduler  = DailyPlanScheduler(all_predictors)
     weekly_scheduler = WeeklyPlanScheduler(all_predictors)
     price_monitor    = PriceZoneMonitor(all_predictors)
 
-    # Schedule daily plan at 06:00 UTC and weekly plan on Sunday 20:00 UTC
-    schedule.every().day.at("06:00").do(daily_scheduler.generate)
+    # Schedule weekly plan on Sunday 20:00 UTC
     schedule.every().sunday.at("20:00").do(weekly_scheduler.generate)
 
-    # Run immediately on startup so there's a plan from the first minute
-    daily_scheduler.generate()
     # Run weekly plan on startup if it's Sunday, otherwise load any existing one
     if datetime.utcnow().weekday() == 6:
         weekly_scheduler.generate()
@@ -3206,14 +3208,15 @@ def run_dual_strategy(symbols: Optional[List[str]] = None):
             print(f"CYCLE #{iteration} │ {cycle_time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
             print(f"{'═'*100}")
 
-            # Run pending scheduled jobs (daily/weekly plan generation)
+            # Run pending scheduled jobs (weekly plan generation)
             schedule.run_pending()
 
-            # Price monitor: check if any daily-plan zone has been touched
+            # Price monitor: check if any pending zone (from all_signals.json) has been touched
             price_monitor.check()
 
             # Still run full signal generation every cycle for live signals
-            # (complements the scheduled plan; saves to all_signals.json)
+            # (the sole source of truth — saves to all_signals.json, which
+            # PriceZoneMonitor also reads to watch pending zones)
             for i in range(0, len(all_predictors), 2):
                 rev_p  = all_predictors[i]
                 cont_p = all_predictors[i + 1] if i + 1 < len(all_predictors) else None

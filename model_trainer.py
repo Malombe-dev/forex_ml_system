@@ -477,6 +477,32 @@ class DualTaskTrainer:
                          task: str = 'reversion',
                          train_indices: Optional[np.ndarray] = None) -> Tuple[pd.DataFrame, pd.Series]:
         logger.info(f"Preparing features for {task.upper()} task...")
+
+        # ── Sentinel & outlier cleanup (applied before column selection) ────────
+        df = df.copy()
+        # time_since_last_touch is excluded from NUMERIC_FEATURES (v8) but may
+        # still exist in older parquet files — neutralise it if present so it
+        # can't accidentally leak in via a schema mismatch.
+        if 'time_since_last_touch' in df.columns:
+            sentinel_mask = df['time_since_last_touch'] >= 2000
+            if sentinel_mask.any():
+                logger.warning(
+                    f"  ⚠️  {sentinel_mask.sum()} rows have time_since_last_touch=2000 sentinel — "
+                    f"clipping to 500 and adding is_first_touch flag"
+                )
+            df['is_first_touch'] = sentinel_mask.astype(float)
+            df['time_since_last_touch'] = df['time_since_last_touch'].clip(upper=500)
+        # Winsorise zone_strength at 99th percentile to prevent USDJPY outliers
+        # (e.g. strength=16.39 during 2024-07 JPY intervention) from dominating
+        # Logistic Regression in the ensemble.
+        if 'zone_strength' in df.columns:
+            cap = df['zone_strength'].quantile(0.99)
+            n_clipped = (df['zone_strength'] > cap).sum()
+            if n_clipped > 0:
+                logger.info(f"  Clipping {n_clipped} zone_strength outliers at 99th pct ({cap:.3f})")
+                df['zone_strength'] = df['zone_strength'].clip(upper=cap)
+        # ── End sentinel cleanup ────────────────────────────────────────────────
+
         numeric_features     = list(NUMERIC_FEATURES)
         categorical_features = list(CATEGORICAL_FEATURES)
         missing_numeric = [f for f in numeric_features     if f not in df.columns]
@@ -608,7 +634,7 @@ class DualTaskTrainer:
             p_lr  * self.ensemble_weights['ridge']
         )
         p_ensemble = np.clip(p_ensemble, 1e-7, 1 - 1e-7).astype(np.float32)
-        y_bin = (y_test >= 0.5).astype(int)
+        y_bin = (y_test >= 1.0).astype(int)   # FIX: match training cast — int(0.5)=0, int(0.75)=0, only 1.0=win
         metrics = {
             'roc_auc':     float(roc_auc_score(y_bin, p_ensemble)),
             'log_loss':    float(log_loss(y_bin, p_ensemble)),

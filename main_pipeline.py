@@ -30,6 +30,13 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-8s  %(message)s",
 )
 logger = logging.getLogger(__name__)
+def get_pip_size(sym: str) -> float:
+    sym_upper = sym.upper()
+    if "JPY" in sym_upper:
+        return 0.01
+    elif "XAU" in sym_upper or "GOLD" in sym_upper:
+        return 1.0
+    return 0.0001
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -105,7 +112,7 @@ def phase2_features(symbols: list = None) -> bool:
             if df_d1 is None:
                 logger.warning(f"  {sym}: D1 bars not found — htf_alignment will be 0 for all zones")
 
-            detector = SMCDetector(pip_size=0.01 if "JPY" in sym else 0.0001)
+            detector = SMCDetector(pip_size=get_pip_size(sym))
             features = detector.extract_all_features_mtf(
                 df_4h=df_4h, df_1h=df_1h, df_15min=df_15, df_d1=df_d1
             )
@@ -166,14 +173,16 @@ def phase3_labels(symbols: list = None) -> bool:
 
             df_4h = _load(Path(f"data/bars_4h_{sym}.parquet"))
             df_1h = _load(Path(f"data/bars_1h_{sym}.parquet"))
-            df_d1 = _load(Path(f"data/bars_1d_{sym}.parquet")) or _load(Path(f"data/bars_d1_{sym}.parquet"))
+            df_d1 = _load(Path(f"data/bars_1d_{sym}.parquet"))
+            if df_d1 is None:
+                df_d1 = _load(Path(f"data/bars_d1_{sym}.parquet"))
 
             generator = DualLabelGenerator(
                 risk_reward            = 1.5,
                 horizon_bars           = 60,
                 sl_atr_multiple        = 1.5,
                 continuation_break_atr = 1.0,
-                pip_size               = 0.01 if "JPY" in sym else 0.0001,
+                pip_size               = get_pip_size(sym),
             )
 
             labels_df = generator.generate_labels_from_zones(
