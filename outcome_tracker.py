@@ -261,8 +261,49 @@ class SignalOutcomeTrackerV2:
         }
 
         for sig in signals:
+            current_status = sig.get("status")
+            
+            # For EXPIRED signals — check if price has returned to the zone.
+            # If it has, reactivate to PENDING so the bar simulator can run.
+            if current_status == Status.EXPIRED:
+                zone_top = float(sig.get("zone_top",  sig.get("entry", 0)))
+                zone_bot = float(sig.get("zone_bottom", sig.get("entry", 0)))
+                
+                # Get latest price from cached bars (or fetch)
+                tf = sig.get("timeframe", "15min")
+                if tf not in df_cache:
+                    df_cache[tf] = fetch_fn(tf, 500)
+                df = df_cache.get(tf)
+                
+                if df is not None and not df.empty:
+                    time_col = "datetime" if "datetime" in df.columns else "time"
+                    latest_bar = df.iloc[-1]
+                    bar_high = float(latest_bar.get("high", 0))
+                    bar_low  = float(latest_bar.get("low",  0))
+                    
+                    # Price is touching the zone again
+                    price_in_zone = (bar_low <= zone_top and bar_high >= zone_bot)
+                    
+                    if price_in_zone:
+                        sig["status"]      = Status.PENDING
+                        sig["triggered"]   = False
+                        sig["bars_to_entry"] = None
+                        sig["bars_to_exit"]  = None
+                        sig.pop("resolved_at", None)
+                        # Reset timestamp to now so TTL restarts
+                        sig["timestamp"]   = datetime.utcnow().isoformat()
+                        logger.info(
+                            f"Reactivated EXPIRED signal: {sig.get('symbol')} "
+                            f"{sig.get('direction')} @ {sig.get('entry')} — price returned to zone"
+                        )
+                        current_status = Status.PENDING  # fall through to normal processing
+                    else:
+                        continue  # still expired, price hasn't returned
+                else:
+                    continue
+
             # Only process signals that are not yet resolved
-            if sig.get("status") not in (None, Status.PENDING, Status.TRIGGERED, "active"):
+            if current_status not in (None, Status.PENDING, Status.TRIGGERED, "active"):
                 continue
 
             tf = sig.get("timeframe", "15min")

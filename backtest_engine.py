@@ -65,7 +65,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
@@ -227,67 +227,97 @@ def fetch_bars_twelvedata(symbol: str = "EUR/USD",
     return df
 
 
-def load_bars(signals_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+def load_bars(signals_df: Optional[pd.DataFrame] = None) -> Dict[str, pd.DataFrame]:
     """
-    Load 15-min bar data.
-    If local bars don't cover the signal date range, automatically
-    fetches recent bars from TwelveData so the backtest actually runs.
+    Load 15-min bar data for all unique symbols in signals_df.
+    If signals_df is None, loads bars for all standard symbols: EURUSD, GBPUSD, USDJPY, XAUUSD.
+    For each symbol, if the local file is stale or missing, automatically fetches live bars via TwelveData.
     """
-    local_df = None
+    symbols = []
+    if signals_df is not None and "symbol" in signals_df.columns:
+        symbols = [s for s in signals_df["symbol"].dropna().unique() if str(s).strip()]
+    
+    if not symbols:
+        symbols = ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"]
 
-    if BARS_FILE.exists():
-        try:
-            local_df = pd.read_parquet(BARS_FILE)
-            if "time" not in local_df.columns:
-                local_df = local_df.reset_index().rename(columns={"index": "time"})
-            local_df["time"] = pd.to_datetime(local_df["time"])
-            local_df = local_df.sort_values("time").reset_index(drop=True)
-            logger.info(f"Local bars: {len(local_df)} rows "
-                        f"({local_df['time'].iloc[0].date()} → "
-                        f"{local_df['time'].iloc[-1].date()})")
-        except Exception as exc:
-            logger.warning(f"Could not read local bars: {exc}")
-            local_df = None
+    bars_by_sym = {}
 
-    needs_live = True
-    if local_df is not None and signals_df is not None and "signal_time" in signals_df.columns:
-        latest_signal = pd.to_datetime(signals_df["signal_time"]).max()
-        latest_local  = local_df["time"].max()
-        gap_hours = (latest_signal - latest_local).total_seconds() / 3600
-        if gap_hours <= 6:
-            needs_live = False
-            logger.info("Local bars cover signal dates — skipping TwelveData fetch")
-        else:
-            logger.warning(
-                f"Local bars end {latest_local.date()} but latest signal is "
-                f"{latest_signal.date()} ({gap_hours:.0f}h gap) — fetching live bars"
-            )
-    elif local_df is None:
-        logger.warning("No local bars found — fetching from TwelveData")
+    for raw_sym in symbols:
+        sym = raw_sym.upper().replace("/", "")
+        # Format the twelve data query symbol (with slash, except gold which TwelveData usually expects as XAU/USD)
+        query_sym = raw_sym
+        if "/" not in query_sym:
+            if query_sym in ("EURUSD", "GBPUSD", "USDJPY", "XAUUSD"):
+                query_sym = f"{query_sym[:3]}/{query_sym[3:]}"
+        
+        local_df = None
+        # Try finding local file bars_15min_{sym}.parquet or bars_15min_{raw_sym}.parquet
+        for filename in [f"bars_15min_{sym}.parquet", f"bars_15min_{raw_sym}.parquet"]:
+            p = Path("data") / filename
+            if p.exists():
+                try:
+                    local_df = pd.read_parquet(p)
+                    if "time" not in local_df.columns:
+                        local_df = local_df.reset_index().rename(columns={"index": "time"})
+                    local_df["time"] = pd.to_datetime(local_df["time"])
+                    local_df = local_df.sort_values("time").reset_index(drop=True)
+                    logger.info(f"Local bars for {sym}: {len(local_df)} rows "
+                                f"({local_df['time'].iloc[0].date()} → "
+                                f"{local_df['time'].iloc[-1].date()})")
+                    break
+                except Exception as exc:
+                    logger.warning(f"Could not read local bars file {p}: {exc}")
 
-    if needs_live:
-        live_df = fetch_bars_twelvedata(outputsize=5000)
-        if live_df is not None:
-            if local_df is not None:
-                combined = pd.concat([local_df, live_df], ignore_index=True)
-                combined = (combined
-                            .drop_duplicates(subset=["time"])
-                            .sort_values("time")
-                            .reset_index(drop=True))
-                logger.info(f"Combined bars: {len(combined)} rows")
-                return combined
+        needs_live = True
+        if local_df is not None:
+            if signals_df is not None and "signal_time" in signals_df.columns:
+                # filter signals for this symbol
+                sym_signals = signals_df[signals_df["symbol"].str.upper().str.replace("/", "") == sym]
+                if not sym_signals.empty:
+                    latest_signal = pd.to_datetime(sym_signals["signal_time"]).max()
+                    latest_local  = local_df["time"].max()
+                    gap_hours = (latest_signal - latest_local).total_seconds() / 3600
+                    if gap_hours <= 6:
+                        needs_live = False
+                        logger.info(f"Local bars for {sym} cover signal dates — skipping TwelveData fetch")
+                    else:
+                        logger.warning(
+                            f"Local bars for {sym} end {latest_local.date()} but latest signal is "
+                            f"{latest_signal.date()} ({gap_hours:.0f}h gap) — fetching live bars"
+                        )
+                else:
+                    needs_live = False  # No signals for this symbol, no need to update
             else:
-                return live_df
-        elif local_df is not None:
-            logger.warning("TwelveData fetch failed — falling back to local bars")
-            return local_df
-        else:
-            raise FileNotFoundError(
-                "No local bars and TwelveData fetch failed. "
-                "Run tick_ingestion.py or check your API key."
-            )
+                needs_live = False  # No signals dataframe provided to check freshness
 
-    return local_df
+        if needs_live:
+            live_df = fetch_bars_twelvedata(symbol=query_sym, outputsize=5000)
+            if live_df is not None:
+                if local_df is not None:
+                    combined = pd.concat([local_df, live_df], ignore_index=True)
+                    combined = (combined
+                                .drop_duplicates(subset=["time"])
+                                .sort_values("time")
+                                .reset_index(drop=True))
+                    logger.info(f"Combined bars for {sym}: {len(combined)} rows")
+                    bars_by_sym[sym] = combined
+                else:
+                    bars_by_sym[sym] = live_df
+            elif local_df is not None:
+                logger.warning(f"TwelveData fetch failed for {sym} — falling back to local bars")
+                bars_by_sym[sym] = local_df
+            else:
+                logger.warning(f"No local bars for {sym} and TwelveData fetch failed. Skipping this symbol.")
+        elif local_df is not None:
+            bars_by_sym[sym] = local_df
+
+    if not bars_by_sym:
+        raise FileNotFoundError(
+            "No local bars found and TwelveData fetch failed for all symbols. "
+            "Verify TwelveData API key and that tick data has been resampled."
+        )
+
+    return bars_by_sym
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -568,14 +598,14 @@ class BacktestEngine:
 
     # ── full backtest ──────────────────────────────────────────────────────────
 
-    def run(self, signals: pd.DataFrame, bars: pd.DataFrame) -> Dict:
+    def run(self, signals: pd.DataFrame, bars: Union[pd.DataFrame, Dict[str, pd.DataFrame]]) -> Dict:
         """
         Main backtest loop.
 
         Parameters
         ----------
         signals : DataFrame from load_signals_from_json()
-        bars    : DataFrame from load_bars()
+        bars    : DataFrame or Dict of DataFrames from load_bars()
 
         NOTE on forward bar slicing
         ---------------------------
@@ -586,7 +616,15 @@ class BacktestEngine:
         """
         self.balance      = self.initial_balance
         self.trades       = []
-        self.equity_curve = [{"time": bars["time"].iloc[0], "balance": self.balance}]
+        
+        if isinstance(bars, dict):
+            # Use the time from the first available DataFrame in the dictionary
+            first_df = next(iter(bars.values()))
+            start_time = first_df["time"].iloc[0] if not first_df.empty else datetime.utcnow()
+        else:
+            start_time = bars["time"].iloc[0] if not bars.empty else datetime.utcnow()
+            
+        self.equity_curve = [{"time": start_time, "balance": self.balance}]
 
         open_count = 0
 
@@ -599,9 +637,25 @@ class BacktestEngine:
             if pd.isna(sig_time):
                 continue
 
+            symbol = sig.get("symbol", "EURUSD")
+            
+            # Look up correct bars DataFrame
+            if isinstance(bars, dict):
+                sym_key = symbol.upper().replace("/", "")
+                sym_bars = None
+                for k, df_b in bars.items():
+                    if k.upper().replace("/", "") == sym_key:
+                        sym_bars = df_b
+                        break
+                if sym_bars is None:
+                    logger.warning(f"No bars found for symbol {symbol} in backtest")
+                    continue
+            else:
+                sym_bars = bars
+
             # All bars strictly after the signal bar
             # reset_index so enumerate() gives clean 0-based bar counts
-            forward = (bars[bars["time"] > sig_time]
+            forward = (sym_bars[sym_bars["time"] > sig_time]
                        .reset_index(drop=True))
 
             if len(forward) < 3:
@@ -925,8 +979,8 @@ def main():
     parser.add_argument("--balance",  type=float, default=10_000, help="Starting balance (default 10000)")
     parser.add_argument("--risk",     type=float, default=1.0,    help="Risk per trade %% (default 1)")
     parser.add_argument("--slippage", type=float, default=0.3,    help="Slippage pips (default 0.3)")
-    parser.add_argument("--horizon",  type=int,   default=96,
-                        help="Max bars per phase (default 96 = 24h on 15min). "
+    parser.add_argument("--horizon",  type=int,   default=192,
+                        help="Max bars per phase (default 192 = 48h on 15min). "
                              "Applies to BOTH entry scan and post-entry TP/SL scan.")
     parser.add_argument("--no-save",  action="store_true", help="Don't save results to disk")
     parser.add_argument("--min-prob", type=float, default=0.0,

@@ -1,29 +1,46 @@
- python smc_detector.py --symbol EURUSD --pip_size 0.0001  
- python smc_detector.py --symbol GBPUSD --pip_size 0.0001 
- python smc_detector.py --symbol USDJPY --pip_size 0.01 
- python smc_detector.py --symbol XAUUSD --pip_size 1.0 
-
-
- step 2
- python label_generator.py --symbol ALL 
-
-  ### Step 3: Data Validation                                                                                                   
-                                                                                                                                
-  To verify the generated dataset's schemas and check for ATR outliers:                                                         
+ ### 1. Pre-screen ML Gate (0.45–0.55 ➔ 0.65 Flat, No Session Softening)                                                                                             
+                                                                                                                                                                      
+  • What is currently happening: The system uses a pre-screen gate of  0.55  (reduced to  0.45  during the Asian session 00:00–07:00 UTC) to filter out weak setups   
+  before doing heavy feature calculation.                                                                                                                             
+  • How raising this to  0.65  flat helps:                                                                                                                            
+      • Saves API Calls & Compute: It immediately drops low-probability zones before the predictor runs heavy multi-timeframe feature calculations on H1/D1/5min bars.
+      • Ensures Setup Quality: By removing the "session softening," you avoid taking lower-quality setups at night. Low-volume sessions (like the Asian session) are  
+      prone to fakeouts and spread-widening, so setups should actually face stricter rules, not softer ones.                                                          
+                                                                                                                                                                      
+                                                                                                                                                                      
+  ### 2. Final Reversion (REV) Threshold (0.62 ➔ 0.70+)                                                                                                               
   
-  •  python data_validation.py 
+  • What is currently happening: The final trade trigger threshold in your constructor is capped at  0.62 .
+  • How raising this to  0.70+  helps:
+      • Locks in the Edge: According to your backtest logs (where outcomes.parquet was replayed), setups above the 75% threshold had a 100% win rate, whereas the     
+      70–75% bucket had a 57% win rate. Lowering the threshold to  0.62  lets in lower-conviction trades that degrade the overall profit factor.
+      • Reduces Max Drawdown: Elevating the threshold to  0.70  filters out marginal trades, protecting your account balance from drawdown phases during choppy market
+      regimes.
+  
+
+  ### 3. Confluence Minimum (1/10 ➔ 6/10)
+  
+  • What is currently happening: In production_predictor.py, the minimum confluence score is set to  1  ( min_confluence_score=1 ).
+  • How raising this to  6/10  helps:
+      • Guarantees SMC Confluence: A confluence score of 1 means a zone is evaluated in isolation. A confluence score of 6 or higher means the zone overlaps with     
+      multiple key structures (e.g., a 4H Order Block + a 4H Fair Value Gap + a 61.8% Fibonacci level + Daily Trend Alignment).
+      • Institutional Alignment: Large institutions place their orders where multiple technical factors intersect. By requiring  6/10 , you ensure you are only       
+      trading zones where significant institutional liquidity is waiting.
+  
+
+  ### 4. Zone Strength (0.5 ➔ 0.8 ATR)
+  
+  • What is currently happening: The zone strength filter accepts imbalances that are at least  0.5 ATR .
+  • How raising this to  0.8 ATR  helps:
+      • Selects True Imbalances: Zone strength measures the explosiveness of the move that created the Order Block or FVG. A  0.5 ATR  move is relatively small and   
+      can be standard market noise. A  0.8 ATR  or greater move represents an aggressive, impulsive displacement of price, confirming that institutions were actively 
+      driving the market.
+  
   ──────
-  ### Step 4: Model Training
+  ### Summary: What this transition achieves
   
-  To train the Reversion and Continuation ensemble models on the validated parquets:
+  Transitioning to this stricter architecture shifts your system from a high-frequency, medium-probability setup to an ultra-selective, high-probability system.      
   
-  •  python model_trainer.py 
-  • (Or run the complete training validation suite:  python retrain_all.py )
-  ──────
-  ### Step 5: Backtesting
-  
-  • To replay live signals from all_signals.json against historical bar data:
-   python backtest_engine.py --source signals 
-  • To replay pre-resolved outcomes from outcomes.parquet (nearly 2 years of history, filtered for ≥70% confidence):              
-   python backtest_engine.py --source outcomes --min-prob 0.70 
-   
+  It cuts out the noise, saves your broker account from unnecessary spread/commission leakages, and matches the true structural mechanics of Smart Money Concepts     
+  (SMC).
+

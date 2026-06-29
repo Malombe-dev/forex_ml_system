@@ -1022,10 +1022,18 @@ class DualLabelGenerator:
         except Exception:
             return 0
 
+        # ── CLOSED-D1 GATE ────────────────────────────────────────────────────
+        # Use only FULLY CLOSED D1 bars — i.e. bars whose open time is strictly
+        # BEFORE the calendar date of zone_time. A D1 bar with open=2026-06-26
+        # 00:00 is only complete once 2026-06-27 opens; at 05:23 on Jun 26 it
+        # still has 18+ hours of price action ahead. Including it (the old <= logic)
+        # meant training saw the full day's close — a lookahead that live can't match.
+        zone_date = pd.to_datetime(zone_time).normalize()  # floor to midnight UTC
         if 'time' in df_d1.columns:
-            d1_before = df_d1[pd.to_datetime(df_d1['time']) <= zone_time]
+            d1_before = df_d1[pd.to_datetime(df_d1['time']).dt.normalize() < zone_date]
         else:
-            d1_before = df_d1[df_d1.index <= zone_time]
+            d1_before = df_d1[pd.to_datetime(df_d1.index).normalize() < zone_date]
+        # ─────────────────────────────────────────────────────────────────────
 
         if len(d1_before) < 50:
             return 0

@@ -163,6 +163,8 @@ def _compute_raw_features(
 
     # ── Zone features ─────────────────────────────────────────────────────────
     zone_strength = float(zone.get("strength", 1.0))
+    # Cap zone_strength at 6.7 to match training percentile clipping
+    zone_strength = min(zone_strength, 6.7)
     raw_conf = zone.get("confluence", 1)
     if isinstance(raw_conf, dict):
         zone_confluence = int(raw_conf.get("count", raw_conf.get("score", 1)))
@@ -251,12 +253,17 @@ def _compute_raw_features(
     # making the feature circular — zones that ARE 4H FVGs always scored 1.0,
     # producing 95%+ win rates on tf_source='4h' rows (data leakage confirmed).
     #
-    # CORRECT: only fire when this OB zone overlaps a SEPARATE 4H FVG.
-    # fvg_overlap is injected by production_predictor on OB zones whose price
-    # range overlaps a distinct 4H FVG — never on the FVG zone itself.
-    # h4_fvg_zone is excluded (it marks the zone AS the FVG — circular).
-    # Training rows default to 0.0 (label_generator does not inject fvg_overlap).
-    h4_fvg_inside = 1.0 if zone.get("fvg_overlap", False) else 0.0
+    # CORRECT: only fire when this OB zone overlaps a SEPARATE 4H FVG, or if the zone
+    # itself was explicitly flagged as a 4H FVG zone during HTF ML scoring setup
+    # (matching training where any zone inside/representing a 4H FVG was labeled with h4_fvg_inside=1.0).
+    h4_fvg_inside = 1.0 if (
+        zone.get("h4_fvg_zone", False)
+        or zone.get("fvg_overlap", False)
+        or "fvg" in sources
+        or zone.get("source", "") == "fvg"
+        or "fvg" in str(zone.get("tf_source", ""))
+        or any("fvg" in str(s) for s in sources)
+    ) else 0.0
 
     d1_ema_distance = _compute_d1_ema_distance(
         touch_bar=t_bar,

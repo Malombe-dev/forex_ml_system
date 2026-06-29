@@ -511,20 +511,41 @@ def save_signals_to_single_file(signals: List[Dict],
 
     for signal in signals:
         sig_id = get_signal_id(signal)
+        cur_ts = signal.get('timestamp') or datetime.utcnow().isoformat()
 
         if sig_id in existing_ids:
             idx = existing_ids[sig_id]
             ex  = existing_signals[idx]
 
-            # Never touch resolved outcomes — they are permanent historical records
-            if ex.get('status') in RESOLVED_STATUSES:
+            is_expired = (ex.get('status') == 'expired')
+
+            # Never touch resolved outcomes — unless it's expired and re-generated in the current cycle
+            if ex.get('status') in RESOLVED_STATUSES and not is_expired:
                 skipped_resolved += 1
                 continue
 
-            # Only update signals still awaiting entry
-            if ex.get('status') == 'pending':
+            # Update count and history
+            if 'cycle_history' not in ex or not isinstance(ex['cycle_history'], list):
+                # Backfill from existing timestamp/last_seen
+                orig_ts = ex.get('timestamp') or ex.get('last_seen')
+                ex['cycle_history'] = [orig_ts] if orig_ts else []
+            
+            if cur_ts not in ex['cycle_history']:
+                ex['cycle_history'].append(cur_ts)
+            ex['production_count'] = len(ex['cycle_history'])
 
-                # Rule 1 — always refresh execution levels (model has fresher data)
+            if is_expired:
+                # Update status back to pending
+                ex['status'] = 'pending'
+                # Clean up resolved trackers
+                ex.pop('exit_price', None)
+                ex.pop('exit_time', None)
+                ex.pop('outcome_reason', None)
+                ex.pop('resolved_at', None)
+                ex.pop('bars_to_entry', None)
+                ex.pop('bars_to_exit', None)
+                
+                # Overwrite/refresh everything since it is a regenerated zone
                 ex['entry']        = signal.get('entry',       ex.get('entry'))
                 ex['sl']           = signal.get('sl',          ex.get('sl'))
                 ex['tp']           = signal.get('tp',          ex.get('tp'))
@@ -532,33 +553,51 @@ def save_signals_to_single_file(signals: List[Dict],
                 ex['reward_pips']  = signal.get('reward_pips', ex.get('reward_pips'))
                 ex['risk_reward']  = signal.get('risk_reward', ex.get('risk_reward'))
                 ex['rr']           = signal.get('rr',          ex.get('rr'))
-
-                # Rule 2 — only upgrade probability, never degrade
-                new_prob = float(signal.get('probability', 0))
-                old_prob = float(ex.get('probability', 0))
-                if new_prob > old_prob:
-                    ex['probability']      = new_prob
-                    ex['base_probability'] = signal.get(
-                        'base_probability',
-                        signal.get('probability', ex.get('base_probability', 0))
-                    )
-
-                # Rule 4 — refresh metadata with latest values where available
+                ex['probability']      = float(signal.get('probability', 0))
+                ex['base_probability'] = float(signal.get('base_probability', signal.get('probability', 0)))
                 ex['confluence']    = signal.get('confluence',    ex.get('confluence'))
                 ex['distance_pips'] = signal.get('distance_pips', ex.get('distance_pips'))
-                # Never overwrite it on a dedup cycle-update — the expiry clock must not
-                # reset just because the same zone is seen again.  Only set it if the
-                # existing record has no valid_until yet (should never happen, but safe).
-                if not ex.get('valid_until'):
-                    ex['valid_until'] = signal.get('valid_until')
-                ex['last_seen']     = signal.get('last_seen', signal.get('timestamp', ex.get('last_seen')))
-
+                ex['valid_until']   = signal.get('valid_until')
+                ex['last_seen']     = cur_ts
+                ex['timestamp']     = cur_ts
                 updated += 1
+            else:
+                # Only update signals still awaiting entry
+                if ex.get('status') == 'pending':
+                    # Rule 1 — always refresh execution levels (model has fresher data)
+                    ex['entry']        = signal.get('entry',       ex.get('entry'))
+                    ex['sl']           = signal.get('sl',          ex.get('sl'))
+                    ex['tp']           = signal.get('tp',          ex.get('tp'))
+                    ex['risk_pips']    = signal.get('risk_pips',   ex.get('risk_pips'))
+                    ex['reward_pips']  = signal.get('reward_pips', ex.get('reward_pips'))
+                    ex['risk_reward']  = signal.get('risk_reward', ex.get('risk_reward'))
+                    ex['rr']           = signal.get('rr',          ex.get('rr'))
+
+                    # Rule 2 — only upgrade probability, never degrade
+                    new_prob = float(signal.get('probability', 0))
+                    old_prob = float(ex.get('probability', 0))
+                    if new_prob > old_prob:
+                        ex['probability']      = new_prob
+                        ex['base_probability'] = signal.get(
+                            'base_probability',
+                            signal.get('probability', ex.get('base_probability', 0))
+                        )
+
+                    # Rule 4 — refresh metadata with latest values where available
+                    ex['confluence']    = signal.get('confluence',    ex.get('confluence'))
+                    ex['distance_pips'] = signal.get('distance_pips', ex.get('distance_pips'))
+                    if not ex.get('valid_until'):
+                        ex['valid_until'] = signal.get('valid_until')
+                    ex['last_seen']     = cur_ts
+
+                    updated += 1
             continue
 
         # Brand-new signal — add with pending status
         signal['status']    = 'pending'
-        signal['last_seen'] = signal.get('timestamp')
+        signal['last_seen'] = cur_ts
+        signal['cycle_history'] = [cur_ts]
+        signal['production_count'] = 1
         existing_signals.append(signal)
         new_added += 1
 
@@ -770,6 +809,14 @@ class ProductionForexPredictor:
             self._calibrator = None
 
 
+    def get_scan_distance(self, current_atr, symbol):
+        """Dynamic scan distance based on ATR."""
+        if 'XAU' in symbol or 'GOLD' in symbol.upper():
+            multiplier = 1.5  # gold moves fast, scan slightly wider
+        else:
+            multiplier = 1.0  # forex: 1x ATR is enough
+        return current_atr * multiplier / self.pip_size  # convert to pips
+
     def _get_session(self, hour: int) -> str:
         return _canonical_get_session(hour)
 
@@ -900,6 +947,16 @@ class ProductionForexPredictor:
         _df_4h_c = df_4h_c if df_4h_c is not None else self.fetch_bars(interval="4h",   outputsize=100)
         _df_4h   = df_4h   if df_4h   is not None else self.fetch_bars(interval="4h",   outputsize=200)
         _df_1d   = df_1d   if df_1d   is not None else self.fetch_bars(interval="1day", outputsize=90)
+        # ── CLOSED-D1 GATE (get_htf_context) ─────────────────────────────────
+        # Drop the still-forming D1 candle. D1 bar 'time' = open time (00:00 UTC).
+        # Only bars from BEFORE today are fully closed and safe to use.
+        # Matches the fix applied in label_generator.py line 1026.
+        if _df_1d is not None and len(_df_1d) > 0 and 'time' in _df_1d.columns:
+            _today_utc = pd.Timestamp(datetime.utcnow().date())
+            _df_1d = _df_1d[pd.to_datetime(_df_1d['time']).dt.normalize() < _today_utc].copy()
+            if len(_df_1d) == 0:
+                _df_1d = None
+        # ─────────────────────────────────────────────────────────────────────
 
         if _df_1h is not None and len(_df_1h) > 50:
             context['h1_trend']  = 'bullish' if _df_1h['ema_20'].iloc[-1] > _df_1h['ema_50'].iloc[-1] else 'bearish'
@@ -1522,27 +1579,45 @@ class ProductionForexPredictor:
             w = self._ensemble_weights
             p_xgb = float(self.model.predict_proba(X_scaled)[0][1])
 
+            p_rf = None
+            p_lr = None
             if self.rf_model is not None and self.lr_model is not None:
                 p_rf  = float(self.rf_model.predict_proba(X_scaled)[0][1])
                 p_lr  = float(self.lr_model.predict_proba(X_scaled)[0][1])
                 raw_prob = (p_xgb * w['xgb']) + (p_rf * w['rf']) + (p_lr * w['lr'])
             elif self.rf_model is not None:
                 # LR missing — redistribute its weight to XGBoost
-                raw_prob = p_xgb * (w['xgb'] + w['lr']) + \
-                           float(self.rf_model.predict_proba(X_scaled)[0][1]) * w['rf']
+                p_rf  = float(self.rf_model.predict_proba(X_scaled)[0][1])
+                raw_prob = p_xgb * (w['xgb'] + w['lr']) + p_rf * w['rf']
             else:
                 # Only XGBoost available — use it alone
                 raw_prob = p_xgb
 
             raw_prob = float(np.clip(raw_prob, 0.0, 1.0))
+            calibrated_prob = raw_prob
 
             if getattr(self, '_calibrator', None) is not None:
                 try:
-                    raw_prob = float(self._calibrator.transform(
+                    calibrated_prob = float(self._calibrator.transform(
                         np.clip([raw_prob], 1e-6, 1 - 1e-6))[0])
                 except Exception:
                     pass
-            return float(np.clip(raw_prob, 0.0, 1.0))
+            final_prob = float(np.clip(calibrated_prob, 0.0, 1.0))
+
+            # ── Detailed Logging of Ensemble Scoring ──────────────────────────
+            msg = (f"  🔮 Ensemble scoring for {self.symbol} {zone.get('type','unknown')} zone "
+                   f"at {zone.get('price_mid', 0.0):.5f} | XGB={p_xgb:.3f}")
+            if p_rf is not None:
+                msg += f" RF={p_rf:.3f}"
+            if p_lr is not None:
+                msg += f" LR={p_lr:.3f}"
+            msg += f" | Raw Ensem={raw_prob:.3f} | Calibrated={final_prob:.3f}"
+            
+            logger.info(msg)
+            if self.debug:
+                print(msg)
+
+            return final_prob
         except Exception as exc:
             print(f"  ❌ model.predict FAILED: {exc}")
             logger.error(f"Model prediction failed for {zone.get('id','unknown')} ({self.symbol}, task={task}): {exc}", exc_info=True)
@@ -1998,6 +2073,21 @@ class ProductionForexPredictor:
         _df_1h  = df_1h  if df_1h  is not None else self.fetch_bars(interval="1h",    outputsize=100)
         _df_d1  = df_d1  if df_d1  is not None else self.fetch_bars(interval="1day",  outputsize=90)
 
+        # ── CLOSED-D1 GATE ────────────────────────────────────────────────────
+        # Strip the still-forming D1 candle so every D1-based calculation
+        # (h4_trend gate, _check_d1_alignment, d1_premium_discount, daily_structure)
+        # only ever sees FULLY CLOSED daily bars — matching what label_generator.py
+        # should use during training (fix applied there too in calculate_htf_trend_alignment).
+        # A D1 bar's 'time' field = its open time (00:00 UTC).
+        # The bar is only complete once the NEXT day has opened.
+        # We drop any bar whose open time == today's UTC date.
+        if _df_d1 is not None and len(_df_d1) > 0 and 'time' in _df_d1.columns:
+            _today_utc = pd.Timestamp(datetime.utcnow().date())
+            _df_d1 = _df_d1[pd.to_datetime(_df_d1['time']).dt.normalize() < _today_utc].copy()
+            if len(_df_d1) == 0:
+                _df_d1 = None  # no closed bars at all (shouldn't happen)
+        # ─────────────────────────────────────────────────────────────────────
+
         if _df_15m is not None and len(_df_15m) > 0:
             current_price = _df_15m['close'].iloc[-1]
         else:
@@ -2016,6 +2106,15 @@ class ProductionForexPredictor:
         if h4_trend == 'neutral' and htf_context:
             h4_trend = htf_context.get('h4_structure', {}).get('trend', 'neutral')
 
+        # ── D1 HARD BIAS GATE ─────────────────────────────────────────────────
+        # D1 is the higher authority. When D1 has a clear bias it overrules 4H.
+        # When D1 is neutral (consolidating), 4H holds the gate as fallback.
+        # This fixes the GBP/USD case: h4=bullish but D1=bearish → BUY blocked.
+        # daily_structure is computed on closed D1 bars only (closed-D1 gate above).
+        _d1_trend   = htf_context.get('daily_structure', {}).get('trend', 'neutral') if htf_context else 'neutral'
+        _hard_bias  = _d1_trend if _d1_trend != 'neutral' else h4_trend
+        # ─────────────────────────────────────────────────────────────────────
+
         # D1 Premium / Discount gate calculation
         _d1_pd = 0
         if _df_d1 is not None and len(_df_d1) >= 20:
@@ -2031,8 +2130,8 @@ class ProductionForexPredictor:
                     _d1_pd = -1  # discount
 
         htf_setups       = []
-        MAX_DIST_ATR     = 20.0
-        MAX_DIST_PIPS    = MAX_DIST_ATR * (current_atr / self.pip_size)
+        # Respect dynamic scan distance based on current ATR
+        MAX_DIST_PIPS    = self.get_scan_distance(current_atr, self.symbol)
         MIN_HTF_RR   = 1.2
         MAX_HTF_RR   = 6.0 if self.symbol == 'XAU/USD' else 10.0
         MIN_HTF_STRENGTH = 0.5  # lowered from 0.8 — 0.8 kills valid zones in low-vol sessions
@@ -2096,17 +2195,18 @@ class ProductionForexPredictor:
             entry     = fvg['mid']
             sl        = fvg['bottom'] if direction == 'BUY' else fvg['top']
 
-            # ── 4H HARD BIAS BLOCK (HTF FVG) ─────────────────────────────────
-            # Bullish 4H trend → block SELL signals. Bearish → block BUY signals.
-            if h4_trend == 'bullish' and direction == 'SELL':
+            # ── D1/4H HARD BIAS BLOCK (HTF FVG) ──────────────────────────────
+            # D1 is the hard gate when it has a clear bias; 4H is fallback.
+            # Bullish bias → block SELL. Bearish bias → block BUY.
+            if _hard_bias == 'bullish' and direction == 'SELL':
                 htf_fvg_rejected['direction'] += 1
                 if self.debug:
-                    print(f"     ⛔ HTF FVG HARD BLOCK: SELL blocked — 4H trend is bullish")
+                    print(f"     ⛔ HTF FVG HARD BLOCK: SELL blocked — D1/4H bias is bullish (d1={_d1_trend} h4={h4_trend})")
                 continue
-            if h4_trend == 'bearish' and direction == 'BUY':
+            if _hard_bias == 'bearish' and direction == 'BUY':
                 htf_fvg_rejected['direction'] += 1
                 if self.debug:
-                    print(f"     ⛔ HTF FVG HARD BLOCK: BUY blocked — 4H trend is bearish")
+                    print(f"     ⛔ HTF FVG HARD BLOCK: BUY blocked — D1/4H bias is bearish (d1={_d1_trend} h4={h4_trend})")
                 continue
 
             # ── D1 Premium / Discount Gate (HTF FVG) ───────────────────────────
@@ -2155,14 +2255,11 @@ class ProductionForexPredictor:
             }
             base_prob = self._ml_score_htf_zone(
                 fvg_zone_for_model, df, tf, htf_context=htf_context,
-                df_4h=df)
-            # Gold keeps strict 0.55 gate unchanged
-            # Forex gets a softer gate during Asia/pre-London (00:00–07:00 UTC)
-            if self.symbol == 'XAU/USD':
-                _ml_gate = 0.55
-            else:
-                _hour_utc = datetime.utcnow().hour
-                _ml_gate  = 0.45 if 0 <= _hour_utc < 7 else 0.55
+                df_4h=df, df_1h=_df_1h, df_5m=_df_5m, df_d1=_df_d1)
+            # Gate raised to 0.70 — calibration shows 0.60–0.89 range is
+            # overconfident by 25–30pp. Only 0.70+ signals have reliable edge.
+            # Asia/pre-London softer gate removed — not justified by calibration.
+            _ml_gate = 0.70
 
             if base_prob < _ml_gate:
                 if self.debug:
@@ -2192,17 +2289,18 @@ class ProductionForexPredictor:
 
             direction = 'BUY' if ob['type'] == 'bullish' else 'SELL'
 
-            # ── 4H HARD BIAS BLOCK (HTF OB) ──────────────────────────────────
-            # Bullish 4H trend → block SELL signals. Bearish → block BUY signals.
-            if h4_trend == 'bullish' and direction == 'SELL':
+            # ── D1/4H HARD BIAS BLOCK (HTF OB) ───────────────────────────────
+            # D1 is the hard gate when it has a clear bias; 4H is fallback.
+            # Bullish bias → block SELL. Bearish bias → block BUY.
+            if _hard_bias == 'bullish' and direction == 'SELL':
                 htf_ob_rejected['direction'] += 1
                 if self.debug:
-                    print(f"     ⛔ HTF OB HARD BLOCK: SELL blocked — 4H trend is bullish")
+                    print(f"     ⛔ HTF OB HARD BLOCK: SELL blocked — D1/4H bias is bullish (d1={_d1_trend} h4={h4_trend})")
                 continue
-            if h4_trend == 'bearish' and direction == 'BUY':
+            if _hard_bias == 'bearish' and direction == 'BUY':
                 htf_ob_rejected['direction'] += 1
                 if self.debug:
-                    print(f"     ⛔ HTF OB HARD BLOCK: BUY blocked — 4H trend is bearish")
+                    print(f"     ⛔ HTF OB HARD BLOCK: BUY blocked — D1/4H bias is bearish (d1={_d1_trend} h4={h4_trend})")
                 continue
 
             # ── D1 Premium / Discount Gate (HTF OB) ────────────────────────────
@@ -2354,14 +2452,10 @@ class ProductionForexPredictor:
                  'index': ob.get('index', len(df) - 1),
                  'mid': ob['mid'], 'top': ob['top'], 'bottom': ob['bottom']},
                 df, tf, htf_context=htf_context, zone_override=full_ob_zone,
-                df_4h=df)
-            # Gold keeps strict 0.55 gate unchanged
-            # Forex gets a softer gate during Asia/pre-London (00:00–07:00 UTC)
-            if self.symbol == 'XAU/USD':
-                _ml_gate = 0.55
-            else:
-                _hour_utc = datetime.utcnow().hour
-                _ml_gate  = 0.45 if 0 <= _hour_utc < 7 else 0.55
+                df_4h=df, df_1h=_df_1h, df_5m=_df_5m, df_d1=_df_d1)
+            # Gate raised to 0.70 — calibration shows 0.60–0.89 range is
+            # overconfident by 25–30pp. Only 0.70+ signals have reliable edge.
+            _ml_gate = 0.70
 
             if base_prob < _ml_gate:
                 if self.debug:
@@ -2423,6 +2517,16 @@ class ProductionForexPredictor:
         current_price = df['close'].iloc[-1]
         current_atr   = df['atr'].iloc[-1]
         current_time  = datetime.utcnow()
+
+        # Update zone tracker distance threshold dynamically based on 4H ATR
+        df_4h = _bars['4h/200']
+        if df_4h is not None and len(df_4h) > 0 and 'atr' in df_4h.columns:
+            h4_atr = df_4h['atr'].iloc[-1]
+        else:
+            h4_atr = current_atr * 4  # fallback: scale 15m ATR
+            
+        dynamic_dist = self.get_scan_distance(h4_atr, self.symbol)
+        self.zone_tracker.distance_threshold_pips = dynamic_dist
 
         expired_count = self.zone_tracker.cleanup_expired(current_time, current_price)
         htf_context   = self.get_htf_context(
@@ -2687,15 +2791,19 @@ class ProductionForexPredictor:
                 rejected_cnt += 1
                 reject_reasons['d1_premium_discount'] += 1
                 observation_signals.append(_make_obs_signal(zone, '4h_bullish_blocks_sell'))
+                msg = f"  ⛔ 4H BIAS HARD BLOCK: supply (SELL) zone at {zone.get('price_mid', 0.0):.5f} blocked — 4H trend is bullish"
+                logger.info(msg)
                 if self.debug:
-                    print(f"     ⛔ 4H BIAS HARD BLOCK: supply (SELL) blocked — 4H trend is bullish")
+                    print(msg)
                 continue
             elif h4_trend == 'bearish' and zone['type'] == 'demand':
                 rejected_cnt += 1
                 reject_reasons['d1_premium_discount'] += 1
                 observation_signals.append(_make_obs_signal(zone, '4h_bearish_blocks_buy'))
+                msg = f"  ⛔ 4H BIAS HARD BLOCK: demand (BUY) zone at {zone.get('price_mid', 0.0):.5f} blocked — 4H trend is bearish"
+                logger.info(msg)
                 if self.debug:
-                    print(f"     ⛔ 4H BIAS HARD BLOCK: demand (BUY) blocked — 4H trend is bearish")
+                    print(msg)
                 continue
             _h4_counter_trend_penalty = 0.0  # no penalty needed — counter-trend already blocked
 
@@ -2706,8 +2814,10 @@ class ProductionForexPredictor:
                     rejected_cnt += 1
                     reject_reasons['d1_premium_discount'] += 1
                     observation_signals.append(_make_obs_signal(zone, 'd1_premium_blocks_demand'))
+                    msg = f"  ⛔ D1 PREMIUM GATE: demand (BUY) zone at {zone.get('price_mid', 0.0):.5f} blocked — price in D1 premium and 4H={h4_trend}"
+                    logger.info(msg)
                     if self.debug:
-                        print(f"     ⛔ D1 PREMIUM GATE: demand zone blocked — price in D1 premium and 4H={h4_trend}")
+                        print(msg)
                     continue
             if _d1_pd == -1 and zone['type'] == 'supply':
                 # Price in D1 discount — only block supply when 4H is also bullish
@@ -2717,8 +2827,10 @@ class ProductionForexPredictor:
                     rejected_cnt += 1
                     reject_reasons['d1_premium_discount'] += 1
                     observation_signals.append(_make_obs_signal(zone, 'd1_discount_blocks_supply'))
+                    msg = f"  ⛔ D1 DISCOUNT GATE: supply (SELL) zone at {zone.get('price_mid', 0.0):.5f} blocked — price in D1 discount but 4H is bullish (counter-trend)"
+                    logger.info(msg)
                     if self.debug:
-                        print(f"     ⛔ D1 DISCOUNT GATE: supply zone blocked — price in D1 discount but 4H is bullish (counter-trend)")
+                        print(msg)
                     continue
                 elif h4_trend == 'neutral':
                     pass  # neutral 4H = no strong bias, let ML model decide
@@ -2826,10 +2938,12 @@ class ProductionForexPredictor:
             if base_probability < 0.55 or probability < effective_threshold:
                 rejected_cnt += 1
                 reject_reasons['prob_low'] += 1
+                msg = (f"  ⛔ Zone rejected (low prob): base_prob={base_probability:.3f} "
+                       f"prob={probability:.3f} threshold={effective_threshold:.3f} "
+                       f"type={zone['type']} dist={zone['distance_pips']:.1f}p")
+                logger.info(msg)
                 if self.debug:
-                    print(f"     ⛔ Zone rejected: base_prob={base_probability:.3f} "
-                          f"prob={probability:.3f} threshold={effective_threshold:.3f} "
-                          f"type={zone['type']} dist={zone['distance_pips']:.1f}p")
+                    print(msg)
                 continue
 
             entry, sl, tp, actual_rr = self.calculate_realistic_levels(
@@ -2844,8 +2958,10 @@ class ProductionForexPredictor:
             if risk_pips < _min_risk or risk_pips > _max_risk or reward_pips > 2000:
                 rejected_cnt += 1
                 reject_reasons['risk_range'] += 1
+                msg = f"  ⛔ Zone rejected (risk range): risk={risk_pips:.1f}p reward={reward_pips:.1f}p (allowed min={_min_risk} max={_max_risk})"
+                logger.info(msg)
                 if self.debug:
-                    print(f"     ⛔ Zone rejected risk range: risk={risk_pips:.1f}p reward={reward_pips:.1f}p")
+                    print(msg)
                 continue
 
             sig = self.zone_tracker.get_canonical_signature(zone, self.symbol)

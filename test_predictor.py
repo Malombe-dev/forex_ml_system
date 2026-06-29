@@ -88,8 +88,8 @@ class TestSaveSignals:
         save_signals_to_single_file(signals, str(f))  # must not raise
 
     def test_all_resolved_statuses_protected(self, tmp_path):
-        """All four resolved statuses must block overwrite"""
-        for status in ['hit_tp', 'hit_sl', 'expired', 'entry_missed']:
+        """Resolved statuses (excluding expired) must block overwrite"""
+        for status in ['hit_tp', 'hit_sl', 'entry_missed']:
             f = tmp_path / f"signals_{status}.json"
             existing = [{'symbol': 'USD/JPY', 'direction': 'SELL',
                          'entry': 150.0, 'sl': 150.5, 'tp': 148.0,
@@ -103,6 +103,47 @@ class TestSaveSignals:
             result = json.loads(f.read_text())
             assert result[0]['status'] == status,        f"status {status} was overwritten"
             assert result[0]['probability'] == 70.0,     f"probability changed for {status}"
+
+    def test_expired_signal_reactivates_to_pending(self, tmp_path):
+        """Expired signals must reactivate to pending and update completely when regenerated"""
+        f = tmp_path / "signals_expired.json"
+        existing = [{'symbol': 'USD/JPY', 'direction': 'SELL',
+                     'entry': 150.0, 'sl': 150.5, 'tp': 148.0,
+                     'timeframe': '4h', 'probability': 70.0,
+                     'status': 'expired',
+                     'exit_price': 151.0, 'outcome_reason': 'expired_time'}]
+        f.write_text(json.dumps(existing))
+        new_signal = [{'symbol': 'USD/JPY', 'direction': 'SELL',
+                       'entry': 150.1, 'sl': 150.6, 'tp': 148.1,
+                       'timeframe': '4h', 'probability': 95.0,
+                       'timestamp': '2026-06-24T12:00:00Z'}]
+        save_signals_to_single_file(new_signal, str(f))
+        result = json.loads(f.read_text())
+        assert result[0]['status'] == 'pending'
+        assert result[0]['probability'] == 95.0
+        assert result[0]['entry'] == 150.1
+        assert 'exit_price' not in result[0]
+        assert 'outcome_reason' not in result[0]
+
+    def test_frequency_tracking(self, tmp_path):
+        """Signal generation frequency must be tracked in cycle_history and production_count"""
+        f = tmp_path / "signals_freq.json"
+        signals_c1 = [{'symbol': 'USD/JPY', 'direction': 'SELL',
+                       'entry': 150.0, 'sl': 150.5, 'tp': 148.0,
+                       'timeframe': '4h', 'probability': 70.0,
+                       'timestamp': '2026-06-24T12:00:00Z'}]
+        save_signals_to_single_file(signals_c1, str(f))
+        
+        # Second cycle
+        signals_c2 = [{'symbol': 'USD/JPY', 'direction': 'SELL',
+                       'entry': 150.0, 'sl': 150.5, 'tp': 148.0,
+                       'timeframe': '4h', 'probability': 72.0,
+                       'timestamp': '2026-06-24T12:15:00Z'}]
+        save_signals_to_single_file(signals_c2, str(f))
+        
+        result = json.loads(f.read_text())
+        assert result[0]['production_count'] == 2
+        assert result[0]['cycle_history'] == ['2026-06-24T12:00:00Z', '2026-06-24T12:15:00Z']
 
 
 # ── Test probability pipeline ────────────────────────────────────
