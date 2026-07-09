@@ -2259,7 +2259,7 @@ class ProductionForexPredictor:
             # Gate raised to 0.70 — calibration shows 0.60–0.89 range is
             # overconfident by 25–30pp. Only 0.70+ signals have reliable edge.
             # Asia/pre-London softer gate removed — not justified by calibration.
-            _ml_gate = 0.70
+            _ml_gate = 0.75
 
             if base_prob < _ml_gate:
                 if self.debug:
@@ -2455,7 +2455,7 @@ class ProductionForexPredictor:
                 df_4h=df, df_1h=_df_1h, df_5m=_df_5m, df_d1=_df_d1)
             # Gate raised to 0.70 — calibration shows 0.60–0.89 range is
             # overconfident by 25–30pp. Only 0.70+ signals have reliable edge.
-            _ml_gate = 0.70
+            _ml_gate = 0.75
 
             if base_prob < _ml_gate:
                 if self.debug:
@@ -2555,11 +2555,52 @@ class ProductionForexPredictor:
                       f"{_s.get('type')} @ {_s.get('entry')} "
                       f"prob={_p:.1f}% < threshold={self.prob_threshold * 100:.1f}%")
 
+        # ── Load open trades for open-trade guard ────────────────────────────
+        _open_trades: List[Dict] = []
+        _signals_path = Path("signals/all_signals.json")
+        if _signals_path.exists():
+            try:
+                with open(_signals_path) as _f:
+                    _all = json.load(_f)
+                    _open_trades = [
+                        _s for _s in _all
+                        if _s.get('symbol') == self.symbol
+                        and _s.get('status') == 'triggered'
+                        and _s.get('triggered') is True
+                    ]
+            except Exception as _e:
+                logger.warning(f"open-trade guard: could not read signals — {_e}")
+        # ─────────────────────────────────────────────────────────────────────
+
         # Deduplicate HTF
         htf_signals = []
         for s in htf_prob_filtered:
             sig_key  = (f"{s.get('timeframe')}|{s.get('direction')}|"
                         f"{s.get('entry'):.5f}|{s.get('sl'):.5f}")
+
+            # ── OPEN-TRADE GUARD ─────────────────────────────────────────────
+            # Block re-firing if a triggered (open) trade already exists on
+            # this symbol+direction within 2×ATR. Prevents doubling exposure
+            # on the same zone after TTL expiry from the zone tracker.
+            _entry_candidate = s.get('entry', 0)
+            _dir_candidate   = s.get('direction')
+            _guard_hit = False
+            for _ot in _open_trades:
+                if _ot.get('direction') != _dir_candidate:
+                    continue
+                _dist = abs(float(_ot.get('entry', 0)) - _entry_candidate) / self.pip_size
+                if _dist < current_atr / self.pip_size * 2:
+                    _guard_hit = True
+                    if self.debug:
+                        print(f"     ⛔ OPEN-TRADE GUARD: {_dir_candidate} @ {_entry_candidate:.5f} "
+                              f"blocked — open trade exists @ {_ot.get('entry')} "
+                              f"(dist={_dist:.1f}p, status=triggered)")
+                    break
+            if _guard_hit:
+                self.stats['total_duplicates'] += 1
+                continue
+            # ────────────────────────────────────────────────────────────────
+
             is_dup, _ = self.zone_tracker.is_duplicate(sig_key, current_time, current_price)
             if not is_dup:
                 self.zone_tracker.add_zone(sig_key, {
