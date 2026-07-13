@@ -1,437 +1,201 @@
-# Production Forex ML Trading System
+# Production Forex ML Trading System (v7)
 
-A complete, production-ready forex trading system that combines Smart Money Concepts (SMC) with Machine Learning for high-probability trade signals.
+A production-ready forex trading system that combines Smart Money Concepts (SMC) with Machine Learning (calibrated ensembles of XGBoost, Random Forest, and Logistic Regression) to deliver high-probability trade signals.
 
-## 🎯 What This System Does
+> [!IMPORTANT]
+> **System Status: READY FOR LIVE DEPLOYMENT**
+> - **Models:** Fully calibrated v5 Ensembles (XGBoost 50%, Random Forest 35%, Logistic Regression 15%).
+> - **Performance:** Reversion Model ROC-AUC: **~0.719** | Continuation Model ROC-AUC: **~0.709**.
+> - **Pairs Supported:** EUR/USD, GBP/USD, USD/JPY, XAU/USD.
+> - **Historical Base:** Retrained on a 23-year dataset (5,751 labeled zones).
 
-1. **Ingests tick data** from Dukascopy CSV files
-2. **Detects Smart Money patterns** (FVG, Order Blocks, Liquidity Sweeps, BOS/CHoCH)
-3. **Trains ML model** to predict which zones will result in profitable trades
-4. **Backtests** with realistic slippage and risk management
-5. **Generates live signals** with calibrated probabilities
+---
+
+## 🎯 System Features & Safety Guards
+
+1. **Dual-Strategy Pipeline:** Detects and executes both **Reversion** (prob. threshold: `62%`) and **Continuation** (prob. threshold: `65%`) trade setups.
+2. **SMC Zone Detection:** Auto-detects Fair Value Gaps (FVG), Order Blocks (OB), Liquidity Sweeps, and BOS/CHoCH.
+3. **Twelve Data API Caching & Rate-Limiter:** Limits calls to 7/min per key with a dynamic fallback pool. Uses a shared bar cache (60s TTL) to prevent duplicate calls.
+4. **Open-Trade Guard:** Prevents doubling exposure on the same zone. Blocks re-firing if a triggered trade exists on the same symbol and direction within $2 \times \text{ATR}$.
+5. **Calibrated Probability Gate:** Live signals must clear a strict `_ml_gate` of **0.75** (75%) for execution.
+6. **Data Quality Monitor:** A background quality logger (`twelvedata_logger.py`) checks for stale, frozen, or missing bars, and anomalous price spikes.
+
+---
 
 ## 📊 Realistic Expectations
 
 | Metric | Target | Notes |
-|--------|--------|-------|
-| **Win Rate** | 58-62% | Professional range |
-| **Sharpe Ratio** | 0.7-1.2 | Profitable |
-| **Max Drawdown** | <12% | Acceptable |
-| **Avg R:R** | 2.0-2.5 | Risk:Reward |
+| :--- | :--- | :--- |
+| **Win Rate** | 55–62% | Professional range at $0.65+$ threshold |
+| **Sharpe Ratio** | 0.7–1.2 | Highly competitive risk-adjusted returns |
+| **Max Drawdown** | <12% | Acceptable risk parameters |
+| **Avg Risk:Reward** | 2.0–2.5 | Risk-to-Reward ratio |
 
-⚠️ **This is NOT a 95% accuracy system**. We target consistent profitability through proper risk management, not high win rates.
+> [!WARNING]
+> This is **NOT** a 90%+ accuracy system. Consistent profitability is achieved via strict risk management and taking trades with a validated, calibrated statistical edge.
+
+---
+
+## 📁 Project Structure
+
+```text
+forex_ml_system/
+├── main_pipeline.py              # Central orchestrator (runs Phases 1 to 6)
+├── production_predictor.py        # Live signal engine (Module 6: Reversion + Continuation)
+├── run_predictor.sh              # Shell launcher for live signal engine
+├── tick_ingestion.py             # Phase 1: dukascopy tick CSV -> Parquet
+├── smc_detector.py               # Phase 2: multi-timeframe SMC zone detection
+├── label_generator.py            # Phase 3: dual-label generation (TP/SL/Timeouts)
+├── validate_pipeline.py          # Phase 3.5: pipeline data consistency check
+├── model_trainer.py              # Phase 4: trains XGBoost, Random Forest, LR ensemble
+├── backtest_engine.py            # Phase 5: realistic walk-forward backtester
+├── outcome_tracker.py            # Phase 6: tracks and updates live trade outcomes
+│
+├── retrain_all.py                # Periodic model retraining (runs every 30–90 days)
+├── auto_retrain_monitor.py       # Automated weekly win-rate monitor & alert checker
+├── twelvedata_logger.py          # API live data quality and spike monitor
+├── signal_pusher.py              # Telegram/Webhook signal transmitter
+├── telegram_signal_monitor.py    # Verification monitor for live Telegram alerts
+│
+├── dash/                         # Flask-based monitoring dashboard
+│   ├── server.py                 # Backend API service
+│   ├── index.html                # Signal & Zone maps visualization frontend
+│   ├── static/                   # Static styling assets
+│   │   ├── css/style.css
+│   │   └── js/app.js
+│   └── requirements.txt          # Dashboard python requirements
+│
+├── data/                         # Data directory (ignored in git except config)
+│   ├── backtest_results/         # Walk-forward backtest logs and charts
+│   ├── features/                 # Generated SMC zones, OBs, and FVGs per pair
+│   ├── labels/                   # Compiled training dataset
+│   └── outcomes/                 # Outcome tracking records
+│
+├── models/                       # Stored model weights (v5)
+│   ├── model_v5_continuation.pkl # Continuation XGBoost model
+│   ├── model_v5_reversion.pkl    # Reversion XGBoost model
+│   ├── scaler_v5_*.pkl           # Scalers for feature normalization
+│   ├── encoders_v5_*.pkl         # Categorical label encoders
+│   ├── lr_v5_*.pkl               # Probability calibration model weights
+│   └── metrics_*/                # Confusion matrices & calibration curve plots
+│
+└── signals/                      # Live signals outputs
+    ├── all_signals.json          # Combined signals file (Dashboard source of truth)
+    ├── daily_plan.json           # Daily active zones
+    └── weekly_plan.json          # Weekly setup planner
+```
+
+---
 
 ## 🚀 Quick Start
 
-### Installation
+### 1. Installation & Setup
 
 ```bash
-# Clone/download the system
-git clone <your-repo>
-cd forex-ml-system
+# Clone the repository
+git clone <your-repo-url>
+cd forex_ml_system
+
+# Create and activate virtual environment
+python3 -m venv venv
+source venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
 ```
 
-### Get Tick Data
+### 2. Live Signal Predictor Execution
 
-**Option 1: Download from Dukascopy**
-1. Go to https://www.dukascopy.com/swiss/english/marketwatch/historical/
-2. Download tick data as CSV
-3. Save as `your_dukascopy_ticks.csv`
-
-**Option 2: Use dukascopy-python**
-```python
-import dukascopy_python as dukas
-from datetime import datetime, timedelta
-
-end = datetime.now()
-start = end - timedelta(days=7)
-
-df = dukas.fetch('EURUSD', 'TICK', 'BID_ASK', start, end)
-df.to_csv('your_dukascopy_ticks.csv')
+Provide your Twelve Data API keys inside your environment variables:
+```bash
+export TWELVE_KEY_EURUSD="your_api_key"
+export TWELVE_KEY_GBPUSD="your_api_key"
+export TWELVE_KEY_USDJPY="your_api_key"
+export TWELVE_KEY_XAUUSD="your_api_key"
+export TWELVE_KEY_SPARE_1="your_spare_key"  # Optional fallback key
 ```
 
-### Run Complete Pipeline
+Run the live monitoring loop (runs continuously, checking every 15 minutes):
+```bash
+python production_predictor.py
+```
+Or run the launcher script:
+```bash
+./run_predictor.sh
+```
+
+---
+
+## ⚙️ Running the ML Pipeline
+
+The `main_pipeline.py` script coordinates the complete historical backtesting and training cycle.
+
+### Full Pipeline Run (Raw Dukascopy CSV -> Training)
+```bash
+python main_pipeline.py data/EURUSD_ticks.csv
+```
+
+### Run Specific Phases
+You can resume or isolate phases using `--phase`:
+- **Phase 1:** Ingest tick CSV (`tick_ingestion.py`)
+- **Phase 2:** Feature Engineering (`smc_detector.py`)
+- **Phase 3:** Label Generation (`label_generator.py`)
+- **Phase 4:** Model Training (`model_trainer.py`)
+- **Phase 5:** Backtesting (`backtest_engine.py`)
+- **Phase 6:** Outcome Tracking (`outcome_tracker.py`)
 
 ```bash
-# Run everything at once
-python main_pipeline.py your_dukascopy_ticks.csv
+# Retrain models only (using existing parquet labels)
+python main_pipeline.py dummy --phase 4
+
+# Run backtest only
+python main_pipeline.py dummy --phase 5
 ```
 
-This will:
-1. ✅ Ingest tick data
-2. ✅ Extract SMC features
-3. ✅ Generate training labels
-4. ✅ Train XGBoost model
-5. ✅ Generate live signals
+---
 
-### Run Individual Modules
+## 🩺 System Diagnostics & Maintenance
+
+### 1. Automated Model Retraining
+Models should be retrained every 30–90 days to adapt to changing market dynamics.
+```bash
+python retrain_all.py
+```
+
+### 2. Live Quality Logger
+Run the Twelve Data quality monitoring script in the background to detect data anomalies or API credit depletion:
+```bash
+python twelvedata_logger.py
+```
+Outputs are written directly to `logs/twelvedata_quality.log`.
+
+### 3. Automated Weekly Check
+Check live performance metrics and verify if retraining is triggered:
+```bash
+python auto_retrain_monitor.py --check
+```
+
+---
+
+## 🖥️ Live Dashboard
+
+The project includes a Flask-based signal dashboard that displays live signals, active zones, daily plans, and overall success metrics.
 
 ```bash
-# 1. Data Ingestion
-python tick_ingestion.py
-
-# 2. Feature Engineering
-python smc_detector.py
-
-# 3. Label Generation
-python label_generator.py
-
-# 4. Model Training
-python model_trainer.py
-
-# 5. Backtesting
-python backtest_engine.py
-
-# 6. Live Signals
-python production_engine.py
+# Launch dashboard server
+python dash/server.py
 ```
+Open **[http://localhost:5050](http://localhost:5050)** in your web browser.
 
-## 📁 Project Structure
-
-```
-forex_ml_system/
-├── data/
-│   ├── raw_ticks.parquet          # Ingested tick data
-│   ├── bars_*.parquet             # Resampled bars (1min, 5min, 15min, etc.)
-│   ├── features/
-│   │   ├── fvgs.parquet          # Fair Value Gaps
-│   │   ├── order_blocks.parquet   # Order Blocks
-│   │   ├── merged_zones.parquet   # Final zones
-│   │   └── ...
-│   └── labels/
-│       └── training_labels.parquet # ML training data
-│
-├── models/
-│   ├── model_v1.pkl               # Trained XGBoost model
-│   ├── scaler_v1.pkl              # Feature scaler
-│   ├── encoders_v1.pkl            # Label encoders
-│   └── training_results.json      # Training metrics
-│
-├── signals/
-│   └── live_signals.json          # Generated signals
-│
-├── tick_ingestion.py              # Module 1: Data loading
-├── smc_detector.py                # Module 2: SMC detection
-├── label_generator.py             # Module 3: Label creation
-├── model_trainer.py               # Module 4: ML training
-├── backtest_engine.py             # Module 5: Backtesting
-├── production_engine.py           # Module 6: Live signals
-├── main_pipeline.py               # Orchestrator
-├── requirements.txt               # Dependencies
-└── README.md                      # This file
-```
-
-## 🔧 How It Works
-
-### 1. Data Ingestion (`tick_ingestion.py`)
-
-```python
-from tick_ingestion import TickDataIngestion
-
-ingestion = TickDataIngestion(output_dir="data")
-ticks = ingestion.load_dukascopy_csv("your_ticks.csv")
-ingestion.save_ticks(ticks)
-all_bars = ingestion.generate_all_timeframes(ticks)
-```
-
-- Loads Dukascopy tick CSV
-- Calculates mid price and spread
-- Resamples to 1min, 5min, 15min, 1h, 4h, 1d bars
-- Saves as efficient Parquet files
-
-### 2. SMC Feature Detection (`smc_detector.py`)
-
-```python
-from smc_detector import SMCDetector
-
-detector = SMCDetector(pip_size=0.0001)
-features = detector.extract_all_features(df)
-```
-
-Detects:
-- **FVG (Fair Value Gaps)**: 3-bar price gaps
-- **Order Blocks**: Last opposite candle before strong move
-- **Liquidity Sweeps**: Spikes that reverse quickly
-- **BOS/CHoCH**: Structure breaks
-- **Merged Zones**: Confluence areas
-
-### 3. Label Generation (`label_generator.py`)
-
-```python
-from label_generator import LabelGenerator
-
-generator = LabelGenerator(risk_reward=2.5, horizon_bars=30)
-labels_df = generator.generate_labels_from_zones(zones, df)
-```
-
-For each zone:
-- Entry: Zone mid-price
-- Stop Loss: Beyond zone edge (1 ATR)
-- Take Profit: 2.5:1 risk-reward
-- Horizon: 30 bars maximum
-
-Labels:
-- **1** if TP hit before SL ✅
-- **0** if SL hit before TP ❌
-- **Discard** if timeout (no edge)
-
-### 4. ML Model Training (`model_trainer.py`)
-
-```python
-from model_trainer import ForexMLTrainer
-
-trainer = ForexMLTrainer()
-X_train, y_train = trainer.prepare_features(train_df)
-trainer.train_model(X_train, y_train)
-trainer.save_model(version="v1")
-```
-
-Model:
-- **Algorithm**: XGBoost + Probability Calibration
-- **Features**: Zone strength, HTF trend, RSI, ATR regime, session, etc.
-- **Validation**: Walk-forward time series splits
-- **Output**: Calibrated probability (0-1)
-
-### 5. Backtesting (`backtest_engine.py`)
-
-```python
-from backtest_engine import BacktestEngine
-
-backtest = BacktestEngine(
-    initial_balance=10000,
-    risk_per_trade=0.01,  # 1%
-    slippage_pips=0.2
-)
-metrics = backtest.run_backtest(signals, df)
-```
-
-Includes:
-- Realistic slippage (0.2 pips)
-- Position sizing (1% risk per trade)
-- Walk-forward validation
-- Max concurrent trades limit
-
-Metrics:
-- Win rate, profit factor, Sharpe ratio
-- Max drawdown, average bars held
-- Returns by probability bucket
-
-### 6. Live Signal Generation (`production_engine.py`)
-
-```python
-from production_engine import ProductionForexEngine
-
-engine = ProductionForexEngine(threshold=0.65)
-signals = engine.generate_signals(df)
-engine.display_signals(signals)
-```
-
-Generates signals with:
-- Entry, SL, TP levels
-- ML probability (65%+ threshold)
-- Risk:Reward ratio (2.5:1)
-- Distance from current price
-- Recommendation (STRONG/GOOD/MODERATE)
-
-## 📈 Example Signal Output
-
-```
-🟢 SIGNAL #1 - BUY - STRONG
-----------------------------------------------------------------------
-   Probability:    78.3%
-   Entry:          1.15749
-   Stop Loss:      1.15706
-   Take Profit:    1.15856
-   Risk:Reward:    1:2.5
-   Distance:       23.4 pips
-   Zone Strength:  2.14
-   Current Price:  1.15983
-```
-
-## ⚙️ Configuration
-
-### Model Parameters
-
-Edit in `model_trainer.py`:
-```python
-self.model = xgb.XGBClassifier(
-    n_estimators=100,      # Number of trees
-    max_depth=6,           # Tree depth
-    learning_rate=0.05,    # Learning rate
-    subsample=0.8,         # Row sampling
-    colsample_bytree=0.8   # Feature sampling
-)
-```
-
-### Risk Management
-
-Edit in `backtest_engine.py` or `production_engine.py`:
-```python
-risk_per_trade = 0.01      # 1% risk per trade
-risk_reward = 2.5          # 2.5:1 target
-max_concurrent = 3         # Max open trades
-slippage_pips = 0.2        # Realistic slippage
-```
-
-### Signal Threshold
-
-Edit in `production_engine.py`:
-```python
-threshold = 0.65  # Minimum 65% probability
-```
-
-## 🧪 Testing
-
-### Backtest on Historical Data
-
-```bash
-python backtest_engine.py
-```
-
-### Paper Trade
-
-1. Generate signals daily
-2. Track in spreadsheet
-3. Compare predicted vs actual outcomes
-4. Minimum 2 weeks before going live
-
-### Go Live Checklist
-
-- [ ] Backtest shows Sharpe > 0.5
-- [ ] Win rate > 55% in paper trading
-- [ ] Calibration error < 5%
-- [ ] Max drawdown acceptable (<15%)
-- [ ] Paper traded for 2+ weeks
-- [ ] Risk management tested
-- [ ] Broker integration working
-- [ ] Start with 0.01 lots only
-
-## 🔍 Troubleshooting
-
-### "Model files not found"
-Run the training pipeline:
-```bash
-python main_pipeline.py your_ticks.csv
-```
-
-### "No zones detected"
-- Check if tick data has sufficient history (6+ months ideal)
-- Verify data quality (no gaps, correct format)
-- Adjust detection parameters in `smc_detector.py`
-
-### "Low win rate in backtest"
-- Normal! Target is 55-65%, not 95%
-- Check if slippage is too high
-- Verify risk:reward ratio
-- May need more training data
-
-### "No signals generated"
-- Current market may not have high-probability zones
-- Lower threshold temporarily (min 0.55)
-- Check if zones are too far from current price
-
-## 📚 Understanding the Results
-
-### Model Metrics
-
-- **Accuracy**: % of correct predictions (target: 60-65%)
-- **Precision**: % of wins when model says "win" (target: 65-70%)
-- **Recall**: % of actual wins captured (target: 55-65%)
-- **Log Loss**: Calibration quality (target: <0.65)
-- **ROC AUC**: Discrimination ability (target: >0.65)
-
-### Backtest Metrics
-
-- **Win Rate**: 58-62% is professional
-- **Sharpe Ratio**: >0.7 is good, >1.0 is excellent
-- **Profit Factor**: >1.5 is profitable
-- **Max Drawdown**: <12% is acceptable
-
-### Calibration
-
-Model should be well-calibrated:
-- If it says 70% probability → should win ~70% of the time
-- Calibration error should be <5%
-- Check calibration plot after training
-
-## 🎓 Learning Resources
-
-### Smart Money Concepts
-- Order Blocks: Last opposite candle before institutional move
-- FVG: Inefficiency that price often revisits
-- Liquidity Sweep: Taking out stops before reversing
-
-### Machine Learning
-- XGBoost: Gradient boosting for classification
-- Calibration: Making probabilities realistic
-- Walk-forward: Time series validation (never train on future!)
-
-### Risk Management
-- 1% rule: Never risk more than 1% per trade
-- Kelly Criterion: Optimal position sizing
-- Drawdown management: Stop trading if DD > 15%
+---
 
 ## ⚠️ Disclaimers
 
-1. **Past performance ≠ Future results**
-   - Backtest results don't guarantee live performance
-   - Markets change, models degrade
+1. **Past performance does not guarantee future results.** Financial markets change, and machine learning models degrade over time without proper retraining.
+2. **No Holy Grail:** Maintain strict risk parameters. Never risk more than 1–2% of equity per trade.
+3. **Consult a professional:** This software is for educational purposes only. Trade live funds at your own risk.
 
-2. **No holy grail**
-   - 60% win rate is realistic, not 95%
-   - Expect losing streaks (normal!)
-   - Risk management is critical
-
-3. **You can lose money**
-   - Only trade with capital you can afford to lose
-   - Start small (0.01 lots)
-   - Paper trade first (2+ weeks minimum)
-
-4. **Not financial advice**
-   - This is educational software
-   - Do your own research
-   - Consult financial advisor
-
-## 🤝 Contributing
-
-Improvements welcome! Areas to enhance:
-- Additional SMC patterns (Breaker Blocks, Mitigation Blocks)
-- Deep learning models (LSTM, Transformers)
-- Real-time data feeds
-- Broker integration (MetaTrader, Oanda, etc.)
-- Advanced risk management (correlation filters, drawdown limits)
+---
 
 ## 📄 License
-
-MIT License - Use at your own risk
-
-## 💬 Support
-
-For questions or issues:
-1. Check troubleshooting section above
-2. Review code comments (heavily documented)
-3. Check scikit-learn and XGBoost documentation
-4. Test individual modules in isolation
-
-## 🎉 Summary
-
-You now have:
-- ✅ Complete tick data pipeline
-- ✅ SMC feature extraction
-- ✅ ML training with proper validation
-- ✅ Realistic backtesting
-- ✅ Production signal generation
-
-**Next steps:**
-1. Run the pipeline on your tick data
-2. Analyze backtest results
-3. Paper trade for 2 weeks
-4. Go live with small size
-5. Monitor and iterate
-
-**Remember:** Professional trading is about consistent execution of an edge, not high win rates. Target 58-62% wins with 2:1 R:R and proper risk management.
-
-Good luck! 🚀
+MIT License - Use at your own risk.
