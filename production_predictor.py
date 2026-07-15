@@ -15,6 +15,7 @@ import warnings
 from feature_builder import build_feature_row
 from features import get_session as _canonical_get_session
 from outcome_tracker import SignalOutcomeTrackerV2
+from news_filter import ForexFactoryNewsFilter
 
 warnings.filterwarnings('ignore')
 
@@ -3263,6 +3264,110 @@ def check_signal_outcomes(predictors: List['ProductionForexPredictor'],
     return result
 
 
+def _get_current_price(pred: 'ProductionForexPredictor') -> Optional[float]:
+    """Best-effort current price lookup for a symbol using its predictor's
+    own bar fetcher (same one PriceZoneMonitor uses)."""
+    try:
+        df = pred.fetch_bars(interval="15min", outputsize=5)
+        if df is None or len(df) == 0:
+            return None
+        return float(df['close'].iloc[-1])
+    except Exception as e:
+        logger.warning(f"_get_current_price: fetch failed for {pred.symbol} — {e}")
+        return None
+
+
+def apply_news_filter_to_active_signals(news_filter: ForexFactoryNewsFilter,
+                                        predictors: Optional[List['ProductionForexPredictor']] = None,
+                                        signals_file: str = "signals/all_signals.json",
+                                        window_minutes: int = 30):
+    path = Path(signals_file)
+    if not path.exists():
+        return
+
+    try:
+        with open(path) as f:
+            signals = json.load(f)
+    except Exception as e:
+        logger.warning(f"apply_news_filter_to_active_signals: load failed — {e}")
+        return
+
+    pred_map = {p.symbol: p for p in predictors} if predictors else {}
+    now_utc  = datetime.utcnow()
+    updated  = False
+
+    for sig in signals:
+        status = sig.get('status')
+        # Only process active (pending or triggered) signals
+        if status in ('pending', 'triggered', 'active') or sig.get('triggered', False) and status not in ('hit_tp', 'hit_sl', 'expired'):
+            symbol = sig.get('symbol')
+            # Check if news is active for this symbol (currencies)
+            is_news, news_event = news_filter.is_news_active(symbol, window_minutes=window_minutes)
+            if is_news:
+                triggered = sig.get('triggered', False)
+
+                # Case 1: Pending (not yet filled) — no position risk yet, and
+                # direction of the news reaction can't be known in advance, so
+                # it's safest to just drop the pending zone.
+                if not triggered or status == 'pending':
+                    sig['status'] = 'expired'
+                    sig['sl']     = None  # Stop showing SL
+                    sig['note']   = f"expired due to news risk: '{news_event['title']}' ({news_event['country']})"
+                    print(f"⚠️  [{symbol}] PENDING SIGNAL EXPIRED due to news risk: '{news_event['title']}'")
+                    updated = True
+
+                # Case 2: Triggered (already running) — a real position exists.
+                elif triggered or status == 'triggered':
+                    event_time = news_event.get('time_utc')
+                    news_already_released = event_time is not None and event_time <= now_utc
+
+                    direction     = sig.get('direction')
+                    entry         = sig.get('entry')
+                    current_price = _get_current_price(pred_map[symbol]) if symbol in pred_map else None
+
+                    favorable = None
+                    if news_already_released and current_price is not None and entry is not None and direction in ('BUY', 'SELL'):
+                        if direction == 'BUY':
+                            favorable = current_price >= entry   # moving up, toward TP
+                        else:  # SELL
+                            favorable = current_price <= entry   # moving down, toward TP
+
+                    if favorable:
+                        # News has already hit and price is moving toward TP —
+                        # leave the trade alone, just log it for visibility.
+                        if sig.get('action') == 'close':
+                            sig['action'] = None
+                        sig['news_risk'] = True
+                        sig['note'] = (f"news released: '{news_event['title']}' ({news_event['country']}) — "
+                                       f"price moving in favor of {direction}, holding")
+                        print(f"ℹ️  [{symbol}] News released ('{news_event['title']}') but price is moving "
+                              f"in your favor ({direction}) — no action needed.")
+                        updated = True
+                    else:
+                        # Either the news hasn't happened yet (direction unknown,
+                        # so be conservative) or it has and price is moving
+                        # against the position — flag for closure either way.
+                        if sig.get('action') != 'close':
+                            sig['action']    = 'close'
+                            sig['news_risk'] = True
+                            sig['sl']        = None  # Stop showing SL
+                            reason = ("price moving against position after news release"
+                                      if news_already_released and favorable is False
+                                      else "upcoming high-impact news — outcome unknown")
+                            sig['note'] = (f"close trade - risk of news: '{news_event['title']}' "
+                                           f"({news_event['country']}) — {reason}")
+                            print(f"🚨 [{symbol}] ACTIVE TRADE FLAGGED FOR CLOSURE — {reason} "
+                                  f"('{news_event['title']}')")
+                            updated = True
+
+    if updated:
+        try:
+            with open(path, "w") as f:
+                json.dump(signals, f, indent=2)
+            print("💾 Saved news-restricted signal updates to all_signals.json")
+        except Exception as e:
+            logger.error(f"apply_news_filter_to_active_signals: save failed — {e}")
+
 
 def run_dual_strategy(symbols: Optional[List[str]] = None):
     # One API key per pair — each key handles ~480 calls/day (well under 800 free limit).
@@ -3342,6 +3447,7 @@ def run_dual_strategy(symbols: Optional[List[str]] = None):
 
     weekly_scheduler = WeeklyPlanScheduler(all_predictors)
     price_monitor    = PriceZoneMonitor(all_predictors)
+    news_filter      = ForexFactoryNewsFilter()
 
     # Schedule weekly plan on Sunday 20:00 UTC
     schedule.every().sunday.at("20:00").do(weekly_scheduler.generate)
@@ -3377,6 +3483,14 @@ def run_dual_strategy(symbols: Optional[List[str]] = None):
             for i in range(0, len(all_predictors), 2):
                 rev_p  = all_predictors[i]
                 cont_p = all_predictors[i + 1] if i + 1 < len(all_predictors) else None
+
+                # ── News Filter Gate ──
+                is_news, news_event = news_filter.is_news_active(rev_p.symbol, window_minutes=30)
+                if is_news:
+                    print(f"\n⚠️  [{rev_p.symbol}] NEWS FILTER ACTIVE: High-impact news event '{news_event['title']}' "
+                          f"({news_event['country']}) is scheduled at {news_event['time_utc']} UTC. "
+                          f"Skipping signal generation for this pair to avoid news-driven volatility.\n")
+                    continue
 
                 # Pre-warm shared cache for this symbol before both predictors run.
                 # REV and CONT will hit cache instead of making duplicate API calls.
@@ -3458,6 +3572,7 @@ def run_dual_strategy(symbols: Optional[List[str]] = None):
 
             # written this cycle are visible to the tracker immediately.
             check_signal_outcomes(all_predictors)
+            apply_news_filter_to_active_signals(news_filter, predictors=all_predictors)
 
             # Per-cycle cap for any downstream Telegram push
             MAX_SIGNALS_PER_CYCLE = 3

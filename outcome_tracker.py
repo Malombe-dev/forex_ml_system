@@ -524,6 +524,8 @@ class SignalOutcomeTrackerV2:
             try:
                 ts        = pd.to_datetime(sig.get("timestamp"), utc=False)
                 ts        = ts.tz_localize(None) if ts.tzinfo is not None else ts
+                if sig.get("entry") is None or sig.get("sl") is None or sig.get("tp") is None:
+                    continue
                 entry     = float(sig["entry"])
                 sl        = float(sig["sl"])
                 tp        = float(sig["tp"])

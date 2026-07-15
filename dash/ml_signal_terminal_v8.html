@@ -228,7 +228,7 @@ tr.row-sell{border-left:2px solid rgba(255,77,106,.35)}
 
 <script>
 const $ = id => document.getElementById(id);
-const f5 = n => (parseFloat(n)||0).toFixed(5);
+const f5 = n => (n === null || n === undefined || n === '' || parseFloat(n) === 0) ? '—' : (parseFloat(n)||0).toFixed(5);
 const f2 = n => (parseFloat(n)||0).toFixed(2);
 
 const PAIRS = ['EUR/USD','GBP/USD','USD/JPY','XAU/USD'];
@@ -309,7 +309,16 @@ function renderReal(signals){
   if(!real.length){ tbody.innerHTML=`<tr><td colspan="14"><div class="empty-blk"><div class="empty-ico"><i class="ti ti-clock" aria-hidden="true"></i></div><div class="empty-ttl">No real signals yet</div><div class="empty-sub">Best window: 08:00–12:00 UTC (London) and 13:00–17:00 UTC (NY overlap).</div></div></td></tr>`; return; }
   tbody.innerHTML=real.map(s=>{
     const dt=parseTS(s.timestamp), dir=(s.direction||'').toLowerCase(), prob=parseFloat(s.probability||0), status=s.status||'pending', pct=Math.min(100,prob);
-    return `<tr class="row-${dir}"><td style="color:var(--muted)">${dt.date}</td><td style="color:var(--muted)">${dt.time}</td><td style="font-weight:500">${s.symbol||'—'}</td><td>${stratPill(s.strategy)}</td><td><span class="badge b-${dir}">${(s.direction||'—').toUpperCase()}</span></td><td>${f5(s.entry)}</td><td style="color:#ff4d6a">${f5(s.sl)}</td><td style="color:#00c97a">${f5(s.tp)}</td><td style="color:var(--muted)">${s.risk_pips??'—'}</td><td style="color:#3d9fff">${s.rr||s.risk_reward||'—'}</td><td><div class="pbar-wrap"><div class="pbar-track"><div class="pbar-fill" style="width:${pct}%;background:${probColor(prob)}"></div></div><span class="pbar-num" style="color:${probColor(prob)}">${prob.toFixed(1)}%</span></div></td><td style="color:var(--muted)">${s.confluence_score??'—'}/10</td><td style="color:${trendColor(s.h4_trend)}">${trendLabel(s.h4_trend)}</td><td><span class="badge b-${status}">${status.toUpperCase().replace('_',' ')}</span></td></tr>`;
+    return `<tr class="row-${dir}"><td style="color:var(--muted)">${dt.date}</td><td style="color:var(--muted)">${dt.time}</td><td style="font-weight:500">${s.symbol||'—'}</td><td>${stratPill(s.strategy)}</td><td><span class="badge b-${dir}">${(s.direction||'—').toUpperCase()}</span></td><td>${f5(s.entry)}</td><td style="color:#ff4d6a">${f5(s.sl)}</td><td style="color:#00c97a">${f5(s.tp)}</td><td style="color:var(--muted)">${s.risk_pips??'—'}</td><td style="color:#3d9fff">${s.rr||s.risk_reward||'—'}</td><td><div class="pbar-wrap"><div class="pbar-track"><div class="pbar-fill" style="width:${pct}%;background:${probColor(prob)}"></div></div><span class="pbar-num" style="color:${probColor(prob)}">${prob.toFixed(1)}%</span></div></td><td style="color:var(--muted)">${s.confluence_score??'—'}/10</td><td style="color:${trendColor(s.h4_trend)}">${trendLabel(s.h4_trend)}</td><td>
+      ${s.action === 'close' || s.news_risk ? 
+        `<span class="badge b-${status}">${status.toUpperCase().replace('_',' ')}</span>
+         <span class="badge b-hit_sl" style="background:#ff4d6a;color:#fff;margin-left:4px;cursor:help" title="${s.note || 'Close Risk'}">⚠️ CLOSE RISK</span>` : 
+        (s.note && s.note.toLowerCase().includes('news') ? 
+         `<span class="badge b-${status}">${status.toUpperCase().replace('_',' ')}</span>
+          <span class="badge b-expired" style="background:#f0b429;color:#fff;margin-left:4px;cursor:help" title="${s.note}">⚠️ NEWS CANCEL</span>` :
+         `<span class="badge b-${status}">${status.toUpperCase().replace('_',' ')}</span>`)
+      }
+    </td></tr>`;
   }).join('');
 }
 
@@ -378,7 +387,16 @@ function renderOutcomes(signals, stats){
   if(!sorted.length){ tbody.innerHTML=`<tr><td colspan="13" style="text-align:center;padding:32px;color:var(--muted)">No resolved signals yet.</td></tr>`; return; }
   tbody.innerHTML=sorted.map(s=>{
     const dt=parseTS(s.timestamp), dir=(s.direction||'').toLowerCase(), status=s.status||'pending', prob=parseFloat(s.probability||0);
-    return `<tr class="row-${dir}"><td style="color:var(--muted)">${dt.date}</td><td style="color:var(--muted)">${dt.time}</td><td style="font-weight:500">${s.symbol||'—'}</td><td><span class="badge b-${dir}">${(s.direction||'—').toUpperCase()}</span></td><td>${f5(s.entry)}</td><td style="color:#ff4d6a">${f5(s.sl)}</td><td style="color:#00c97a">${f5(s.tp)}</td><td style="color:#3d9fff">${s.rr||s.risk_reward||'—'}</td><td style="color:${probColor(prob)}">${prob.toFixed(1)}%</td><td><span class="badge b-${status}">${status.toUpperCase().replace('_',' ')}</span></td><td style="color:var(--muted);text-align:center">${s.bars_to_entry??'—'}</td><td style="color:var(--muted);text-align:center">${s.bars_to_exit??'—'}</td><td style="color:var(--muted)">${s.resolved_at?s.resolved_at.slice(0,10):'—'}</td></tr>`;
+    return `<tr class="row-${dir}"><td style="color:var(--muted)">${dt.date}</td><td style="color:var(--muted)">${dt.time}</td><td style="font-weight:500">${s.symbol||'—'}</td><td><span class="badge b-${dir}">${(s.direction||'—').toUpperCase()}</span></td><td>${f5(s.entry)}</td><td style="color:#ff4d6a">${f5(s.sl)}</td><td style="color:#00c97a">${f5(s.tp)}</td><td style="color:#3d9fff">${s.rr||s.risk_reward||'—'}</td><td style="color:${probColor(prob)}">${prob.toFixed(1)}%</td><td>
+      ${s.action === 'close' || s.news_risk ? 
+        `<span class="badge b-${status}">${status.toUpperCase().replace('_',' ')}</span>
+         <span class="badge b-hit_sl" style="background:#ff4d6a;color:#fff;margin-left:4px;cursor:help" title="${s.note || 'Close Risk'}">⚠️ CLOSE RISK</span>` : 
+        (s.note && s.note.toLowerCase().includes('news') ? 
+         `<span class="badge b-${status}">${status.toUpperCase().replace('_',' ')}</span>
+          <span class="badge b-expired" style="background:#f0b429;color:#fff;margin-left:4px;cursor:help" title="${s.note}">⚠️ NEWS CANCEL</span>` :
+         `<span class="badge b-${status}">${status.toUpperCase().replace('_',' ')}</span>`)
+      }
+    </td><td style="color:var(--muted);text-align:center">${s.bars_to_entry??'—'}</td><td style="color:var(--muted);text-align:center">${s.bars_to_exit??'—'}</td><td style="color:var(--muted)">${s.resolved_at?s.resolved_at.slice(0,10):'—'}</td></tr>`;
   }).join('');
 }
 

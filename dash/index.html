@@ -528,7 +528,9 @@ function updateCurrencyOptions(signals) {
 
 // ── Price formatting ──────────────────────────────────────────────────────────
 function fPrice(n, symbol) {
+  if (n === null || n === undefined || n === '') return '—';
   const v = parseFloat(n) || 0;
+  if (v === 0) return '—';
   if (!symbol) return v.toFixed(5);
   const s = symbol.toUpperCase();
   if (s.includes('XAU') || s.includes('GOLD')) return v.toFixed(2);
@@ -536,7 +538,9 @@ function fPrice(n, symbol) {
   return v.toFixed(5);
 }
 const f5 = n => {
+  if (n === null || n === undefined || n === '') return '—';
   const v = parseFloat(n) || 0;
+  if (v === 0) return '—';
   if (v > 500) return v.toFixed(2);
   if (v > 20)  return v.toFixed(3);
   return v.toFixed(5);
@@ -811,7 +815,16 @@ function renderReal(signals) {
       <td style="color:var(--muted)">${s.confluence_score ?? '—'}/10</td>
       <td style="color:var(--muted);text-align:center">${s.production_count ?? 1}x</td>
       <td style="color:${trendColor(s.h4_trend)}">${trendLabel(s.h4_trend)}</td>
-      <td><span class="status-badge ${status}">${status.toUpperCase().replace('_',' ')}</span></td>
+      <td>
+        ${s.action === 'close' || s.news_risk ? 
+          `<span class="status-badge ${status}">${status.toUpperCase().replace('_',' ')}</span>
+           <span class="status-badge" style="background:#fff5f5;color:#e53e3e;border:1px solid #fed7d7;margin-left:4px;cursor:help" title="${s.note || 'Close Risk'}">⚠️ CLOSE RISK</span>` : 
+          (s.note && s.note.toLowerCase().includes('news') ? 
+           `<span class="status-badge ${status}">${status.toUpperCase().replace('_',' ')}</span>
+            <span class="status-badge" style="background:#edf2f7;color:#4a5568;border:1px solid #e2e8f0;margin-left:4px;cursor:help" title="${s.note}">⚠️ NEWS CANCEL</span>` :
+           `<span class="status-badge ${status}">${status.toUpperCase().replace('_',' ')}</span>`)
+        }
+      </td>
     </tr>`;
   }).join('');
 }
@@ -1043,7 +1056,16 @@ function renderOutcomes(signals, stats) {
       <td style="color:var(--blue)">${s.rr || s.risk_reward || '—'}</td>
       <td style="color:${probColor(prob, s.strategy)}">${prob.toFixed(1)}%</td>
       <td>${thrPill(s.strategy)}</td>
-      <td><span class="status-badge ${status}">${status.toUpperCase().replace('_',' ')}</span></td>
+      <td>
+        ${s.action === 'close' || s.news_risk ? 
+          `<span class="status-badge ${status}">${status.toUpperCase().replace('_',' ')}</span>
+           <span class="status-badge" style="background:#fff5f5;color:#e53e3e;border:1px solid #fed7d7;margin-left:4px;cursor:help" title="${s.note || 'Close Risk'}">⚠️ CLOSE RISK</span>` : 
+          (s.note && s.note.toLowerCase().includes('news') ? 
+           `<span class="status-badge ${status}">${status.toUpperCase().replace('_',' ')}</span>
+            <span class="status-badge" style="background:#edf2f7;color:#4a5568;border:1px solid #e2e8f0;margin-left:4px;cursor:help" title="${s.note}">⚠️ NEWS CANCEL</span>` :
+           `<span class="status-badge ${status}">${status.toUpperCase().replace('_',' ')}</span>`)
+        }
+      </td>
       <td style="color:var(--muted);text-align:center">${s.bars_to_entry ?? '—'}</td>
       <td style="color:var(--muted);text-align:center">${s.bars_to_exit  ?? '—'}</td>
       <td style="color:var(--muted)">${s.resolved_at ? s.resolved_at.slice(0,10) : '—'}</td>
