@@ -248,21 +248,27 @@ def _compute_raw_features(
     # h1_confluence REMOVED — replaced by granular features below
 
     sources = zone.get("sources", [])
-    # ── h4_fvg_inside (leakage fix) ──────────────────────────────────────────
+    # ── h4_fvg_inside (leakage fix v2) ───────────────────────────────────────
     # OLD BUG: checked zone["sources"]/zone["tf_source"] to detect FVG membership
     # making the feature circular — zones that ARE 4H FVGs always scored 1.0,
     # producing 95%+ win rates on tf_source='4h' rows (data leakage confirmed).
     #
-    # CORRECT: only fire when this OB zone overlaps a SEPARATE 4H FVG, or if the zone
-    # itself was explicitly flagged as a 4H FVG zone during HTF ML scoring setup
-    # (matching training where any zone inside/representing a 4H FVG was labeled with h4_fvg_inside=1.0).
+    # v1 "fix" (still buggy): kept the correct h4_fvg_zone/fvg_overlap flags but
+    # ALSO kept OR-ing in the old circular sources/source/tf_source checks below
+    # them, so any FVG-sourced zone still auto-scored 1.0 regardless of whether
+    # a genuinely separate 4H FVG confirmed it. Leakage was never actually removed.
+    #
+    # v2 (this fix): only fire on the two legitimate, non-circular flags — the
+    # zone must be EXPLICITLY flagged as sitting inside/overlapping a SEPARATE
+    # 4H FVG (h4_fvg_zone) or an overlap detected independently (fvg_overlap).
+    # A zone's own source/type being "fvg" no longer implies h4_fvg_inside=1.
+    #
+    # NOTE: existing trained models were fit on the leaky version of this
+    # feature. Historical labels/features must be regenerated and the model
+    # retrained after this change — the feature's meaning has changed.
     h4_fvg_inside = 1.0 if (
         zone.get("h4_fvg_zone", False)
         or zone.get("fvg_overlap", False)
-        or "fvg" in sources
-        or zone.get("source", "") == "fvg"
-        or "fvg" in str(zone.get("tf_source", ""))
-        or any("fvg" in str(s) for s in sources)
     ) else 0.0
 
     d1_ema_distance = _compute_d1_ema_distance(

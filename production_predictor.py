@@ -10,7 +10,7 @@ import time
 import json
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import warnings
 from feature_builder import build_feature_row
 from features import get_session as _canonical_get_session
@@ -499,44 +499,81 @@ def save_signals_to_single_file(signals: List[Dict],
         sym   = str(signal.get('symbol', ''))
         entry = float(signal.get('entry', 0))
         if 'XAU' in sym or 'GOLD' in sym.upper():
-            entry_bucketed = round(entry / 5) * 5
+            pip_size = 1.0        # $1 = 1 pip, matches training convention
         elif 'JPY' in sym:
-            entry_bucketed = round(entry * 2) / 2
+            pip_size = 0.01
         else:
-            entry_bucketed = round(entry, 3)
+            pip_size = 0.0001
+
+        # FIX: bucket width now scales with the ZONE'S OWN size (risk_pips)
+        # instead of a flat 0.5 pip. A flat 0.5 pip (=$0.50 for gold) is
+        # far tighter than the natural drift of a re-detected zone on a
+        # volatile instrument — gold's edges commonly shift $2-8 between
+        # cycles as new candles form, so a fixed tiny bucket was logging
+        # the SAME zone as brand-new "duplicate" signals a few dollars
+        # apart (e.g. 4078 vs 4072) instead of updating the existing one.
+        # Tying the bucket to a fraction of the zone's own risk width means
+        # "same area" scales with how wide that zone actually is.
+        risk_pips = float(signal.get('risk_pips', 0) or 0)
+        if risk_pips > 0:
+            bucket_width = max(pip_size * 0.5, risk_pips * pip_size * 0.35)
+        else:
+            bucket_width = pip_size * 0.5
+        entry_bucketed = round(entry / bucket_width) * bucket_width
         return (f"{sym}_{signal.get('direction')}_"
                 f"{entry_bucketed}_{signal.get('timeframe', '')}")
 
     existing_ids = {get_signal_id(s): i for i, s in enumerate(existing_signals)}
     new_added = updated = skipped_resolved = 0
 
+    # A resolved trade should only dedupe against re-detections of the SAME
+    # watch cycle — not block a genuinely new signal that reappears at the
+    # same zone a day (or more) later. hit_sl today shouldn't permanently
+    # veto the same setup reappearing tomorrow.
+    RESOLVED_BLOCK_HOURS = 24
+
     for signal in signals:
         sig_id = get_signal_id(signal)
         cur_ts = signal.get('timestamp') or datetime.utcnow().isoformat()
 
-        if sig_id in existing_ids:
+        treat_as_new = sig_id not in existing_ids
+
+        if not treat_as_new:
             idx = existing_ids[sig_id]
             ex  = existing_signals[idx]
 
             is_expired = (ex.get('status') == 'expired')
 
-            # Never touch resolved outcomes — unless it's expired and re-generated in the current cycle
+            # Never touch resolved outcomes — unless it's expired and re-generated
+            # in the current cycle, or the resolved record is stale enough that
+            # this is clearly a new, unrelated signal rather than a re-detection.
             if ex.get('status') in RESOLVED_STATUSES and not is_expired:
-                skipped_resolved += 1
-                continue
+                stale = True
+                try:
+                    ref_ts = ex.get('last_seen') or ex.get('resolved_at') or ex.get('timestamp')
+                    new_ts = datetime.fromisoformat(str(cur_ts))
+                    old_ts = datetime.fromisoformat(str(ref_ts))
+                    age_hours = (new_ts - old_ts).total_seconds() / 3600
+                    stale = age_hours >= RESOLVED_BLOCK_HOURS
+                except Exception:
+                    stale = False  # if we can't parse timestamps, fail safe (keep old behavior)
 
-            # Update count and history
-            if 'cycle_history' not in ex or not isinstance(ex['cycle_history'], list):
-                # Backfill from existing timestamp/last_seen
-                orig_ts = ex.get('timestamp') or ex.get('last_seen')
-                ex['cycle_history'] = [orig_ts] if orig_ts else []
-            
-            if cur_ts not in ex['cycle_history']:
-                ex['cycle_history'].append(cur_ts)
-            ex['production_count'] = len(ex['cycle_history'])
+                if not stale:
+                    skipped_resolved += 1
+                    continue
+                # Stale — this is a distinct new signal, not a re-detection of
+                # the old resolved trade. Fall through to append-as-new below.
+                treat_as_new = True
 
-            if is_expired:
+            elif is_expired:
                 # Update status back to pending
+                if 'cycle_history' not in ex or not isinstance(ex['cycle_history'], list):
+                    orig_ts = ex.get('timestamp') or ex.get('last_seen')
+                    ex['cycle_history'] = [orig_ts] if orig_ts else []
+                if cur_ts not in ex['cycle_history']:
+                    ex['cycle_history'].append(cur_ts)
+                ex['production_count'] = len(ex['cycle_history'])
+
                 ex['status'] = 'pending'
                 # Clean up resolved trackers
                 ex.pop('exit_price', None)
@@ -545,7 +582,7 @@ def save_signals_to_single_file(signals: List[Dict],
                 ex.pop('resolved_at', None)
                 ex.pop('bars_to_entry', None)
                 ex.pop('bars_to_exit', None)
-                
+
                 # Overwrite/refresh everything since it is a regenerated zone
                 ex['entry']        = signal.get('entry',       ex.get('entry'))
                 ex['sl']           = signal.get('sl',          ex.get('sl'))
@@ -562,9 +599,25 @@ def save_signals_to_single_file(signals: List[Dict],
                 ex['last_seen']     = cur_ts
                 ex['timestamp']     = cur_ts
                 updated += 1
+                continue
+
             else:
+                # Not resolved, not expired — normal re-detection update path.
+                if 'cycle_history' not in ex or not isinstance(ex['cycle_history'], list):
+                    orig_ts = ex.get('timestamp') or ex.get('last_seen')
+                    ex['cycle_history'] = [orig_ts] if orig_ts else []
+                if cur_ts not in ex['cycle_history']:
+                    ex['cycle_history'].append(cur_ts)
+                ex['production_count'] = len(ex['cycle_history'])
+
                 # Only update signals still awaiting entry
                 if ex.get('status') == 'pending':
+                    # Snapshot BEFORE overwrite so we can tell whether the
+                    # tradeable levels actually moved this cycle.
+                    _old_entry = ex.get('entry')
+                    _old_sl    = ex.get('sl')
+                    _old_tp    = ex.get('tp')
+
                     # Rule 1 — always refresh execution levels (model has fresher data)
                     ex['entry']        = signal.get('entry',       ex.get('entry'))
                     ex['sl']           = signal.get('sl',          ex.get('sl'))
@@ -573,6 +626,19 @@ def save_signals_to_single_file(signals: List[Dict],
                     ex['reward_pips']  = signal.get('reward_pips', ex.get('reward_pips'))
                     ex['risk_reward']  = signal.get('risk_reward', ex.get('risk_reward'))
                     ex['rr']           = signal.get('rr',          ex.get('rr'))
+
+                    # FIX: if entry/sl/tp changed, the zone the tracker should be
+                    # watching is different from the one it was watching before —
+                    # re-anchor `timestamp` to now. Otherwise check_outcomes()
+                    # slices bars_after using the OLD (often much earlier)
+                    # timestamp and replays them against the NEW levels, which
+                    # can "discover" a trigger/TP/SL hit from price action that
+                    # happened before this exact zone existed. That's what
+                    # produces status labels (triggered / hit_tp / hit_sl) that
+                    # don't match reality.
+                    if (ex['entry'] != _old_entry or ex['sl'] != _old_sl
+                            or ex['tp'] != _old_tp):
+                        ex['timestamp'] = cur_ts
 
                     # Rule 2 — only upgrade probability, never degrade
                     new_prob = float(signal.get('probability', 0))
@@ -592,14 +658,18 @@ def save_signals_to_single_file(signals: List[Dict],
                     ex['last_seen']     = cur_ts
 
                     updated += 1
-            continue
+                continue
 
-        # Brand-new signal — add with pending status
+        # Brand-new signal (or a stale-resolved bucket collision treated as new)
+        # — add with pending status.
+        prior_at_bucket = [s for s in existing_signals if get_signal_id(s) == sig_id]
+        signal['round']     = len(prior_at_bucket) + 1
         signal['status']    = 'pending'
         signal['last_seen'] = cur_ts
         signal['cycle_history'] = [cur_ts]
         signal['production_count'] = 1
         existing_signals.append(signal)
+        existing_ids[sig_id] = len(existing_signals) - 1  # future dedup targets THIS entry
         new_added += 1
 
     if skipped_resolved:
@@ -743,6 +813,16 @@ class ProductionForexPredictor:
         self.last_15min_bar_time   = None
         self.zone_history          = {}   # FIX: was never initialised — caused AttributeError at runtime
 
+        # FIX #5: dedup guard. Same zone/price-level was observed firing multiple
+        # signals within minutes/seconds of each other (e.g. XAU/USD BUY firing
+        # 3x on 2026-07-23, EUR/USD BUY firing twice one second apart on
+        # 2026-07-27) — this isn't 3 independent trade ideas, it's one market
+        # move counted (and risked) as several. Track last-fired time per
+        # (symbol, direction, price-bucket) and suppress re-firing within the
+        # cooldown window.
+        self._recent_zone_signals: Dict[str, datetime] = {}
+        self.zone_dedupe_cooldown_minutes: float = 30.0
+
         self.stats = {
             'total_iterations': 0, 'total_candidates': 0,
             'total_duplicates': 0, 'total_new_zones': 0,
@@ -756,6 +836,30 @@ class ProductionForexPredictor:
     # Cache removed — pre_warm_cache is a no-op kept for call-site compatibility.
     def pre_warm_cache(self) -> None:
         pass
+
+    def _is_duplicate_zone_signal(self, symbol: str, direction: str, entry: float) -> bool:
+        """
+        FIX #5: returns True (and records the firing) if a signal for this
+        symbol/direction/price-level already fired within the cooldown window.
+        Price is bucketed to the nearest 10 pips (or $1 for XAU) so minor zone
+        migrations between near-duplicate detections still count as the same
+        level, matching the bucketing already used for zone_history elsewhere.
+        """
+        bucket = round(entry / (self.pip_size * 10)) * (self.pip_size * 10)
+        key = f"{symbol}:{direction}:{bucket:.5f}"
+        now = datetime.utcnow()
+
+        last_fired = self._recent_zone_signals.get(key)
+        if last_fired is not None:
+            elapsed_min = (now - last_fired).total_seconds() / 60.0
+            if elapsed_min < self.zone_dedupe_cooldown_minutes:
+                if self.debug:
+                    print(f"     ⛔ DEDUP: {key} suppressed — fired {elapsed_min:.1f}min ago "
+                          f"(cooldown={self.zone_dedupe_cooldown_minutes}min)")
+                return True
+
+        self._recent_zone_signals[key] = now
+        return False
 
 
     def load_model(self, model_path, scaler_path, encoders_path, stats_path):
@@ -1744,7 +1848,105 @@ class ProductionForexPredictor:
     def apply_boost_ceiling(self, base: float, boost: float) -> float:
         return min(base + min(boost, self.max_boost), 0.95)
 
-    # ARCHITECTURE (confirmed from training_labels_clean.parquet):
+    def _find_swing_points(self, df: pd.DataFrame, lookback: int, pivot_width: int = 2) -> Tuple[List[float], List[float]]:
+        """
+        Real pivot detection: a bar's low is a swing low only if it's lower
+        than `pivot_width` bars on both sides (and likewise for highs).
+        Excludes the last `pivot_width` bars since they can't be confirmed
+        yet (no future bars to compare against).
+        Returns (swing_lows, swing_highs).
+        """
+        window = df.tail(lookback).reset_index(drop=True)
+        n = len(window)
+        swing_lows, swing_highs = [], []
+        for i in range(pivot_width, n - pivot_width):
+            lo = window['low'].iloc[i]
+            hi = window['high'].iloc[i]
+            left_lows   = window['low'].iloc[i - pivot_width:i]
+            right_lows  = window['low'].iloc[i + 1:i + 1 + pivot_width]
+            left_highs  = window['high'].iloc[i - pivot_width:i]
+            right_highs = window['high'].iloc[i + 1:i + 1 + pivot_width]
+            if lo < left_lows.min() and lo < right_lows.min():
+                swing_lows.append(lo)
+            if hi > left_highs.max() and hi > right_highs.max():
+                swing_highs.append(hi)
+        return swing_lows, swing_highs
+
+    def _clamp_tp_to_structure(self, direction: str, entry: float, tp_raw: float,
+                                df: pd.DataFrame, htf_context: Optional[Dict],
+                                swing_lookback: int = 30) -> Tuple[float, Optional[str]]:
+        """
+        Structure-aware TP clamp. tp_raw (from the reaction_size/fvg_size
+        multiplier) is a pure measured-move projection — it has no idea
+        whether a real opposing zone or swing point sits in the way.
+        This scans for the nearest such obstacle between entry and tp_raw
+        and pulls TP back to just short of it if one exists.
+
+        Candidates closer than `min_obstacle_dist` are ignored — a level a
+        few pips from entry isn't real structure, it's noise, and clamping
+        to it would gut the trade's RR to near zero.
+
+        Returns (clamped_tp, reason). reason is None if tp_raw was left
+        untouched (no meaningful obstacle found in the path).
+        """
+        atr = df['atr'].iloc[-1] if 'atr' in df.columns and not pd.isna(df['atr'].iloc[-1]) else self.pip_size * 15
+        # Roughly the minimum reward the RR floor would require anyway
+        # (risk floor ≈ 2.5×ATR, MIN_HTF_RR ≈ 1.2 → reward ≈ 3×ATR).
+        # Anything closer than this isn't a meaningful obstacle to clamp to.
+        min_obstacle_dist = atr * 3.0
+
+        candidates: List[float] = []
+
+        # 1) Opposing HTF zones (FVGs/OBs) whose near edge sits between
+        #    entry and tp_raw, and is far enough away to be real structure.
+        if htf_context:
+            all_zones = (htf_context.get('h1_fvgs', []) + htf_context.get('h4_fvgs', []) +
+                         htf_context.get('h1_order_blocks', []) + htf_context.get('h4_order_blocks', []))
+            opposing_type = 'bullish' if direction == 'SELL' else 'bearish'
+            for z in all_zones:
+                if z.get('type') != opposing_type:
+                    continue
+                near_edge = z.get('top') if direction == 'SELL' else z.get('bottom')
+                if near_edge is None:
+                    continue
+                if abs(near_edge - entry) < min_obstacle_dist:
+                    continue
+                if direction == 'SELL' and tp_raw < near_edge < entry:
+                    candidates.append(near_edge)
+                elif direction == 'BUY' and entry < near_edge < tp_raw:
+                    candidates.append(near_edge)
+
+        # 2) Real swing pivots (not just a rolling window min/max) in the
+        #    same path — catches obstacles the zone detectors missed.
+        try:
+            swing_lows, swing_highs = self._find_swing_points(df, swing_lookback)
+            if direction == 'SELL':
+                for sl in swing_lows:
+                    if tp_raw < sl < entry and abs(sl - entry) >= min_obstacle_dist:
+                        candidates.append(sl)
+            else:
+                for sh in swing_highs:
+                    if entry < sh < tp_raw and abs(sh - entry) >= min_obstacle_dist:
+                        candidates.append(sh)
+        except Exception:
+            pass
+
+        if not candidates:
+            return tp_raw, None
+
+        # Take the nearest obstacle (most conservative), leave a small buffer
+        # so TP sits just short of it rather than exactly on it.
+        buffer = atr * 0.15
+        if direction == 'SELL':
+            nearest = max(candidates)          # closest to entry = highest of the below-entry candidates
+            clamped = nearest + buffer
+        else:
+            nearest = min(candidates)          # closest to entry = lowest of the above-entry candidates
+            clamped = nearest - buffer
+
+        return clamped, f"clamped to nearest opposing structure at {nearest:.5f}"
+
+
     #   tf_source:    4h_1h_confluence=5190 (90%),  4h=561 (10%),  15min=0
     #   zone_sources: order_block=96%,  fvg=4%
     # The old 15min demand/supply zone pipeline is SECONDARY — the model was
@@ -2172,7 +2374,13 @@ class ProductionForexPredictor:
                 'distance_pips': round(abs(current_price - entry) / self.pip_size, 1),
                 'd1_trend':     htf_context.get('daily_structure', {}).get('trend', 'neutral') if htf_context else 'unknown',
                 'zone_strength': round(zone_obj.get('strength', 0), 2),
-                'htf_trend':    htf_context.get('h1_trend', 'unknown') if htf_context else 'unknown',
+                # FIX: 'htf_trend' was silently sourced from h1_trend (a 1H EMA20/50
+                # crossover) despite the name implying 4H. Point it at the real 4H
+                # structure trend so d1_trend/htf_trend alignment analysis is
+                # actually comparing D1 vs 4H, as intended. The old 1H value is
+                # preserved below under its own honest field name.
+                'htf_trend':    htf_context.get('h4_structure', {}).get('trend', 'unknown') if htf_context else 'unknown',
+                '1h_trend':     htf_context.get('h1_trend', 'unknown') if htf_context else 'unknown',
                 # Zone body boundaries — required by PriceZoneMonitor for Step 3 body check
                 'zone_top':     round(zone_obj.get('top', zone_obj.get('price_high', entry)), 5),
                 'zone_bottom':  round(zone_obj.get('bottom', zone_obj.get('price_low', sl)), 5),
@@ -2193,8 +2401,30 @@ class ProductionForexPredictor:
                 htf_fvg_rejected['confs'] += 1; continue
 
             direction = 'BUY' if fvg['type'] == 'bullish' else 'SELL'
-            entry     = fvg['mid']
-            sl        = fvg['bottom'] if direction == 'BUY' else fvg['top']
+            # ── Entry/SL: 3/4-toward-near-edge entry, SL past the true edge ────
+            # Old logic entered at fvg['mid'] (halfway INTO the gap) with SL at
+            # the far edge. That let a bar wick through the near edge and keep
+            # going before entry was even touched — large entry_slippage_pips,
+            # and once filled that deep, large sl_overflow_pips on the way out
+            # (FVG-1.78 / FVG-1.05 / FVG-0.54 losses).
+            # A prior fix moved entry all the way to the near edge but
+            # (bug) recomputed SL as an offset from the new entry using the
+            # OLD half-gap risk number — which silently dragged SL in from the
+            # zone's real far edge to its midpoint, a level with no structural
+            # meaning. That's why win rate dropped even though slippage improved.
+            # Corrected version: entry sits 3/4 of the way from the far edge
+            # toward the near edge (meaningfully shallower than mid, without
+            # fully chasing the edge). SL stays anchored to the REAL far edge
+            # — the zone's actual invalidation point — plus a small ATR buffer
+            # so an ordinary wick past the edge doesn't stop the trade out.
+            _gap      = abs(fvg['top'] - fvg['bottom'])
+            _atr_buf  = df['atr'].iloc[-1] * 0.2 if 'atr' in df.columns else 0.0002
+            if direction == 'BUY':
+                entry = fvg['bottom'] + 0.75 * _gap   # 3/4 toward near edge (top)
+                sl    = fvg['bottom'] - _atr_buf      # past the real far edge, wick-buffered
+            else:
+                entry = fvg['top'] - 0.75 * _gap      # 3/4 toward near edge (bottom)
+                sl    = fvg['top'] + _atr_buf         # past the real far edge, wick-buffered
 
             # ── D1/4H HARD BIAS BLOCK (HTF FVG) ──────────────────────────────
             # D1 is the hard gate when it has a clear bias; 4H is fallback.
@@ -2233,6 +2463,10 @@ class ProductionForexPredictor:
             tp_target = (max(fib_levels.get('0.5', entry + fvg['size'] * 2), entry + fvg['size'] * 2)
                          if direction == 'BUY' else
                          min(fib_levels.get('0.5', entry - fvg['size'] * 2), entry - fvg['size'] * 2))
+
+            tp_target, _clamp_reason = self._clamp_tp_to_structure(direction, entry, tp_target, df, htf_context)
+            if self.debug and _clamp_reason:
+                print(f"     🎯 FVG TP {_clamp_reason}")
 
             risk   = abs(entry - sl)
             reward = abs(tp_target - entry)
@@ -2333,6 +2567,10 @@ class ProductionForexPredictor:
 
             tp_raw = (entry + ob['reaction_size'] * 1.5 if direction == 'BUY'
                     else entry - ob['reaction_size'] * 1.5)
+
+            tp_raw, _clamp_reason = self._clamp_tp_to_structure(direction, entry, tp_raw, df, htf_context)
+            if self.debug and _clamp_reason:
+                print(f"     🎯 OB TP {_clamp_reason}")
 
             # For non-Gold pairs, clamp TP so RR never exceeds MAX_HTF_RR ceiling
             # Gold is untouched — its reaction_size already produces valid RR naturally
@@ -2557,6 +2795,11 @@ class ProductionForexPredictor:
                       f"prob={_p:.1f}% < threshold={self.prob_threshold * 100:.1f}%")
 
         # ── Load open trades for open-trade guard ────────────────────────────
+        # Covers BOTH triggered (open position) and pending (untriggered,
+        # still-watched) signals — without the pending half, tightening the
+        # signal-ID bucket (needed to stop a real dedup bug) could let
+        # several near-identical pending signals stack up in the same area
+        # before any of them ever triggers.
         _open_trades: List[Dict] = []
         _signals_path = Path("signals/all_signals.json")
         if _signals_path.exists():
@@ -2566,8 +2809,7 @@ class ProductionForexPredictor:
                     _open_trades = [
                         _s for _s in _all
                         if _s.get('symbol') == self.symbol
-                        and _s.get('status') == 'triggered'
-                        and _s.get('triggered') is True
+                        and _s.get('status') in ('triggered', 'pending')
                     ]
             except Exception as _e:
                 logger.warning(f"open-trade guard: could not read signals — {_e}")
@@ -2594,8 +2836,8 @@ class ProductionForexPredictor:
                     _guard_hit = True
                     if self.debug:
                         print(f"     ⛔ OPEN-TRADE GUARD: {_dir_candidate} @ {_entry_candidate:.5f} "
-                              f"blocked — open trade exists @ {_ot.get('entry')} "
-                              f"(dist={_dist:.1f}p, status=triggered)")
+                              f"blocked — {_ot.get('status')} signal exists @ {_ot.get('entry')} "
+                              f"(dist={_dist:.1f}p, status={_ot.get('status')})")
                     break
             if _guard_hit:
                 self.stats['total_duplicates'] += 1
@@ -2603,6 +2845,14 @@ class ProductionForexPredictor:
             # ────────────────────────────────────────────────────────────────
 
             is_dup, _ = self.zone_tracker.is_duplicate(sig_key, current_time, current_price)
+            # FIX #5: zone_tracker.is_duplicate() keys on exact entry/sl (5dp),
+            # so two near-identical zones a fraction of a pip apart (e.g. the
+            # observed EUR/USD pair firing one second apart on 2026-07-27 with
+            # entries 0.00016 apart) both pass as "different" zones. Add a
+            # proximity-bucketed cooldown check as a second layer.
+            if not is_dup and self._is_duplicate_zone_signal(
+                    self.symbol, s.get('direction'), s.get('entry', 0)):
+                is_dup = True
             if not is_dup:
                 self.zone_tracker.add_zone(sig_key, {
                     'price_mid': s.get('entry'),
@@ -2743,7 +2993,8 @@ class ProductionForexPredictor:
         observation_signals = []   # zones blocked by gates — saved for study
         rejected_cnt = 0
         reject_reasons = {'5min_refine': 0, 'prob_low': 0, 'risk_range': 0,
-                          'h4_bias': 0, 'd1_premium_discount': 0, 'zone_close': 0}
+                          'h4_bias': 0, 'd1_premium_discount': 0, 'zone_close': 0,
+                          'zone_dedupe': 0}
 
         def _make_obs_signal(zone, gate_reason):
             """Build a lightweight observation signal dict for a gate-blocked zone."""
@@ -2779,7 +3030,7 @@ class ProductionForexPredictor:
                 'status':           'observation',
             }
 
-        # ── v7 HARD GATE 1: 4H Bias ───────────────────────────────────────────
+        # ── v7 HARD GATE 1: D1 Bias (primary) with 4H fallback ─────────────────
         # Recompute h4_structure fresh from live 4H bars every cycle.
         # the trend label could be hours old and wrong side of a structure flip.
         _df_4h_bias = _bars['4h/200']
@@ -2788,6 +3039,21 @@ class ProductionForexPredictor:
             h4_trend = _fresh_h4_struct.get('trend', 'neutral')
         else:
             h4_trend = htf_context.get('h4_structure', {}).get('trend', 'neutral')
+
+        # FIX: this gate previously used h4_trend as the ONLY hard bias check —
+        # D1 was never consulted here at all, even though D1 is supposed to be
+        # the top of the bias hierarchy (D1 → 4H zones → 1H confirm → 5M entry).
+        # This is why ~56% of historical signals showed d1_trend='neutral' in
+        # the log yet still fired freely in either direction: the daily bias
+        # field was informational only on this path, not an actual gate.
+        #
+        # Mirrors the _hard_bias pattern already used correctly in the HTF FVG
+        # and HTF OB gates elsewhere in this file: D1 is the hard gate whenever
+        # it has a clear (non-neutral) structure trend; 4H only takes over as
+        # the fallback when D1 itself is neutral/consolidating.
+        # daily_structure is computed on closed-D1 bars only (see get_htf_context).
+        _d1_trend  = htf_context.get('daily_structure', {}).get('trend', 'neutral') if htf_context else 'neutral'
+        _hard_bias = _d1_trend if _d1_trend != 'neutral' else h4_trend
 
         # ── v7 HARD GATE 2: D1 Premium / Discount ─────────────────────────────
         _d1_pd = 0  # default: equilibrium (no gate)
@@ -2826,23 +3092,24 @@ class ProductionForexPredictor:
             is_cont  = zone.get('is_continuation', False)
             flip_info = zone.get('flip_info')
 
-            # ── Apply 4H bias gate — HARD BLOCK ──────────────────────────────
-            # If 4H trend is bullish → block all SELL (supply) signals.
-            # If 4H trend is bearish → block all BUY (demand) signals.
-            if h4_trend == 'bullish' and zone['type'] == 'supply':
+            # ── Apply D1/4H bias gate — HARD BLOCK ───────────────────────────
+            # D1 is the hard gate when it has a clear bias; 4H is fallback
+            # (see _hard_bias derivation above). Bullish bias → block SELL.
+            # Bearish bias → block BUY. Matches the HTF FVG / HTF OB gates.
+            if _hard_bias == 'bullish' and zone['type'] == 'supply':
                 rejected_cnt += 1
                 reject_reasons['d1_premium_discount'] += 1
-                observation_signals.append(_make_obs_signal(zone, '4h_bullish_blocks_sell'))
-                msg = f"  ⛔ 4H BIAS HARD BLOCK: supply (SELL) zone at {zone.get('price_mid', 0.0):.5f} blocked — 4H trend is bullish"
+                observation_signals.append(_make_obs_signal(zone, 'd1_4h_bullish_blocks_sell'))
+                msg = f"  ⛔ D1/4H BIAS HARD BLOCK: supply (SELL) zone at {zone.get('price_mid', 0.0):.5f} blocked — bias is bullish (d1={_d1_trend} h4={h4_trend})"
                 logger.info(msg)
                 if self.debug:
                     print(msg)
                 continue
-            elif h4_trend == 'bearish' and zone['type'] == 'demand':
+            elif _hard_bias == 'bearish' and zone['type'] == 'demand':
                 rejected_cnt += 1
                 reject_reasons['d1_premium_discount'] += 1
-                observation_signals.append(_make_obs_signal(zone, '4h_bearish_blocks_buy'))
-                msg = f"  ⛔ 4H BIAS HARD BLOCK: demand (BUY) zone at {zone.get('price_mid', 0.0):.5f} blocked — 4H trend is bearish"
+                observation_signals.append(_make_obs_signal(zone, 'd1_4h_bearish_blocks_buy'))
+                msg = f"  ⛔ D1/4H BIAS HARD BLOCK: demand (BUY) zone at {zone.get('price_mid', 0.0):.5f} blocked — bias is bearish (d1={_d1_trend} h4={h4_trend})"
                 logger.info(msg)
                 if self.debug:
                     print(msg)
@@ -3035,7 +3302,13 @@ class ProductionForexPredictor:
                 'zone_strength':   round(zone['strength'], 2),
                 'distance_pips':   round(zone['distance_pips'], 1),
                 'stale':           zone['distance_pips'] > 15,
-                'htf_trend':       htf_context.get('h1_trend', 'unknown'),
+                # FIX: 'htf_trend' was silently sourced from h1_trend (1H EMA
+                # crossover) despite the name implying a higher timeframe. This
+                # block already computes a genuine 4H trend a few lines below
+                # ('h4_trend') — point 'htf_trend' at that instead, and keep the
+                # 1H value under its own honest field name so nothing is lost.
+                'htf_trend':       htf_context.get('h4_structure', {}).get('trend', 'unknown'),
+                '1h_trend':        htf_context.get('h1_trend', 'unknown'),
                 'validated':       zone.get('validated', False),
                 '5min_refined':    refinement is not None,
                 'confluence_score': zone.get('htf_confluence', {}).get('score', 0),
@@ -3084,6 +3357,16 @@ class ProductionForexPredictor:
                         rejected_cnt += 1
                         reject_reasons['zone_close'] += 1
                         continue
+
+            # FIX #5: proximity-bucketed dedup guard — suppress re-firing the
+            # same symbol/direction/price-level within the cooldown window.
+            if self._is_duplicate_zone_signal(self.symbol, signal.get('direction'), signal.get('entry', 0)):
+                rejected_cnt += 1
+                reject_reasons['zone_dedupe'] += 1
+                if self.debug:
+                    print(f"     ⛔ DEDUP: {signal.get('direction')} @ {signal.get('entry'):.5f} "
+                          f"suppressed — same zone fired within {self.zone_dedupe_cooldown_minutes}min")
+                continue
 
             signals.append(signal)
 
@@ -3293,8 +3576,38 @@ def apply_news_filter_to_active_signals(news_filter: ForexFactoryNewsFilter,
         return
 
     pred_map = {p.symbol: p for p in predictors} if predictors else {}
-    now_utc  = datetime.utcnow()
+    now_utc  = datetime.now(timezone.utc)
     updated  = False
+
+    # Backfill: signals flagged for closure before the news_status field was
+    # introduced only have the older action=='close' marker. Without this,
+    # they'd never surface in the persistent summary below, since the branch
+    # that sets news_status intentionally skips re-processing already-closed
+    # signals (to avoid re-spamming the same closure warning every cycle).
+    for sig in signals:
+        if (sig.get('status') in ('triggered', 'active')
+                and sig.get('action') == 'close'
+                and sig.get('news_status') is None):
+            sig['news_status'] = 'flagged_for_closure'
+            updated = True
+
+    # Clear sweep: a news-flagged trade should stop being treated as a news
+    # risk the moment the actual news window (window_minutes around the
+    # event) closes — not after some arbitrary timer. Check the real window
+    # directly via is_news_active() for each flagged symbol; if it's no
+    # longer active, the acute risk has passed, so drop the flag. You're
+    # handling the real broker-side position yourself, so this is just
+    # about keeping the log/JSON accurate — not a trade action.
+    for sig in signals:
+        if sig.get('news_status') == 'flagged_for_closure':
+            symbol = sig.get('symbol')
+            is_news, _ = news_filter.is_news_active(symbol, window_minutes=window_minutes)
+            if not is_news:
+                _entry_str = f"{sig.get('entry'):.5f}" if sig.get('entry') is not None else "?"
+                print(f"✅ [{symbol} {sig.get('direction')} @ {_entry_str}] News window closed — flag cleared.")
+                sig['action']      = None
+                sig['news_status'] = None
+                updated = True
 
     for sig in signals:
         status = sig.get('status')
@@ -3311,9 +3624,12 @@ def apply_news_filter_to_active_signals(news_filter: ForexFactoryNewsFilter,
                 # it's safest to just drop the pending zone.
                 if not triggered or status == 'pending':
                     sig['status'] = 'expired'
-                    sig['sl']     = None  # Stop showing SL
+                    if sig.get('original_sl') is None:
+                        sig['original_sl'] = sig.get('sl')   # preserve for record/slippage tracking
                     sig['note']   = f"expired due to news risk: '{news_event['title']}' ({news_event['country']})"
-                    print(f"⚠️  [{symbol}] PENDING SIGNAL EXPIRED due to news risk: '{news_event['title']}'")
+                    _dir = sig.get('direction', '?')
+                    _entry_str = f"{sig.get('entry'):.5f}" if sig.get('entry') is not None else "?"
+                    print(f"⚠️  [{symbol} {_dir} @ {_entry_str}] PENDING SIGNAL EXPIRED due to news risk: '{news_event['title']}'")
                     updated = True
 
                 # Case 2: Triggered (already running) — a real position exists.
@@ -3337,27 +3653,35 @@ def apply_news_filter_to_active_signals(news_filter: ForexFactoryNewsFilter,
                         # leave the trade alone, just log it for visibility.
                         if sig.get('action') == 'close':
                             sig['action'] = None
+                        sig.pop('news_status', None)
                         sig['news_risk'] = True
                         sig['note'] = (f"news released: '{news_event['title']}' ({news_event['country']}) — "
                                        f"price moving in favor of {direction}, holding")
-                        print(f"ℹ️  [{symbol}] News released ('{news_event['title']}') but price is moving "
-                              f"in your favor ({direction}) — no action needed.")
+                        _entry_str = f"{entry:.5f}" if entry is not None else "?"
+                        print(f"ℹ️  [{symbol} {direction} @ {_entry_str}] News released ('{news_event['title']}') "
+                              f"but price is moving in your favor ({direction}) — no action needed.")
                         updated = True
                     else:
                         # Either the news hasn't happened yet (direction unknown,
                         # so be conservative) or it has and price is moving
                         # against the position — flag for closure either way.
                         if sig.get('action') != 'close':
-                            sig['action']    = 'close'
-                            sig['news_risk'] = True
-                            sig['sl']        = None  # Stop showing SL
+                            sig['action']       = 'close'
+                            sig['news_risk']    = True
+                            # Distinct from 'triggered' so it can't be mistaken for a
+                            # resolved outcome (hit_tp/hit_sl) if something downstream
+                            # stamps resolved_at on any signal carrying action=close.
+                            sig['news_status']  = 'flagged_for_closure'
+                            if sig.get('original_sl') is None:
+                                sig['original_sl'] = sig.get('sl')   # preserve for record/slippage tracking
                             reason = ("price moving against position after news release"
                                       if news_already_released and favorable is False
                                       else "upcoming high-impact news — outcome unknown")
                             sig['note'] = (f"close trade - risk of news: '{news_event['title']}' "
                                            f"({news_event['country']}) — {reason}")
-                            print(f"🚨 [{symbol}] ACTIVE TRADE FLAGGED FOR CLOSURE — {reason} "
-                                  f"('{news_event['title']}')")
+                            _entry_str = f"{entry:.5f}" if entry is not None else "?"
+                            print(f"🚨 [{symbol} {direction} @ {_entry_str}] ACTIVE TRADE FLAGGED FOR CLOSURE — "
+                                  f"{reason} ('{news_event['title']}')")
                             updated = True
 
     if updated:
@@ -3367,6 +3691,20 @@ def apply_news_filter_to_active_signals(news_filter: ForexFactoryNewsFilter,
             print("💾 Saved news-restricted signal updates to all_signals.json")
         except Exception as e:
             logger.error(f"apply_news_filter_to_active_signals: save failed — {e}")
+
+    # ── Persistent status summary ──────────────────────────────────────────
+    # The transition logs above only fire when something *changes* this
+    # cycle, so a trade flagged for closure two cycles ago goes silent even
+    # though it's still sitting there unresolved. Print the full current
+    # state every cycle so nothing gets missed just because nothing changed.
+    still_flagged = [s for s in signals
+                      if s.get('status') in ('triggered', 'active')
+                      and s.get('news_status') == 'flagged_for_closure']
+    if still_flagged:
+        print(f"\n📋 Trades still flagged for closure (news risk):")
+        for s in still_flagged:
+            _entry_str = f"{s.get('entry'):.5f}" if s.get('entry') is not None else "?"
+            print(f"   • [{s.get('symbol')} {s.get('direction')} @ {_entry_str}] {s.get('note', '')}")
 
 
 def run_dual_strategy(symbols: Optional[List[str]] = None):

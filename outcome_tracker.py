@@ -62,6 +62,7 @@ def simulate_signal_bar_by_bar(
     tp: float,
     entry_tolerance_pips: float = 0.5,
     pip_size: float = 0.0001,
+    closed_cutoff=None,
 ) -> Dict:
     """
     Walk bars in chronological order and simulate exactly what would happen
@@ -91,6 +92,9 @@ def simulate_signal_bar_by_bar(
         bar_high = bar["high"]
         bar_low  = bar["low"]
         bar_open = bar.get("open", entry) if hasattr(bar, "get") else getattr(bar, "open", entry)
+        _bar_time = bar.get("time") if hasattr(bar, "get") else getattr(bar, "time", None)
+        bar_is_closed = (closed_cutoff is None or _bar_time is None
+                          or _bar_time <= closed_cutoff)
 
         if not triggered:
             # ── FIX-6: Tightened entry trigger ───────────────────────────
@@ -125,32 +129,32 @@ def simulate_signal_bar_by_bar(
                 # Removed open-proximity coin-flip. If both SL and TP are
                 # hit on the entry bar, we cannot confirm TP was hit first
                 # without tick data → treat as SL (conservative, realistic).
-                if sl_hit and tp_hit:
-                    return {
-                        "status":        Status.HIT_SL,
-                        "triggered":     True,
-                        "resolved_bar":  bar,
-                        "bars_to_entry": i,
-                        "bars_to_exit":  0,
-                    }
-                elif sl_hit:
-                    return {
-                        "status":        Status.HIT_SL,
-                        "triggered":     True,
-                        "resolved_bar":  bar,
-                        "bars_to_entry": i,
-                        "bars_to_exit":  0,
-                    }
-                elif tp_hit:
-                    # TP hit on entry bar with no SL → valid WIN
-                    return {
-                        "status":        Status.HIT_TP,
-                        "triggered":     True,
-                        "resolved_bar":  bar,
-                        "bars_to_entry": i,
-                        "bars_to_exit":  0,
-                    }
-                # Entry touched, neither SL nor TP yet — continue to next bar
+                if bar_is_closed:
+                    if sl_hit and tp_hit:
+                        return {
+                            "status":        Status.HIT_SL,
+                            "triggered":     True,
+                            "resolved_bar":  bar,
+                            "bars_to_entry": i,
+                            "bars_to_exit":  0,
+                        }
+                    elif sl_hit:
+                        return {
+                            "status":        Status.HIT_SL,
+                            "triggered":     True,
+                            "resolved_bar":  bar,
+                            "bars_to_entry": i,
+                            "bars_to_exit":  0,
+                        }
+                    elif tp_hit:
+                        return {
+                            "status":        Status.HIT_TP,
+                            "triggered":     True,
+                            "resolved_bar":  bar,
+                            "bars_to_entry": i,
+                            "bars_to_exit":  0,
+                        }
+                # Entry touched, neither SL nor TP resolved yet — continue to next bar
 
         else:
             # ── Trade is live — check SL first, then TP ───────────────────
@@ -164,31 +168,31 @@ def simulate_signal_bar_by_bar(
                 tp_hit = bar_low  <= tp
 
             # ── FIX-7: SL always wins on same-bar conflict ────────────────
-            if sl_hit and tp_hit:
-                return {
-                    "status":        Status.HIT_SL,
-                    "triggered":     True,
-                    "resolved_bar":  bar,
-                    "bars_to_entry": entry_bar_i,
-                    "bars_to_exit":  i - entry_bar_i,
-                }
-            elif sl_hit:
-                return {
-                    "status":        Status.HIT_SL,
-                    "triggered":     True,
-                    "resolved_bar":  bar,
-                    "bars_to_entry": entry_bar_i,
-                    "bars_to_exit":  i - entry_bar_i,
-                }
-            elif tp_hit:
-                # TP reached, SL was never hit → genuine WIN
-                return {
-                    "status":        Status.HIT_TP,
-                    "triggered":     True,
-                    "resolved_bar":  bar,
-                    "bars_to_entry": entry_bar_i,
-                    "bars_to_exit":  i - entry_bar_i,
-                }
+            if bar_is_closed:
+                if sl_hit and tp_hit:
+                    return {
+                        "status":        Status.HIT_SL,
+                        "triggered":     True,
+                        "resolved_bar":  bar,
+                        "bars_to_entry": entry_bar_i,
+                        "bars_to_exit":  i - entry_bar_i,
+                    }
+                elif sl_hit:
+                    return {
+                        "status":        Status.HIT_SL,
+                        "triggered":     True,
+                        "resolved_bar":  bar,
+                        "bars_to_entry": entry_bar_i,
+                        "bars_to_exit":  i - entry_bar_i,
+                    }
+                elif tp_hit:
+                    return {
+                        "status":        Status.HIT_TP,
+                        "triggered":     True,
+                        "resolved_bar":  bar,
+                        "bars_to_entry": entry_bar_i,
+                        "bars_to_exit":  i - entry_bar_i,
+                    }
 
     # ── Ran out of bars ────────────────────────────────────────────────────────
     if triggered:
@@ -426,6 +430,22 @@ class SignalOutcomeTrackerV2:
                         _ts.isoformat() if _ts is not None and hasattr(_ts, "isoformat")
                         else datetime.utcnow().isoformat()
                     )
+
+                    # SL overflow: how far past SL the resolving bar's worst-case
+                    # wick reached (mirrors backtest_replay.py's approach).
+                    if new_status == Status.HIT_SL and _rb is not None:
+                        _fill = _rb.get("low") if direction == "BUY" else _rb.get("high")
+                        if _fill is not None:
+                            sig["sl_overflow_pips"] = round(abs(float(_fill) - sl) / _pip, 2)
+
+                    # Entry slippage: ideal entry vs. the entry bar's touch price.
+                    _be = result.get("bars_to_entry")
+                    if _be is not None and _be < len(bars_after):
+                        _entry_bar = bars_after.iloc[_be]
+                        _touch = _entry_bar.get("high") if direction == "SELL" else _entry_bar.get("low")
+                        if _touch is not None:
+                            sig["entry_slippage_pips"] = round(abs(float(_touch) - entry) / _pip, 2)
+
                     counts["updated"] += 1
 
                     if new_status == Status.HIT_TP:
@@ -538,8 +558,13 @@ class SignalOutcomeTrackerV2:
                 bars_after = df[df[time_col] > ts].copy()
                 if "datetime" in bars_after.columns:
                     bars_after = bars_after.rename(columns={"datetime": "time"})
+
                 if bars_after.empty:
                     continue
+
+                _tf_hours = {"4h": 4, "4hour": 4, "1h": 1, "1hour": 1,
+                             "15min": 0.25, "1d": 24, "daily": 24}.get(tf, 4)
+                _closed_cutoff = datetime.utcnow() - pd.Timedelta(hours=_tf_hours)
 
                 _sym = sym.upper()
                 _pip = (0.01 if "JPY" in _sym
@@ -550,6 +575,7 @@ class SignalOutcomeTrackerV2:
                     bars_after, direction, entry, sl, tp,
                     entry_tolerance_pips=self.entry_tolerance_pips,
                     pip_size=_pip,
+                    closed_cutoff=_closed_cutoff,
                 )
 
                 new_status = result["status"]
