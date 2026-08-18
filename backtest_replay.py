@@ -342,9 +342,65 @@ def is_news_active_at(t: datetime, currencies: list, events: list, window_minute
 # 4. SIGNAL TRIGGER + OUTCOME SIMULATION
 # ═══════════════════════════════════════════════════════════════════════
 
+def trace_post_sl_price_action(df15: pd.DataFrame, exit_time: datetime, direction: str,
+                                entry: float, sl: float, tp: float, pip_size: float,
+                                trace_days: float = 3.0) -> dict:
+    """
+    After a hit_sl exit, keep walking forward through 15-min bars for
+    `trace_days` to see what price actually did next. This is the
+    sweep-vs-genuine-reversal check: a stop hunt / liquidity sweep looks
+    like price tagging the SL, then reclaiming the original entry level
+    and continuing on toward (or through) the original TP. A genuine
+    directional move against the trade just keeps going the SL direction
+    and never comes back.
+
+    Returns:
+      post_sl_reached_tp        — did price later touch the original TP level?
+      post_sl_time_to_tp_hours  — hours from SL exit to that TP touch (None if never)
+      post_sl_reclaimed_entry   — did price close back beyond the original entry
+                                   price (i.e. fully round-tripped the loss)?
+      post_sl_max_favorable_pips — best price reached in the TP direction during
+                                   the trace window, measured in pips past the SL
+                                   level (0 if price never recovered at all)
+      post_sl_bars_checked      — how many 15-min bars were available to check
+                                   (small numbers near the end of the dataset mean
+                                   this read is truncated / not yet conclusive)
+    """
+    cutoff = exit_time + timedelta(days=trace_days)
+    window = df15[(df15["time"] > exit_time) & (df15["time"] <= cutoff)]
+
+    result = {
+        "post_sl_reached_tp": False,
+        "post_sl_time_to_tp_hours": None,
+        "post_sl_reclaimed_entry": False,
+        "post_sl_max_favorable_pips": 0.0,
+        "post_sl_bars_checked": len(window),
+    }
+    if len(window) == 0 or not pip_size:
+        return result
+
+    if direction == "BUY":
+        max_favorable = max(0.0, (window["high"].max() - sl) / pip_size)
+        tp_hits = window[window["high"] >= tp]
+        reclaim = window[window["close"] >= entry]
+    else:
+        max_favorable = max(0.0, (sl - window["low"].min()) / pip_size)
+        tp_hits = window[window["low"] <= tp]
+        reclaim = window[window["close"] <= entry]
+
+    result["post_sl_max_favorable_pips"] = max_favorable
+    result["post_sl_reclaimed_entry"] = len(reclaim) > 0
+    if len(tp_hits) > 0:
+        first = tp_hits.iloc[0]
+        result["post_sl_reached_tp"] = True
+        result["post_sl_time_to_tp_hours"] = (first["time"] - exit_time).total_seconds() / 3600.0
+
+    return result
+
+
 def simulate_trigger_and_outcome(sig: dict, symbol: str, proposed_at: datetime,
                                   historical: dict, zone_ttl_hours: float, pip_size: float,
-                                  max_hold_days: int = 15):
+                                  max_hold_days: int = 15, sl_trace_days: float = 3.0):
     """
     Walks forward through historical 15-min bars to determine:
     1. Whether/when the zone got touched (trigger)
@@ -412,10 +468,14 @@ def simulate_trigger_and_outcome(sig: dict, symbol: str, proposed_at: datetime,
         if hit_sl:  # conservative: SL wins ties within the same bar
             sl_overflow = (sl - bar["low"]) if direction == "BUY" else (bar["high"] - sl)
             sl_overflow_pips = sl_overflow / pip_size if pip_size else None
+            post_sl = trace_post_sl_price_action(
+                df15, bar["time"], direction, entry, sl, tp, pip_size, trace_days=sl_trace_days
+            )
             return {
                 "outcome": "hit_sl", "trigger_time": trigger_time, "exit_time": bar["time"],
                 "trigger_price": trigger_price, "entry_slippage_pips": entry_slippage_pips,
                 "sl_overflow_pips": sl_overflow_pips, "same_bar_tie": bool(hit_tp),
+                **post_sl,
             }
         if hit_tp:
             return {
@@ -439,28 +499,36 @@ SYMBOL_PARAMS = {
 }
 
 
-def build_reversion_predictor(symbol: str, api_key: str, debug: bool = True) -> ProductionForexPredictor:
-    """Same construction params as run_dual_strategy()'s `rev` predictor, live."""
+def build_reversion_predictor(symbol: str, api_key: str, debug: bool = True,
+                               zone_ttl_hours: float = 24.0) -> ProductionForexPredictor:
+    """Same construction params as run_dual_strategy()'s `rev` predictor, live.
+
+    zone_ttl_hours default (24.0) matches the 4H institutional FVG/OB zone
+    horizon — per the 2026-08-17/18 replay audit, 4H zones typically take
+    12-48h to get revisited by price.
+    """
     p = SYMBOL_PARAMS[symbol]
     return ProductionForexPredictor(
         api_key=api_key,
-        model_path="models/model_v5_reversion.pkl",
-        scaler_path="models/scaler_v5_reversion.pkl",
-        encoders_path="models/encoders_v5_reversion.pkl",
-        stats_path="models/training_stats_v5_reversion.pkl",
+        model_path="models/model_v6_reversion.pkl",
+        scaler_path="models/scaler_v6_reversion.pkl",
+        encoders_path="models/encoders_v6_reversion.pkl",
+        stats_path="models/training_stats_v6_reversion.pkl",
         symbol=symbol,
-        prob_threshold=0.62,
+        prob_threshold=0.70,   # matches live run_dual_strategy() REV predictor
         max_rr=8.0, min_risk_atr=2.5, max_distance_pips=p["max_distance_pips_rev"],
         min_strength_atr=0.50, use_5min_refinement=True,
         refine_max_dist_multiplier=2.0, enable_continuation=False,
         use_htf_analysis=True, min_confluence_score=1,
-        zone_ttl_hours=5.8, zone_distance_threshold=p["zone_distance_threshold"],
+        zone_ttl_hours=zone_ttl_hours, zone_distance_threshold=p["zone_distance_threshold"],
         htf_fvg_min_gap_atr=0.5, htf_ob_min_reaction_atr=2.5,
         is_continuation_strategy=False, require_zone_close=True, debug=debug,
     )
 
 
-def run_replay(pairs: list, days_back: int, finnhub_key: str, use_news: bool, out_dir: Path, debug: bool = True):
+def run_replay(pairs: list, days_back: int, finnhub_key: str, use_news: bool, out_dir: Path,
+                debug: bool = True, sl_trace_days: float = 3.0, zone_ttl_hours: float = 24.0,
+                zone_dedup_days: float = 3.0):
     end   = datetime.utcnow()
     start = end - timedelta(days=days_back)
     warmup_start = start - timedelta(days=45)  # buffer for EMA200/ATR warmup on 4H
@@ -473,7 +541,8 @@ def run_replay(pairs: list, days_back: int, finnhub_key: str, use_news: bool, ou
     print(f"\n{'═'*70}\nREPLAY WINDOW: {start.date()} → {end.date()}  ({days_back} days)\n{'═'*70}")
     print(f"📝 Detailed log:   {log_path}")
     print(f"📝 Per-signal log: {jsonl_path}  (JSON-lines, one record per proposed signal)")
-    print(f"Run params: pairs={pairs} days_back={days_back} use_news={use_news} debug={debug}")
+    print(f"Run params: pairs={pairs} days_back={days_back} use_news={use_news} debug={debug} "
+          f"zone_ttl_hours={zone_ttl_hours} zone_dedup_days={zone_dedup_days} sl_trace_days={sl_trace_days}")
 
     news_events = []
     if use_news:
@@ -492,7 +561,7 @@ def run_replay(pairs: list, days_back: int, finnhub_key: str, use_news: bool, ou
                 symbol, interval, warmup_start, end, api_key, cache_dir
             )
 
-        pred = build_reversion_predictor(symbol, api_key, debug=debug)
+        pred = build_reversion_predictor(symbol, api_key, debug=debug, zone_ttl_hours=zone_ttl_hours)
         clock = ReplayClock()
         pred.fetch_bars = make_replay_fetch_bars(symbol, historical, clock, pred)
         pip_size = pred.pip_size
@@ -513,6 +582,18 @@ def run_replay(pairs: list, days_back: int, finnhub_key: str, use_news: bool, ou
         # brand-new signal on every 4H candle it continued to exist.
         symbol_locked_until = None
         currencies = [c.upper() for c in symbol.replace("/", "_").split("_")]
+
+        # ── Zone-identity dedup (fixes "16 unique zones → 31 signals" churn) ──
+        # symbol_locked_until alone only prevents re-proposing WHILE a zone is
+        # actively locked. Once a zone expires untriggered, the lock releases
+        # and the very next 4H bar the *same* still-unmitigated structural
+        # zone gets re-detected, re-scored, and logged as a brand-new signal.
+        # Track the last proposed zone's (direction, price bucket) and skip
+        # re-logging it as new if it reappears within zone_dedup_days — this
+        # mirrors the live zone_tracker's cooldown instead of counting every
+        # re-evaluation of one unfilled zone as an independent trade idea.
+        last_zone_key  = None
+        last_zone_time = None
 
         for i, t in enumerate(walk_points, 1):
             if i == 1 or i % 20 == 0 or i == n_points:
@@ -545,7 +626,26 @@ def run_replay(pairs: list, days_back: int, finnhub_key: str, use_news: bool, ou
                 continue
 
             sig = signals[0]  # highest-probability signal, mirrors live's top pick
-            zone_ttl_hours = getattr(pred.zone_tracker, 'ttl_seconds', 5.8 * 3600) / 3600.0
+            effective_ttl_hours = getattr(pred.zone_tracker, 'ttl_seconds',
+                                           zone_ttl_hours * 3600) / 3600.0
+
+            # ── Dedup check: same (direction, price bucket) as last proposal? ──
+            _entry = sig.get('entry')
+            zone_key = (sig.get('direction'),
+                        round(_entry / (pip_size * 5)) if (_entry and pip_size) else None)
+            if (last_zone_key is not None and zone_key == last_zone_key
+                    and last_zone_time is not None
+                    and (t - last_zone_time) <= timedelta(days=zone_dedup_days)):
+                if debug:
+                    hrs_since = (t - last_zone_time).total_seconds() / 3600.0
+                    print(f"  🔁 [{symbol}] Same zone re-detected {hrs_since:.1f}h after last "
+                          f"proposal ({sig.get('direction')} ~{_entry}) — treating as a "
+                          f"continuation, NOT logging as a new signal.")
+                symbol_locked_until = t + timedelta(hours=effective_ttl_hours)
+                continue
+
+            last_zone_key, last_zone_time = zone_key, t
+
             print(f"  📌 [{symbol}] Signal proposed @ {t}: {sig.get('direction')} "
                   f"entry={sig.get('entry')} sl={sig.get('sl')} tp={sig.get('tp')} "
                   f"prob={sig.get('probability')}")
@@ -555,7 +655,8 @@ def run_replay(pairs: list, days_back: int, finnhub_key: str, use_news: bool, ou
             print(f"     ↳ full signal fields: {json.dumps(sig, default=str)}")
 
             result = simulate_trigger_and_outcome(sig, symbol, t, historical,
-                                                   zone_ttl_hours=zone_ttl_hours, pip_size=pip_size)
+                                                   zone_ttl_hours=effective_ttl_hours, pip_size=pip_size,
+                                                   sl_trace_days=sl_trace_days)
 
             entry, sl, tp = sig.get("entry"), sig.get("sl"), sig.get("tp")
             # Pip-normalized risk/reward — divide by THIS symbol's pip_size so
@@ -584,8 +685,8 @@ def run_replay(pairs: list, days_back: int, finnhub_key: str, use_news: bool, ou
 
             outcome = result["outcome"]
             if outcome == "expired_untriggered":
-                print(f"     ⌛ Never triggered — zone expired after {zone_ttl_hours:.1f}h watch window.")
-                symbol_locked_until = t + timedelta(hours=zone_ttl_hours)
+                print(f"     ⌛ Never triggered — zone expired after {effective_ttl_hours:.1f}h watch window.")
+                symbol_locked_until = t + timedelta(hours=effective_ttl_hours)
             elif outcome in ("hit_tp", "hit_sl"):
                 emoji = "✅" if outcome == "hit_tp" else "❌"
                 print(f"     {emoji} Triggered {result.get('trigger_time')} → {outcome.upper()} "
@@ -600,6 +701,23 @@ def run_replay(pairs: list, days_back: int, finnhub_key: str, use_news: bool, ou
                     tie_note = "⚠️ SAME-BAR TIE (also touched TP — ambiguous, SL assumed by pessimistic tie-break)" if tie else "clean SL (TP not touched same bar)"
                     print(f"        ↳ LOSS DIAGNOSTIC: sl_overflow={overflow:.1f} pips past SL | "
                           f"entry_slippage={slip:.1f} pips from proposed entry | {tie_note}")
+
+                    reached_tp   = result.get("post_sl_reached_tp")
+                    time_to_tp   = result.get("post_sl_time_to_tp_hours")
+                    reclaimed    = result.get("post_sl_reclaimed_entry")
+                    max_fav      = result.get("post_sl_max_favorable_pips")
+                    bars_checked = result.get("post_sl_bars_checked")
+                    if bars_checked == 0:
+                        print(f"        ↳ POST-SL TRACE: no bars available after exit — truncated, can't tell.")
+                    elif reached_tp:
+                        sweep_note = "reclaimed entry first — looks like a LIQUIDITY SWEEP, not a real reversal" if reclaimed else "did NOT reclaim entry before running to TP — check chart, unusual"
+                        print(f"        ↳ POST-SL TRACE: price reached the original TP {time_to_tp:.1f}h later ({sweep_note})")
+                    elif reclaimed:
+                        print(f"        ↳ POST-SL TRACE: price reclaimed entry but never reached TP within "
+                              f"{sl_trace_days:.0f}d (best recovery: {max_fav:.1f} pips past SL) — partial bounce, not a clean sweep")
+                    else:
+                        print(f"        ↳ POST-SL TRACE: price never came back — genuine move against the trade "
+                              f"(best recovery: {max_fav:.1f} pips past SL in {sl_trace_days:.0f}d)")
                 symbol_locked_until = result.get("exit_time", t + timedelta(days=15))
             elif outcome == "timeout":
                 print(f"     ⏱️  Triggered {result.get('trigger_time')} → ran past max hold "
@@ -607,7 +725,7 @@ def run_replay(pairs: list, days_back: int, finnhub_key: str, use_news: bool, ou
                 symbol_locked_until = t + timedelta(days=15)
             else:
                 print(f"     ⚠️  outcome={outcome}")
-                symbol_locked_until = t + timedelta(hours=zone_ttl_hours)
+                symbol_locked_until = t + timedelta(hours=effective_ttl_hours)
 
     # ── Report ──────────────────────────────────────────────────────────
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -696,6 +814,19 @@ def run_replay(pairs: list, days_back: int, finnhub_key: str, use_news: bool, ou
         print(f"  Same-bar TP/SL ties (ambiguous — SL assumed by pessimistic rule): "
               f"{len(ties)}/{len(losses)} losses ({len(ties)/len(losses)*100:.0f}%) — "
               f"these could actually have been wins on live tick data.")
+
+        traced = [r for r in losses if r.get("post_sl_bars_checked", 0) > 0]
+        swept  = [r for r in traced if r.get("post_sl_reached_tp") and r.get("post_sl_reclaimed_entry")]
+        reclaimed_only = [r for r in traced if r.get("post_sl_reclaimed_entry") and not r.get("post_sl_reached_tp")]
+        genuine = [r for r in traced if not r.get("post_sl_reclaimed_entry")]
+        if traced:
+            print(f"  Post-SL trace ({len(traced)}/{len(losses)} losses had enough forward data to check):")
+            print(f"    → Likely liquidity sweeps (reclaimed entry, then ran to original TP): "
+                  f"{len(swept)}/{len(traced)} ({len(swept)/len(traced)*100:.0f}%)")
+            print(f"    → Reclaimed entry but never reached TP (partial bounce):              "
+                  f"{len(reclaimed_only)}/{len(traced)} ({len(reclaimed_only)/len(traced)*100:.0f}%)")
+            print(f"    → Never reclaimed entry (genuine move against the trade):              "
+                  f"{len(genuine)}/{len(traced)} ({len(genuine)/len(traced)*100:.0f}%)")
         print(f"\n  By symbol:")
         for symbol in pairs:
             sym_losses = [r for r in losses if r["symbol"] == symbol]
@@ -726,6 +857,19 @@ if __name__ == "__main__":
     parser.add_argument("--finnhub-key", type=str, default=os.getenv("FINNHUB_API_KEY", ""))
     parser.add_argument("--no-news", action="store_true")
     parser.add_argument("--out-dir", type=str, default="backtest_results")
+    parser.add_argument("--sl-trace-days", type=float, default=3.0,
+                         help="After a hit_sl, how many days forward to keep watching price "
+                              "for a return to the original TP (sweep-vs-genuine-reversal check). "
+                              "Default 3.")
+    parser.add_argument("--zone-ttl-hours", type=float, default=24.0,
+                         help="How long to watch a proposed zone for entry before marking it "
+                              "expired_untriggered. Default 24.0 hours (matches 4H institutional "
+                              "FVG/OB structure horizon).")
+    parser.add_argument("--zone-dedup-days", type=float, default=3.0,
+                         help="If the same (direction, price) zone gets re-detected within this "
+                              "many days of its last proposal, treat it as a continuation instead "
+                              "of logging it as a brand-new signal. Fixes the 31-signals/16-unique-"
+                              "zones duplicate-churn issue. Set to 0 to disable dedup entirely.")
     parser.add_argument("--quiet", action="store_true",
                          help="Suppress per-zone detection/scoring logs (faster, less output). "
                               "Default is verbose, matching your live run's log style.")
@@ -738,4 +882,7 @@ if __name__ == "__main__":
         use_news=not args.no_news,
         out_dir=Path(args.out_dir),
         debug=not args.quiet,
+        sl_trace_days=args.sl_trace_days,
+        zone_ttl_hours=args.zone_ttl_hours,
+        zone_dedup_days=args.zone_dedup_days,
     )

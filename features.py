@@ -70,7 +70,7 @@ NUMERIC_FEATURES: Tuple[str, ...] = (
     # ── v5: Approach-time features ────────────────────────────────────────────
     "approach_distance",
     "candle_body_ratio",
-    # "zone_age_bars",  # REMOVED: 99.8% of rows are 0 — dead column, overfits LR
+    # "zone_age_bars",  # REMOVED v9: redesign attempt saturated at cap in training
     "approach_momentum",
 
     # ── v6: Zone-memory + MTF-edge features ───────────────────────────────────
@@ -107,7 +107,7 @@ FEATURE_COLUMNS: Tuple[str, ...] = NUMERIC_FEATURES + tuple(
     f"{c}_encoded" for c in CATEGORICAL_FEATURES
 )
 
-N_FEATURES: int = len(FEATURE_COLUMNS)   # 26 numeric + 3 categorical-encoded = 29 total
+N_FEATURES: int = len(FEATURE_COLUMNS)   # 23 numeric + 3 categorical-encoded = 26 total
 
 
 def assert_feature_columns_exact(actual: list, expected: Tuple[str, ...] = FEATURE_COLUMNS) -> None:

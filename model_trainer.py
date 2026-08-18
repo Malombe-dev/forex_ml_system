@@ -280,9 +280,18 @@ def save_feature_importance(
     except Exception as e:
         logger.warning(f"Could not extract RF importances: {e}")
 
-    # Logistic Regression — abs coefficients (not CalibratedCV)
+    # Logistic Regression — abs coefficients, averaged over base estimators
+    # inside CalibratedClassifierCV (same pattern as XGBoost/RF above).
     try:
-        lr_coef = np.abs(lr_model.coef_[0])
+        if hasattr(lr_model, 'calibrated_classifiers_'):
+            lr_coefs = []
+            for est in lr_model.calibrated_classifiers_:
+                base = est.estimator if hasattr(est, 'estimator') else est.base_estimator
+                lr_coefs.append(np.abs(base.coef_[0]))
+            lr_coef = np.mean(lr_coefs, axis=0)
+        else:
+            # Backward-compat: plain (uncalibrated) LogisticRegression
+            lr_coef = np.abs(lr_model.coef_[0])
         lr_coef = lr_coef / lr_coef.sum()
         importances['Log. Regression'] = lr_coef
     except Exception as e:
@@ -471,6 +480,8 @@ class DualTaskTrainer:
         self.feature_names           = []
         self.training_feature_stats  = {}
         self.ensemble_weights        = {'xgb': 0.50, 'rf': 0.35, 'ridge': 0.15}
+        self.calibrator               = None  # fitted post-hoc ensemble calibrator (Platt or isotonic)
+        self._calibrator_kind         = None  # 'platt' | 'isotonic' | None
 
     def prepare_features(self,
                          df: pd.DataFrame,
@@ -609,14 +620,119 @@ class DualTaskTrainer:
         metrics['rf'] = {'log_loss': log_loss(y_int, p_rf), 'roc_auc': roc_auc_score(y_int, p_rf)}
         logger.info(f"  RF  train  log_loss={metrics['rf']['log_loss']:.4f}  auc={metrics['rf']['roc_auc']:.4f}")
 
-        logger.info("\n3️⃣  Training Logistic Regression...")
-        self.ridge_model = LogisticRegression(
+        logger.info("\n3️⃣  Training Calibrated Logistic Regression...")
+        raw_lr = LogisticRegression(
             C=1.0, class_weight='balanced', max_iter=1000, random_state=42, solver='lbfgs',
         )
-        self.ridge_model.fit(X_train_scaled, y_train.astype(int))
+        # NOTE: plain LogisticRegression is NOT automatically well-calibrated —
+        # class_weight='balanced' reweights the loss during fit, which skews
+        # predict_proba away from true posterior probabilities (that's the
+        # source of the 0.07 ↔ 0.89 extremes). Wrap in CalibratedClassifierCV,
+        # same as XGBoost and RF, so all three base models are calibrated
+        # before they're blended into the ensemble.
+        self.ridge_model = CalibratedClassifierCV(estimator=raw_lr, method='sigmoid', cv=3)
+        self.ridge_model.fit(X_train_scaled, y_train.astype(int), sample_weight=recency_w)
         p_lr = self.ridge_model.predict_proba(X_train_scaled)[:, 1].astype(np.float32)
         metrics['lr'] = {'log_loss': log_loss(y_int, p_lr), 'roc_auc': roc_auc_score(y_int, p_lr)}
         logger.info(f"  LR  train  log_loss={metrics['lr']['log_loss']:.4f}  auc={metrics['lr']['roc_auc']:.4f}")
+
+        # ── 4️⃣  Fit ensemble-level calibrator on the VAL set ───────────────────
+        # X_val_scaled was previously computed and never used. Per-model
+        # CalibratedClassifierCV(cv=3) calibrates each base model using folds
+        # carved out of the TRAINING set, which is why the fixed-weight blend
+        # of those three "calibrated" outputs can still be systematically
+        # overconfident on genuinely unseen data. Here we fit a lightweight
+        # Platt (sigmoid) scaler and an isotonic regressor on true out-of-sample
+        # val predictions so the final blended probability itself is calibrated.
+        self.calibrator = None
+        self._calibrator_kind = None
+        if X_val is not None and y_val is not None and len(X_val) > 0:
+            logger.info("\n4️⃣  Fitting ensemble-level calibrator on VAL set...")
+            p_xgb_val = self.xgb_model.predict_proba(X_val_scaled)[:, 1]
+            p_rf_val  = self.rf_model.predict_proba(X_val_scaled)[:, 1]
+            p_lr_val  = self.ridge_model.predict_proba(X_val_scaled)[:, 1]
+            p_ens_val = (
+                p_xgb_val * self.ensemble_weights['xgb'] +
+                p_rf_val  * self.ensemble_weights['rf']  +
+                p_lr_val  * self.ensemble_weights['ridge']
+            )
+            y_val_bin = (np.asarray(y_val, dtype=float) >= 1.0).astype(int)
+
+            from sklearn.linear_model import LogisticRegression as _PlattScaler
+            from sklearn.isotonic import IsotonicRegression
+            from sklearn.model_selection import KFold
+
+            def _fit_predict(kind, x_tr, y_tr, x_te):
+                if kind == 'platt':
+                    m = _PlattScaler()
+                    m.fit(x_tr.reshape(-1, 1), y_tr)
+                    return m.predict_proba(x_te.reshape(-1, 1))[:, 1]
+                else:  # isotonic
+                    m = IsotonicRegression(out_of_bounds='clip')
+                    m.fit(x_tr, y_tr)
+                    return m.predict(x_te)
+
+            # ── Proper cross-validated (out-of-fold) evaluation ─────────────────
+            # IMPORTANT: isotonic regression can memorize its own fit data almost
+            # perfectly (it's a free-knot step function), so evaluating it on the
+            # SAME val rows it was fit on always makes it look best — that was the
+            # earlier bug. Instead, k-fold CV within the val set: fit on k-1 folds,
+            # score on the held-out fold, so every score is genuinely out-of-sample.
+            n = len(p_ens_val)
+            n_splits = min(5, max(2, n // 40))  # keep folds reasonably sized
+            kf = KFold(n_splits=n_splits, shuffle=False)  # preserve time order
+
+            ll_raw = log_loss(y_val_bin, np.clip(p_ens_val, 1e-7, 1 - 1e-7))
+            br_raw = brier_score_loss(y_val_bin, np.clip(p_ens_val, 1e-7, 1 - 1e-7))
+
+            oof_scores = {}
+            for kind in ('platt', 'isotonic'):
+                oof_pred = np.zeros(n)
+                for tr_idx, te_idx in kf.split(p_ens_val):
+                    if len(np.unique(y_val_bin[tr_idx])) < 2:
+                        oof_pred[te_idx] = p_ens_val[te_idx]  # can't fit — fall back to raw for this fold
+                        continue
+                    oof_pred[te_idx] = _fit_predict(kind, p_ens_val[tr_idx], y_val_bin[tr_idx], p_ens_val[te_idx])
+                oof_scores[kind] = {
+                    'll': log_loss(y_val_bin, np.clip(oof_pred, 1e-7, 1 - 1e-7)),
+                    'br': brier_score_loss(y_val_bin, np.clip(oof_pred, 1e-7, 1 - 1e-7)),
+                }
+                logger.info(
+                    f"     OOF ({n_splits}-fold) log_loss  raw={ll_raw:.4f}  →  {kind}={oof_scores[kind]['ll']:.4f}   "
+                    f"(brier raw={br_raw:.4f} → {oof_scores[kind]['br']:.4f})"
+                )
+
+            # Guardrail: only keep a candidate if its cross-validated (honest,
+            # held-out) score beats raw on BOTH metrics by a real margin.
+            MIN_IMPROVEMENT = 0.002
+            qualifying = {
+                kind: s for kind, s in oof_scores.items()
+                if (ll_raw - s['ll'] > MIN_IMPROVEMENT) and (br_raw - s['br'] > MIN_IMPROVEMENT)
+            }
+            if qualifying:
+                best_kind = min(qualifying, key=lambda k: qualifying[k]['ll'])
+                # Refit the winning calibrator type on the FULL val set for deployment
+                # (CV was only used to pick the type — this is standard practice: use
+                # CV to select, then refit champion on all available data).
+                if best_kind == 'platt':
+                    final_cal = _PlattScaler()
+                    final_cal.fit(p_ens_val.reshape(-1, 1), y_val_bin)
+                else:
+                    final_cal = IsotonicRegression(out_of_bounds='clip')
+                    final_cal.fit(p_ens_val, y_val_bin)
+                self.calibrator = final_cal
+                self._calibrator_kind = best_kind
+                logger.info(f"  ✅ Selected '{best_kind}' calibrator (cross-validated) — refit on all {n} val examples")
+            else:
+                self.calibrator = None
+                self._calibrator_kind = None
+                logger.warning(
+                    f"  ⚠️  Neither Platt nor isotonic meaningfully improved OUT-OF-FOLD log_loss/brier "
+                    f"— DISCARDING calibration, will use raw ensemble probabilities instead."
+                )
+        else:
+            logger.warning("  ⚠️  No val set provided — ensemble calibrator NOT fit (predictions will stay raw)")
+
 
         return metrics
 
@@ -634,6 +750,24 @@ class DualTaskTrainer:
             p_lr  * self.ensemble_weights['ridge']
         )
         p_ensemble = np.clip(p_ensemble, 1e-7, 1 - 1e-7).astype(np.float32)
+
+        # ── Apply fitted ensemble calibrator (if we have one) ───────────────────
+        # Without this, the raw weighted blend can be systematically overconfident
+        # in the mid-probability range even though each base model is individually
+        # "calibrated" — see train_ensemble() for why.
+        if getattr(self, 'calibrator', None) is not None:
+            p_ensemble_raw = p_ensemble
+            if getattr(self, '_calibrator_kind', None) == 'isotonic':
+                p_ensemble = self.calibrator.predict(p_ensemble_raw).astype(np.float32)
+            else:
+                p_ensemble = self.calibrator.predict_proba(
+                    p_ensemble_raw.reshape(-1, 1)
+                )[:, 1].astype(np.float32)
+            p_ensemble = np.clip(p_ensemble, 1e-7, 1 - 1e-7).astype(np.float32)
+            logger.info(f"  ✅ Applied '{getattr(self, '_calibrator_kind', '?')}' calibrator to test-set probabilities")
+        else:
+            logger.warning("  ⚠️  No ensemble calibrator available — using raw (uncalibrated) probabilities")
+
         y_bin = (y_test >= 1.0).astype(int)   # FIX: match training cast — int(0.5)=0, int(0.75)=0, only 1.0=win
         metrics = {
             'roc_auc':     float(roc_auc_score(y_bin, p_ensemble)),
@@ -683,47 +817,151 @@ class DualTaskTrainer:
 
         return metrics
 
-    def save_models(self, task: str, version: str = "v5"):
+    def save_models(self, task: str, version: str = "v6"):
+        """Save all models and calibration artifacts."""
         logger.info(f"\nSAVING {task.upper()} MODELS")
         logger.info("=" * 70)
-        suffix          = f"{version}_{task}"
+        suffix = f"{version}_{task}"
         pickle_protocol = 4
+        
+        # 1. Save calibrated XGBoost (already CalibratedClassifierCV)
         model_path = self.output_dir / f"model_{suffix}.pkl"
         with open(model_path, 'wb') as f:
             pickle.dump(self.xgb_model, f, protocol=pickle_protocol)
-        logger.info(f"✅ Saved XGBoost to {model_path}")
-        for name, obj in [
-            (f"rf_{suffix}.pkl",     self.rf_model),
-            (f"lr_{suffix}.pkl",     self.ridge_model),
-            (f"scaler_{suffix}.pkl", self.scaler),
-        ]:
-            with open(self.output_dir / name, 'wb') as f:
-                pickle.dump(obj, f, protocol=pickle_protocol)
+        logger.info(f"✅ Saved XGBoost (calibrated) to {model_path}")
+        
+        # 2. Save calibrated RF
+        rf_path = self.output_dir / f"rf_{suffix}.pkl"
+        with open(rf_path, 'wb') as f:
+            pickle.dump(self.rf_model, f, protocol=pickle_protocol)
+        logger.info(f"✅ Saved RF (calibrated) to rf_{suffix}.pkl")
+        
+        # 3. Save calibrated LR
+        lr_path = self.output_dir / f"lr_{suffix}.pkl"
+        with open(lr_path, 'wb') as f:
+            pickle.dump(self.ridge_model, f, protocol=pickle_protocol)
+        logger.info(f"✅ Saved LR (calibrated) to lr_{suffix}.pkl")
+        
+        # 4. ✅ NEW: Save a dedicated calibrator for the ensemble
+        # This saves calibration metadata so production knows the models are calibrated
+        try:
+            calibrator = {
+                'ensemble_weights': self.ensemble_weights,
+                'scaler': self.scaler,
+                'xgb_calibrated': True,  # Flag that XGBoost is already calibrated
+                'rf_calibrated': True,   # Flag that RF is already calibrated
+                'lr_calibrated': True,   # Flag that LR is already calibrated
+                'calibration_method': 'sigmoid',
+                'cv_folds': 3,
+            }
+            
+            # Save the calibration metadata
+            cal_path = self.output_dir / f"calibrator_{suffix}.pkl"
+            with open(cal_path, 'wb') as f:
+                pickle.dump(calibrator, f, protocol=pickle_protocol)
+            logger.info(f"✅ Saved calibrator metadata to calibrator_{suffix}.pkl")
+            
+        except Exception as e:
+            logger.warning(f"Could not save calibration artifacts: {e}")
+        
+        # 5. Save scaler
+        scaler_path = self.output_dir / f"scaler_{suffix}.pkl"
+        with open(scaler_path, 'wb') as f:
+            pickle.dump(self.scaler, f, protocol=pickle_protocol)
+        logger.info(f"✅ Saved scaler to scaler_{suffix}.pkl")
+        
+        # 6. Save encoders
         encoders_path = self.output_dir / f"encoders_{suffix}.pkl"
         with open(encoders_path, 'wb') as f:
             pickle.dump(self.label_encoders, f, protocol=pickle_protocol)
+        logger.info(f"✅ Saved encoders to encoders_{suffix}.pkl")
+        
+        # 7. Save training stats
         stats_path = self.output_dir / f"training_stats_{suffix}.pkl"
         with open(stats_path, 'wb') as f:
             pickle.dump(self.training_feature_stats, f, protocol=pickle_protocol)
+        logger.info(f"✅ Saved training stats to training_stats_{suffix}.pkl")
+        
+        # 8. Metadata
         metadata = {
-            'version':          suffix,
-            'task':             task,
-            'model_type':       'classification',
-            'feature_names':    self.feature_names,
-            'num_features':     len(self.feature_names),
-            'models':           ['XGBClassifier', 'RandomForestClassifier', 'LogisticRegression'],
+            'version': suffix,
+            'task': task,
+            'model_type': 'classification',
+            'feature_names': self.feature_names,
+            'num_features': len(self.feature_names),
+            'models': ['XGBClassifier(calibrated)', 'RandomForestClassifier(calibrated)', 'LogisticRegression(calibrated)'],
             'ensemble_weights': self.ensemble_weights,
-            'train_end_date':   TRAIN_END_DATE.isoformat(),
-            'val_end_date':     VAL_END_DATE.isoformat(),
-            'created_at':       pd.Timestamp.utcnow().isoformat(),
-            'pickle_protocol':  pickle_protocol,
-            'schema_version':   'v8',
+            'train_end_date': TRAIN_END_DATE.isoformat(),
+            'val_end_date': VAL_END_DATE.isoformat(),
+            'created_at': pd.Timestamp.utcnow().isoformat(),
+            'pickle_protocol': pickle_protocol,
+            'schema_version': 'v8',
+            'calibration': {
+                'xgb_method': 'sigmoid',
+                'rf_method': 'sigmoid',
+                'cv_folds': 3,
+            }
         }
         metadata_path = self.output_dir / f"metadata_{suffix}.json"
         with open(metadata_path, 'w') as f:
             json.dump(metadata, f, default=convert_numpy_types, indent=2)
-        logger.info(f"✅ Saved all {task} artifacts")
+        logger.info(f"✅ Saved metadata to metadata_{suffix}.json")
+        logger.info(f"✅ All {task} artifacts saved successfully")
 
+    def save_calibration_model(self, task: str, version: str = "v6"):
+        """
+        Save the full ensemble bundle plus the fitted post-hoc calibrator.
+
+        NOTE: previously this saved a nested closure (`calibration_predict`)
+        which pickle cannot serialize ("Can't pickle local object
+        'DualTaskTrainer.save_calibration_model.<locals>.calibration_predict'").
+        The closure write failed silently into a caught exception, so the
+        ensemble bundle saved fine but the actual calibration mapping never
+        made it to disk. self.calibrator is a real sklearn LogisticRegression
+        instance (fit in train_ensemble on the val set), so it pickles cleanly.
+        """
+        suffix = f"{version}_{task}"
+        try:
+            # Save the full ensemble bundle (models, scaler, weights) for convenience
+            ensemble_cal = {
+                'xgb_model': self.xgb_model,
+                'rf_model': self.rf_model,
+                'lr_model': self.ridge_model,
+                'scaler': self.scaler,
+                'weights': self.ensemble_weights,
+                'is_calibrated': self.calibrator is not None,
+                'calibration_method': 'platt_sigmoid_on_val',
+            }
+            cal_fn_path = self.output_dir / f"calibration_ensemble_{suffix}.pkl"
+            with open(cal_fn_path, 'wb') as f:
+                pickle.dump(ensemble_cal, f, protocol=4)
+            logger.info(f"✅ Saved calibration ensemble to calibration_ensemble_{suffix}.pkl")
+
+            # Save the actual fitted calibrator — a real object, not a closure.
+            # Bundle it with its 'kind' since Platt (LogisticRegression) exposes
+            # .predict_proba() while IsotonicRegression exposes .predict() — the
+            # two are NOT interchangeable and inference code must branch on this.
+            cal_path = self.output_dir / f"calibrator_ensemble_{suffix}.pkl"
+            calibrator_bundle = {
+                'calibrator': self.calibrator,
+                'kind': getattr(self, '_calibrator_kind', None),  # 'platt' | 'isotonic' | None
+            }
+            with open(cal_path, 'wb') as f:
+                pickle.dump(calibrator_bundle, f, protocol=4)
+            if self.calibrator is not None:
+                logger.info(
+                    f"✅ Saved fitted '{calibrator_bundle['kind']}' ensemble calibrator "
+                    f"to calibrator_ensemble_{suffix}.pkl"
+                )
+            else:
+                logger.warning(
+                    f"⚠️  self.calibrator is None (no val set was provided, or no candidate "
+                    f"improved val metrics) — saved a None placeholder to calibrator_ensemble_{suffix}.pkl. "
+                    f"Inference code should treat None as 'use raw ensemble probabilities'."
+                )
+
+        except Exception as e:
+            logger.warning(f"Could not save calibration artifacts: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Training orchestration
@@ -782,7 +1020,8 @@ def train_both_tasks(df: pd.DataFrame):
     X_test_rev,  y_test_rev  = trainer_reversion.prepare_features(test_df,  task='reversion')
     train_metrics_rev = trainer_reversion.train_ensemble(X_train_rev, y_train_rev, X_val_rev, y_val_rev, pre_fitted_scaler=None)
     test_metrics_rev  = trainer_reversion.evaluate_ensemble(X_test_rev, y_test_rev, task='reversion')
-    trainer_reversion.save_models(task='reversion', version='v5')
+    trainer_reversion.save_models(task='reversion', version='v6')
+    trainer_reversion.save_calibration_model(task='reversion', version='v6')
     results['reversion'] = {'train': train_metrics_rev, 'test': test_metrics_rev}
 
     # ── Task 2: Continuation ──────────────────────────────────────────────
@@ -796,7 +1035,8 @@ def train_both_tasks(df: pd.DataFrame):
     X_test_cont,  y_test_cont  = trainer_continuation.prepare_features(test_df,  task='continuation')
     train_metrics_cont = trainer_continuation.train_ensemble(X_train_cont, y_train_cont, X_val_cont, y_val_cont, pre_fitted_scaler=trainer_reversion.scaler)
     test_metrics_cont  = trainer_continuation.evaluate_ensemble(X_test_cont, y_test_cont, task='continuation')
-    trainer_continuation.save_models(task='continuation', version='v5')
+    trainer_continuation.save_models(task='continuation', version='v6')
+    trainer_continuation.save_calibration_model(task='continuation', version='v6')
     results['continuation'] = {'train': train_metrics_cont, 'test': test_metrics_cont}
 
     # ── Summary ───────────────────────────────────────────────────────────
@@ -829,8 +1069,10 @@ def train_both_tasks(df: pd.DataFrame):
     print("       └── metrics_test.json")
 
     print("\n✅ Both models saved:")
-    print("  models/model_v5_reversion.pkl")
-    print("  models/model_v5_continuation.pkl")
+    print("  models/model_v6_reversion.pkl")
+    print("  models/model_v6_continuation.pkl")
+    print("  models/calibrator_ensemble_v6_reversion.pkl")
+    print("  models/calibrator_ensemble_v6_continuation.pkl")
     return results
 
 

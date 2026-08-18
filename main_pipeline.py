@@ -59,7 +59,7 @@ def phase1_ingest(csv_path: str) -> bool:
         return False
 
 
-SYMBOLS = ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"]
+SYMBOLS = ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD", "AUDUSD"]
 
 
 def phase2_features(symbols: list = None) -> bool:

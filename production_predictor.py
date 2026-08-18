@@ -714,12 +714,13 @@ class ProductionForexPredictor:
 
     def __init__(self,
                  api_key: str,
-                 model_path: str = "models/model_v5_reversion.pkl",
-                 scaler_path: str = "models/scaler_v5_reversion.pkl",
-                 encoders_path: str = "models/encoders_v5_reversion.pkl",
-                 stats_path: str = "models/training_stats_v5_reversion.pkl",
+                 model_path: str = "models/model_v6_reversion.pkl",
+                 scaler_path: str = "models/scaler_v6_reversion.pkl",
+                 encoders_path: str = "models/encoders_v6_reversion.pkl",
+                 stats_path: str = "models/training_stats_v6_reversion.pkl",
                  symbol: str = "EUR/USD",
                  prob_threshold: float = None,
+                 max_disagreement: float = 0.10,
                  max_rr: float = 3.5,
                  min_risk_atr: float = 0.8,
                  max_distance_pips: float = 25.0,
@@ -730,7 +731,7 @@ class ProductionForexPredictor:
                  continuation_prob_boost: float = 0.05,
                  use_htf_analysis: bool = True,
                  min_confluence_score: int = 4,
-                 zone_ttl_hours: float = 5.8,
+                 zone_ttl_hours: float = 24.0,
                  zone_distance_threshold: float = 50.0,
                  htf_fvg_min_gap_atr: float = 0.5,
                  htf_ob_min_reaction_atr: float = 2.0,
@@ -752,6 +753,11 @@ class ProductionForexPredictor:
         }[key]
 
         self.prob_threshold  = validated_stats["base_prob"] if prob_threshold is None else prob_threshold
+        # Model-agreement gate (see disagreement_diagnostic_v2.py): reject signals
+        # where XGB/RF/LR disagree beyond this std-dev, even if the blended
+        # probability clears prob_threshold. 0.10 was validated on the
+        # 2024-02-01+ test set (precision 83.4%→92.4% at threshold=0.65).
+        self.max_disagreement = max_disagreement
         self.max_boost       = validated_stats["max_boost"]
         self.max_rr          = max_rr
         self.min_risk_atr    = min_risk_atr
@@ -831,7 +837,8 @@ class ProductionForexPredictor:
         }
 
         if not self.debug:
-            print(f"✓ {key.upper()} [{symbol}] loaded | Base: {self.prob_threshold*100:.0f}% | MaxBoost: {self.max_boost*100:.0f}%")
+            print(f"✓ {key.upper()} [{symbol}] loaded | Base: {self.prob_threshold*100:.0f}% | "
+                  f"MaxBoost: {self.max_boost*100:.0f}% | MaxDisagreement: {self.max_disagreement:.2f}")
 
     # Cache removed — pre_warm_cache is a no-op kept for call-site compatibility.
     def pre_warm_cache(self) -> None:
@@ -886,40 +893,77 @@ class ProductionForexPredictor:
             except FileNotFoundError:
                 logger.warning(f"LR model not found at {lr_path} — ensemble will use XGBoost only")
 
-            cal_path = model_path.replace("model_", "calibrator_")
-            self._calibrator = None
+            # FIX: filename was wrong (constructed 'calibrator_v6_reversion.pkl',
+            # but model_trainer.py actually saves 'calibrator_ensemble_v6_reversion.pkl')
+            # AND the saved file is a {'calibrator':obj, 'kind':'platt'|'isotonic'|None}
+            # bundle, not the raw calibrator object — both bugs meant calibration
+            # NEVER actually loaded, silently, even when a real one existed.
+            cal_path = model_path.replace("model_", "calibrator_ensemble_")
+            self._calibrator      = None
+            self._calibrator_kind = None
             try:
                 with open(cal_path, 'rb') as f:
-                    self._calibrator = pickle.load(f)
+                    _cal_bundle = pickle.load(f)
+                if isinstance(_cal_bundle, dict):
+                    self._calibrator      = _cal_bundle.get('calibrator')
+                    self._calibrator_kind = _cal_bundle.get('kind')
+                else:
+                    # defensive fallback in case an older-format file exists
+                    self._calibrator = _cal_bundle
             except FileNotFoundError:
                 pass
 
             strat    = "continuation" if self.is_continuation_strategy else "reversion"
-            cal_st   = "with calibrator" if self._calibrator else "no calibrator"
+            # NOTE: self._calibrator is an OPTIONAL post-blend recalibration step —
+            # current training pipeline doesn't produce one (no
+            # calibrator_ensemble_*.pkl saved) because calibration already happens
+            # per-base-model: model_v6_*.pkl / rf_v6_*.pkl / lr_v6_*.pkl are each
+            # saved as CalibratedClassifierCV (sigmoid/Platt) wrappers, so
+            # self.model.predict_proba() etc. already return calibrated probabilities.
+            # "no ensemble-level calibrator" here is expected, not a missing artifact.
+            cal_st   = (f"with additional '{self._calibrator_kind}' ensemble calibrator"
+                        if self._calibrator is not None
+                        else "base models individually calibrated (no extra ensemble-level calibrator)")
             rf_st    = "RF✓" if self.rf_model else "RF✗"
             lr_st    = "LR✓" if self.lr_model else "LR✗"
+            import os as _os
             print(
-                f"  ✅ Model v5 ({'continuation' if self.is_continuation_strategy else 'reversion'}) loaded — "
-                f"XGB✓ RF✓ LR✓ [PROBABILITY CALIBRATED]"
+                f"  ✅ Model loaded ({_os.path.basename(model_path)}, {strat}) — "
+                f"XGB✓ {rf_st} {lr_st} [{cal_st}]"
             )
 
         except FileNotFoundError:
             logger.warning("Model files not found, falling back to reversion model")
-            with open("models/model_v5_reversion.pkl",          'rb') as f: self.model          = pickle.load(f)
-            with open("models/scaler_v5_reversion.pkl",         'rb') as f: self.scaler         = pickle.load(f)
-            with open("models/encoders_v5_reversion.pkl",       'rb') as f: self.encoders       = pickle.load(f)
-            with open("models/training_stats_v5_reversion.pkl", 'rb') as f: self.training_stats = pickle.load(f)
-            self.rf_model    = None
-            self.lr_model    = None
-            self._calibrator = None
+            with open("models/model_v6_reversion.pkl",          'rb') as f: self.model          = pickle.load(f)
+            with open("models/scaler_v6_reversion.pkl",         'rb') as f: self.scaler         = pickle.load(f)
+            with open("models/encoders_v6_reversion.pkl",       'rb') as f: self.encoders       = pickle.load(f)
+            with open("models/training_stats_v6_reversion.pkl", 'rb') as f: self.training_stats = pickle.load(f)
+            self.rf_model         = None
+            self.lr_model         = None
+            self._calibrator      = None
+            self._calibrator_kind = None
 
 
-    def get_scan_distance(self, current_atr, symbol):
-        """Dynamic scan distance based on ATR."""
-        if 'XAU' in symbol or 'GOLD' in symbol.upper():
-            multiplier = 1.5  # gold moves fast, scan slightly wider
+    def get_scan_distance(self, current_atr, symbol, zone_type: str = "FVG"):
+        """Dynamic scan distance based on ATR and zone structure.
+
+        FIX (2026-08-18 replay audit): previously used ONE multiplier for
+        both FVGs and Order Blocks. But an Order Block is only valid after
+        an impulse move of >= ob_min_reaction_atr (2.0-2.5x ATR) away from
+        where it formed — so a fresh unmitigated OB naturally sits 2-3x ATR
+        from current price by construction. Scanning only 1.0-1.5x ATR (the
+        old single multiplier) meant most real OBs were rejected on 'dist'
+        before ever reaching ML scoring — confirmed in the 60-day replay:
+        13,199 OB 'dist' rejections vs 2,709 for FVGs, and 0 OB signals
+        passed in the entire window. FVGs form from a much smaller gap
+        (>= fvg_min_gap_atr, ~0.4-0.5x ATR) so they legitimately sit close
+        to price and keep their original multiplier.
+        """
+        is_gold = 'XAU' in symbol or 'GOLD' in symbol.upper()
+        if zone_type == "OB":
+            multiplier = 3.0 if is_gold else 2.5  # matches OB's own 2.0-2.5x ATR formation distance
         else:
-            multiplier = 1.0  # forex: 1x ATR is enough
+            multiplier = 1.5 if is_gold else 1.0  # FVGs sit close to price; unchanged
         return current_atr * multiplier / self.pip_size  # convert to pips
 
     def _get_session(self, hour: int) -> str:
@@ -1079,6 +1123,14 @@ class ProductionForexPredictor:
 
         context['h4_atr'] = _df_4h_c['atr'].iloc[-1] if _df_4h_c is not None and len(_df_4h_c) > 14 else None
 
+        # ── D1 EMA20/50 trend (matches what the model was trained on) ─────────
+        # This is the SAME calculation as label_generator.calculate_htf_trend_
+        # alignment / smc_detector.get_d1_trend — cached here once, on the
+        # already closed-bar-filtered _df_1d, so every bias gate in this file
+        # reads the identical value instead of each recomputing it slightly
+        # differently (and potentially against non-closed-bar-filtered data).
+        context['d1_ema_trend'] = self._get_d1_trend_ema(_df_1d)
+
         # outputsize=90: the D1 premium/discount gate uses tail(60) so we need
         # at least 60 bars here.
         if _df_1d is not None and len(_df_1d) > 1:
@@ -1235,13 +1287,18 @@ class ProductionForexPredictor:
                             'bar_time':     bar['time']
                         })
 
-        # Calculate touch count for each zone: how many times has price
-        # entered this zone's range in the recent lookback window?
+        # FIX: previously counted every 15-min bar whose range overlapped the
+        # zone, with no de-duplication — a single sustained price excursion
+        # through the zone over N consecutive bars counted as N touches. This
+        # is the value that actually feeds the model (feature_builder.py's
+        # zone.get("touch_count", zone.get("zone_touch_count", 1)) fallback —
+        # 'touch_count' is never set on the raw zone object, only this one
+        # is), so it needs to match how training counts touches:
+        # calculate_zone_touch_count() (and this file's own, correctly
+        # implemented _calculate_touch_count()) explicitly skip 20 bars after
+        # each detected touch specifically to avoid this over-counting.
         for zone in zones:
-            z_high = zone['price_high']
-            z_low  = zone['price_low']
-            touches = int(((recent['low'] <= z_high) & (recent['high'] >= z_low)).sum())
-            zone['zone_touch_count'] = max(1, touches)
+            zone['zone_touch_count'] = self._calculate_touch_count(zone, df)
 
         adaptive_max = max(35.0, current_atr / self.pip_size * 4.0)
         return [z for z in zones if abs(z['distance_pips']) < adaptive_max]
@@ -1458,7 +1515,7 @@ class ProductionForexPredictor:
             sl   = entry - risk if is_buy else entry + risk
 
         # ── Spread on SL (entry slip, once) ──────────────────────────────────
-        session_spread = {'sydney': 1.5, 'tokyo': 1.2, 'london': 0.7, 'ny': 0.8}
+        session_spread = {'sydney': 1.5, 'asia': 1.2, 'london': 0.7, 'ny': 0.8}
         spread_pips    = session_spread.get(self._get_session(datetime.utcnow().hour), 1.0)
         spread_price   = spread_pips * self.pip_size
         sl   = sl - spread_price * 0.5 if is_buy else sl + spread_price * 0.5
@@ -1703,11 +1760,35 @@ class ProductionForexPredictor:
 
             if getattr(self, '_calibrator', None) is not None:
                 try:
-                    calibrated_prob = float(self._calibrator.transform(
-                        np.clip([raw_prob], 1e-6, 1 - 1e-6))[0])
-                except Exception:
-                    pass
+                    if getattr(self, '_calibrator_kind', None) == 'isotonic':
+                        calibrated_prob = float(self._calibrator.predict(
+                            np.clip([raw_prob], 1e-6, 1 - 1e-6))[0])
+                    else:  # 'platt' — LogisticRegression, needs 2D input + predict_proba
+                        calibrated_prob = float(self._calibrator.predict_proba(
+                            np.clip([[raw_prob]], 1e-6, 1 - 1e-6))[0, 1])
+                except Exception as _cal_err:
+                    logger.warning(f"Calibrator application failed ({_cal_err}) — using raw probability")
+                    calibrated_prob = raw_prob
             final_prob = float(np.clip(calibrated_prob, 0.0, 1.0))
+
+            # ── Model-agreement gate — DISABLED ─────────────────────────────────
+            # Diagnostic on the 2024-02-01+ test set (disagreement_diagnostic_v2.py)
+            # showed r=0.868 between bucket calibration error and disagreement, and
+            # gating at disagreement_std <= 0.10 took precision at threshold=0.65
+            # from 85.4% to 91.0%. But at the thresholds actually used in
+            # production (0.70+) the STEP 4 sweep showed the gate barely moved
+            # precision (e.g. 0.70: 89.6% no-gate vs 92.3% gated, n=154 vs n=143)
+            # — not worth the rejected signals. Gate disabled; disagreement_std
+            # is still computed and logged below for visibility only.
+            max_disagreement = getattr(self, 'max_disagreement', 0.10)
+            disagreement_std = None
+            gate_rejected = False
+            if p_rf is not None and p_lr is not None:
+                _probs = np.array([p_xgb, p_rf, p_lr])
+                disagreement_std = float(_probs.std())
+                # Gate disabled — no longer rejecting on disagreement_std.
+                # if disagreement_std > max_disagreement:
+                #     gate_rejected = True
 
             # ── Detailed Logging of Ensemble Scoring ──────────────────────────
             msg = (f"  🔮 Ensemble scoring for {self.symbol} {zone.get('type','unknown')} zone "
@@ -1717,10 +1798,26 @@ class ProductionForexPredictor:
             if p_lr is not None:
                 msg += f" LR={p_lr:.3f}"
             msg += f" | Raw Ensem={raw_prob:.3f} | Calibrated={final_prob:.3f}"
-            
+            if disagreement_std is not None:
+                msg += f" | disagreement_std={disagreement_std:.3f}"
+                if disagreement_std > max_disagreement:
+                    msg += f" (> {max_disagreement:.2f}, gate disabled — not rejected)"
+                else:
+                    msg += f" (<= {max_disagreement:.2f})"
+
+            if gate_rejected:
+                msg += (f" | ⛔ REJECTED (models disagreed): disagreement_std="
+                        f"{disagreement_std:.3f} > max {max_disagreement:.2f}")
+
             logger.info(msg)
             if self.debug:
                 print(msg)
+
+            if gate_rejected:
+                # Force below any realistic threshold so every downstream
+                # `prob >= self.prob_threshold` check rejects it naturally,
+                # without needing to touch each call site individually.
+                return 0.0
 
             return final_prob
         except Exception as exc:
@@ -1952,6 +2049,35 @@ class ProductionForexPredictor:
     # The old 15min demand/supply zone pipeline is SECONDARY — the model was
     # never trained on raw 15min zones and scores them unreliably.
 
+    def _get_d1_trend_ema(self, df_d1) -> str:
+        """
+        Returns 'bullish', 'bearish', or 'neutral' from D1 close EMA20 vs EMA50.
+
+        This is the SAME calculation the model was actually trained on
+        (label_generator.calculate_htf_trend_alignment / smc_detector.
+        SMCDetector.get_d1_trend) — NOT the swing/structure-based
+        detect_market_structure_shift() trend that daily_structure['trend']
+        holds. Use this (not daily_structure) anywhere the intent is "D1 bias
+        as the model understands it" — e.g. the live hard-bias gate — so the
+        gate and the model's own probability score are reasoning about the
+        same D1 signal instead of two different, sometimes-disagreeing ones.
+
+        Requires >= 50 closed D1 bars, else 'neutral' (matches
+        _check_d1_alignment / get_d1_trend exactly).
+        """
+        if df_d1 is None or len(df_d1) < 50:
+            return 'neutral'
+        try:
+            ema20 = float(df_d1['close'].ewm(span=20, adjust=False).mean().iloc[-1])
+            ema50 = float(df_d1['close'].ewm(span=50, adjust=False).mean().iloc[-1])
+        except Exception:
+            return 'neutral'
+        if ema20 > ema50:
+            return 'bullish'
+        elif ema20 < ema50:
+            return 'bearish'
+        return 'neutral'
+
     def _check_d1_alignment(self, direction: str, df_d1) -> int:
         """
         Returns 1 if the D1 EMA20/50 trend aligns with the zone direction,
@@ -1964,25 +2090,11 @@ class ProductionForexPredictor:
           - computed from D1 close EMA20 vs EMA50, not from H1 data
           - requires >= 50 D1 bars, else neutral (0)
         """
-        if df_d1 is None or len(df_d1) < 50:
-            return 0
-        try:
-            ema20 = float(df_d1['close'].ewm(span=20, adjust=False).mean().iloc[-1])
-            ema50 = float(df_d1['close'].ewm(span=50, adjust=False).mean().iloc[-1])
-        except Exception:
-            return 0
-
-        if ema20 > ema50:
-            d1_trend = 'up'
-        elif ema20 < ema50:
-            d1_trend = 'down'
-        else:
-            d1_trend = 'neutral'
-
+        d1_trend = self._get_d1_trend_ema(df_d1)  # 'bullish' / 'bearish' / 'neutral'
         if direction == 'BUY':
-            return 1 if d1_trend == 'up' else 0
+            return 1 if d1_trend == 'bullish' else 0
         else:
-            return 1 if d1_trend == 'down' else 0
+            return 1 if d1_trend == 'bearish' else 0
 
     def _check_1h_confluence(self, zone_top: float, zone_bot: float,
                               direction: str, df_1h) -> Dict:
@@ -2053,20 +2165,28 @@ class ProductionForexPredictor:
             h1_disp    = float(body_sizes.max() / atr_1h) if atr_1h > 0 else 0.0
             result['h1_displacement'] = round(min(h1_disp, 10.0), 4)
 
-            # ── h1_liquidity_sweep : zone-boundary wick + reclaim ─────────────
-            # sp=4 rolling window is preserved to match feature_builder exactly.
-            check_window = sub.reset_index(drop=True)
-            sp = 4
+            # ── h1_liquidity_sweep : swept swing high/low + reclaim ──────────
+            # FIX (v11): v10 fixed the window/lookback but the flag was still
+            # near-constant (98.7%) — most detected sweeps were real but
+            # economically trivial. MIN_SWEEP_ATR=0.20 chosen from the
+            # measured excursion-magnitude distribution across all 4 symbols
+            # (median ~0.18-0.19×ATR) — see smc_detector.py for the full
+            # write-up. Kept in sync with that function exactly.
+            MIN_SWEEP_ATR = 0.20
+            check_window = sub.tail(60).reset_index(drop=True)
+            sp = 10
             for i in range(sp, len(check_window)):
                 bar     = check_window.iloc[i]
                 prev_lo = check_window.iloc[max(0, i - sp):i]['low'].min()
                 prev_hi = check_window.iloc[max(0, i - sp):i]['high'].max()
                 if direction == 'BUY' and bar['low'] < prev_lo and bar['close'] > prev_lo:
-                    result['h1_liquidity_sweep'] = 1
-                    break
+                    if (prev_lo - bar['low']) / atr_1h >= MIN_SWEEP_ATR:
+                        result['h1_liquidity_sweep'] = 1
+                        break
                 if direction == 'SELL' and bar['high'] > prev_hi and bar['close'] < prev_hi:
-                    result['h1_liquidity_sweep'] = 1
-                    break
+                    if (bar['high'] - prev_hi) / atr_1h >= MIN_SWEEP_ATR:
+                        result['h1_liquidity_sweep'] = 1
+                        break
 
             result['confirmed'] = bool(
                 result['h1_trend_alignment'] != 0 or result['h1_structure_shift'] != 0)
@@ -2107,8 +2227,10 @@ class ProductionForexPredictor:
             if not np.isfinite(atr_5m) or atr_5m <= 0:
                 atr_5m = self.pip_size * 5
 
-            # ── m5_micro_bos — swing-high/low BOS (sp=3) ────────────────────
-            sp = 3
+            # ── m5_micro_bos — swing-high/low BOS (sp=10) ────────────────────
+            # FIX 2 (v10): sp widened 3 -> 10 (see feature_builder.py for
+            # full reasoning — was near-constant at 99.7% true with sp=3).
+            sp = 10
             for i in range(sp, len(recent) - 1):
                 bar = recent.iloc[i]
                 if zone_type == 'demand':
@@ -2122,11 +2244,13 @@ class ProductionForexPredictor:
                         result['m5_micro_bos'] = 1
                         break
 
-            # ── m5_sweep_confirmation — wick-beyond + close-back (lookback=4) ─
-            for i in range(4, len(recent)):
+            # ── m5_sweep_confirmation — wick-beyond + close-back (lookback=10) ─
+            # FIX 2 (v10): lookback widened 4 -> 10, matching feature_builder.py.
+            _sweep_lb = 10
+            for i in range(_sweep_lb, len(recent)):
                 bar     = recent.iloc[i]
-                prev_lo = recent.iloc[max(0, i - 4):i]['low'].min()
-                prev_hi = recent.iloc[max(0, i - 4):i]['high'].max()
+                prev_lo = recent.iloc[max(0, i - _sweep_lb):i]['low'].min()
+                prev_hi = recent.iloc[max(0, i - _sweep_lb):i]['high'].max()
                 if zone_type == 'demand':
                     if bar['low'] < prev_lo and bar['close'] > prev_lo:
                         result['m5_sweep_confirmation'] = 1
@@ -2313,8 +2437,14 @@ class ProductionForexPredictor:
         # D1 is the higher authority. When D1 has a clear bias it overrules 4H.
         # When D1 is neutral (consolidating), 4H holds the gate as fallback.
         # This fixes the GBP/USD case: h4=bullish but D1=bearish → BUY blocked.
-        # daily_structure is computed on closed D1 bars only (closed-D1 gate above).
-        _d1_trend   = htf_context.get('daily_structure', {}).get('trend', 'neutral') if htf_context else 'neutral'
+        #
+        # D1 SOURCE: uses d1_ema_trend (EMA20/50 crossover, cached on
+        # htf_context by get_htf_context) — the SAME calculation the model was
+        # trained on — rather than the swing/structure-based
+        # daily_structure['trend']. Those two D1 definitions can disagree;
+        # gating on the EMA version keeps the live filter and the model's own
+        # probability score reasoning about the same D1 signal.
+        _d1_trend   = htf_context.get('d1_ema_trend', 'neutral') if htf_context else 'neutral'
         _hard_bias  = _d1_trend if _d1_trend != 'neutral' else h4_trend
         # ─────────────────────────────────────────────────────────────────────
 
@@ -2333,15 +2463,20 @@ class ProductionForexPredictor:
                     _d1_pd = -1  # discount
 
         htf_setups       = []
-        # Respect dynamic scan distance based on current ATR
-        MAX_DIST_PIPS    = self.get_scan_distance(current_atr, self.symbol)
+        # Respect dynamic scan distance based on current ATR — separate
+        # distances per zone type since OBs form 2-3x ATR away by
+        # construction while FVGs sit much closer (see get_scan_distance).
+        MAX_DIST_PIPS_FVG = self.get_scan_distance(current_atr, self.symbol, zone_type="FVG")
+        MAX_DIST_PIPS_OB  = self.get_scan_distance(current_atr, self.symbol, zone_type="OB")
+        MAX_DIST_PIPS     = MAX_DIST_PIPS_FVG  # kept for any other legacy reference to this name
         MIN_HTF_RR   = 1.2
         MAX_HTF_RR   = 6.0 if self.symbol == 'XAU/USD' else 10.0
         MIN_HTF_STRENGTH = 0.5  # lowered from 0.8 — 0.8 kills valid zones in low-vol sessions
 
         if self.debug:
             print(f"\n  🔍 HTF [{self.symbol}|{tf}] current_price={current_price:.5f} "
-                  f"ATR={current_atr:.5f}  FVGs={len(fvgs)}  OBs={len(obs)}")
+                  f"ATR={current_atr:.5f}  FVGs={len(fvgs)}  OBs={len(obs)}  "
+                  f"scan_dist_fvg={MAX_DIST_PIPS_FVG:.1f}p scan_dist_ob={MAX_DIST_PIPS_OB:.1f}p")
         htf_fvg_rejected = {'dist': 0, 'confs': 0, 'direction': 0, 'rr': 0, 'strength': 0, 'prob': 0, 'd1_pd': 0}
         htf_ob_rejected  = {'dist': 0, 'confs': 0, 'direction': 0, 'rr': 0, 'strength': 0, 'prob': 0, 'd1_pd': 0}
 
@@ -2372,7 +2507,13 @@ class ProductionForexPredictor:
                 'confluence':   conf_str,
                 'confirmations': confirmations,
                 'distance_pips': round(abs(current_price - entry) / self.pip_size, 1),
-                'd1_trend':     htf_context.get('daily_structure', {}).get('trend', 'neutral') if htf_context else 'unknown',
+                # FIX: 'd1_trend' now reports the EMA20/50 value that actually
+                # gates trades and matches what the model was trained on (see
+                # _hard_bias above). The old swing/structure-based value is
+                # preserved separately as 'd1_structure_trend' — it's still
+                # informative but is no longer what decides BUY/SELL blocking.
+                'd1_trend':     htf_context.get('d1_ema_trend', 'neutral') if htf_context else 'unknown',
+                'd1_structure_trend': htf_context.get('daily_structure', {}).get('trend', 'neutral') if htf_context else 'unknown',
                 'zone_strength': round(zone_obj.get('strength', 0), 2),
                 # FIX: 'htf_trend' was silently sourced from h1_trend (a 1H EMA20/50
                 # crossover) despite the name implying 4H. Point it at the real 4H
@@ -2388,7 +2529,7 @@ class ProductionForexPredictor:
 
         # FVGs
         for fvg in fvgs:
-            if abs(current_price - fvg['mid']) / self.pip_size > MAX_DIST_PIPS:
+            if abs(current_price - fvg['mid']) / self.pip_size > MAX_DIST_PIPS_FVG:
                 htf_fvg_rejected['dist'] += 1; continue
             future = df.iloc[fvg['index'] + 1:]
             if len(future) < 2:
@@ -2476,8 +2617,53 @@ class ProductionForexPredictor:
             if fvg.get('strength', 0) < MIN_HTF_STRENGTH:
                 htf_fvg_rejected['strength'] += 1; continue
 
-            # The old dict had no 'sources'/'tf_source' so h4_fvg_inside was always
-            # 0.0 — this single bug was suppressing 40% of the model's decision weight.
+            # FIX: previously forced 'h4_fvg_zone': True here, based on the
+            # pre-correction belief that h4_fvg_inside=1 was a positive signal
+            # the model wasn't getting enough credit for. Two things we now
+            # know make that wrong:
+            #   1) The diagnostic (train vs test groupby on the corrected,
+            #      leakage-fixed label_generator output) shows h4_fvg_inside=1
+            #      correlates with a MUCH LOWER reversion win rate, and this
+            #      holds consistently in both the train and test periods —
+            #      it's a real, generalizable pattern, not noise.
+            #   2) Structurally, a pure FVG-sourced zone can never legitimately
+            #      get h4_fvg_inside=1 in training — smc_detector.py's
+            #      fvg_overlap computation only ever applies to order_block-
+            #      sourced zones (a zone can't "confirm" itself). Forcing it
+            #      True here put every live HTF FVG signal into a feature
+            #      combination the model never actually saw in training.
+            # Leaving 'h4_fvg_zone' unset lets feature_builder's
+            # zone.get("h4_fvg_zone", False) fallback apply, matching what
+            # training actually saw for FVG-sourced zones.
+            # FIX (2026-08-18 replay audit — feature parity): previously this
+            # dict only carried direction/type/prices/strength/index, while
+            # the OB branch below computes and injects real 'confluence',
+            # 'htf_alignment', and 'touch_count'. Missing keys silently fall
+            # back to hard defaults inside feature_builder.build_feature_row
+            # (confluence=1, htf_alignment=0/neutral, touch_count=1 vs a
+            # training mean of ~11.24) regardless of the FVG's actual
+            # context — an inconsistency between how the two zone types are
+            # scored, not a deliberate modeling choice. (Note: h1_trend_
+            # alignment/h1_structure_shift/h1_displacement/h1_liquidity_sweep
+            # and the m5_* features are NOT affected by this — feature_builder
+            # already computes those live from df_1h/df_5m when absent from
+            # the zone dict, for both FVGs and OBs alike.)
+            # 'h4_fvg_zone'/'fvg_overlap' are deliberately left OFF for FVGs
+            # per the fix above this block — that one's correct as-is.
+            _fvg_real_overlap = 1
+            if htf_context:
+                _all_htf_items = (htf_context.get('h1_fvgs', []) +
+                                   htf_context.get('h4_fvgs', []) +
+                                   htf_context.get('h1_order_blocks', []) +
+                                   htf_context.get('h4_order_blocks', []))
+                _fvg_top = fvg.get('top', fvg.get('price_high', entry))
+                _fvg_bot = fvg.get('bottom', fvg.get('price_low', sl))
+                for _item in _all_htf_items:
+                    _item_bot = _item.get('bottom', _item.get('price_low', 0))
+                    _item_top = _item.get('top',    _item.get('price_high', 0))
+                    if _item_bot < _fvg_top and _item_top > _fvg_bot:
+                        _fvg_real_overlap += 1
+
             fvg_zone_for_model = {
                 'direction':   direction,
                 'type':        'demand' if direction == 'BUY' else 'supply',
@@ -2486,13 +2672,21 @@ class ProductionForexPredictor:
                 'price_mid':   fvg.get('mid',    fvg.get('price_mid',  entry)),
                 'strength':    fvg['strength'],
                 'index':       fvg.get('index', len(df) - 1),
-                'h4_fvg_zone': True,   # ← triggers h4_fvg_inside=1 in feature_builder
+                'confluence':    _fvg_real_overlap,
+                'htf_alignment': self._check_d1_alignment(direction, _df_d1),
+                'touch_count':   self._calculate_touch_count(
+                                      {'type': 'demand' if direction == 'BUY' else 'supply',
+                                       'price_high': fvg.get('top', fvg.get('price_high', entry)),
+                                       'price_low':  fvg.get('bottom', fvg.get('price_low', sl)),
+                                       'index': fvg.get('index', len(df) - 1)},
+                                      _df_15m),
             }
             base_prob = self._ml_score_htf_zone(
                 fvg_zone_for_model, df, tf, htf_context=htf_context,
+                zone_override=fvg_zone_for_model,
                 df_4h=df, df_1h=_df_1h, df_5m=_df_5m, df_d1=_df_d1)
-            # Gate raised to 0.70 — calibration shows 0.60–0.89 range is
-            # overconfident by 25–30pp. Only 0.70+ signals have reliable edge.
+            # Gate raised to 0.75 — calibration shows 0.60–0.89 range is
+            # overconfident by 25–30pp. Only 0.75+ signals have reliable edge.
             # Asia/pre-London softer gate removed — not justified by calibration.
             _ml_gate = 0.75
 
@@ -2501,7 +2695,7 @@ class ProductionForexPredictor:
                     print(f"    ❌ FVG prob={base_prob:.3f} < gate={_ml_gate:.2f}"
                           f"  dir={direction}"
                           f"  strength={fvg.get('strength', 0):.2f}"
-                          f"  age_bars={fvg.get('index', '?')}")
+                          f"  idx={fvg.get('index', '?')}")
                 htf_fvg_rejected['prob'] += 1; continue
 
             htf_setups.append(_build_setup(fvg, 'FVG', direction, entry, sl, tp_target,
@@ -2510,7 +2704,7 @@ class ProductionForexPredictor:
 
         # Order Blocks
         for ob in obs:
-            if abs(current_price - ob['mid']) / self.pip_size > MAX_DIST_PIPS:
+            if abs(current_price - ob['mid']) / self.pip_size > MAX_DIST_PIPS_OB:
                 htf_ob_rejected['dist'] += 1; continue
             future = df.iloc[ob['index'] + 1:]
             if len(future) < 2:
@@ -2685,15 +2879,29 @@ class ProductionForexPredictor:
                 # where any zone inside a 4H FVG was labeled with h4_fvg_inside=1.
                 'fvg_overlap':             fvg_overlap_flag,
             }
-
+             # ── TRAIN/LIVE PARITY: skip zones outside the training range ──────
+            # label_generator.py drops every training row with zone_touch_count
+            # > MAX_TOUCH_COUNT (20) — the model has ZERO examples above that.
+            # Scoring these live forces XGB/RF/LR to extrapolate independently
+            # past their training boundary, which is why they disagree wildly
+            # here specifically (see disagreement_std spikes on touch=21-25
+            # zones in the live logs).
+            _MAX_TOUCH_COUNT = 20
+            if full_ob_zone['touch_count'] > _MAX_TOUCH_COUNT:
+                htf_ob_rejected['strength'] += 1  # reuse existing counter bucket
+                if self.debug:
+                    print(f"    ⛔ OB skipped — touch_count={full_ob_zone['touch_count']} "
+                          f"> {_MAX_TOUCH_COUNT} (outside training range, exhausted zone)")
+                continue
+               
             base_prob = self._ml_score_htf_zone(
                 {'direction': direction, 'strength': ob['strength'],
                  'index': ob.get('index', len(df) - 1),
                  'mid': ob['mid'], 'top': ob['top'], 'bottom': ob['bottom']},
                 df, tf, htf_context=htf_context, zone_override=full_ob_zone,
                 df_4h=df, df_1h=_df_1h, df_5m=_df_5m, df_d1=_df_d1)
-            # Gate raised to 0.70 — calibration shows 0.60–0.89 range is
-            # overconfident by 25–30pp. Only 0.70+ signals have reliable edge.
+            # Gate raised to 0.75 — calibration shows 0.60–0.89 range is
+            # overconfident by 25–30pp. Only 0.75+ signals have reliable edge.
             _ml_gate = 0.75
 
             if base_prob < _ml_gate:
@@ -2701,7 +2909,7 @@ class ProductionForexPredictor:
                     print(f"    ❌ OB  prob={base_prob:.3f} < gate={_ml_gate:.2f}"
                           f"  dir={direction}"
                           f"  strength={ob.get('strength', 0):.2f}"
-                          f"  age_bars={ob.get('index', '?')}"
+                          f"  idx={ob.get('index', '?')}"
                           f"  mid={ob.get('mid', 0):.5f}")
                 htf_ob_rejected['prob'] += 1; continue
 
@@ -2746,6 +2954,26 @@ class ProductionForexPredictor:
             '1day/90':   self.fetch_bars(interval="1day",  outputsize=90),
         }
 
+        # FIX: drop today's still-forming D1 candle at the source, once, so
+        # every consumer of _bars['1day/90'] downstream (get_htf_context,
+        # htf_trade_detect's own D1 fetch fallback, predict_with_proper_
+        # features → the model's d1_premium_discount/htf_trend_alignment/
+        # d1_ema_distance features, and the D1 premium/discount hard gate)
+        # sees the same closed-bar-only D1 data. Previously only some of
+        # these paths applied their own closed-bar filter (get_htf_context,
+        # htf_trade_detect did; predict_with_proper_features's feature calls
+        # and the main-path premium/discount gate did not) — meaning the
+        # model's live D1 features could include a partial, still-forming
+        # day that never exists in the historical/training data (every bar
+        # in a stored historical dataset is, by definition, already closed).
+        # That's a live/train distribution mismatch on top of being simply
+        # inconsistent within the live pipeline itself.
+        _df_1d_raw = _bars['1day/90']
+        if _df_1d_raw is not None and len(_df_1d_raw) > 0 and 'time' in _df_1d_raw.columns:
+            _today_utc0 = pd.Timestamp(datetime.utcnow().date())
+            _df_1d_closed = _df_1d_raw[pd.to_datetime(_df_1d_raw['time']).dt.normalize() < _today_utc0].copy()
+            _bars['1day/90'] = _df_1d_closed if len(_df_1d_closed) > 0 else None
+
         df = _bars['15min/200']
         if df is None or len(df) < 50:
             strat = "CONT" if self.is_continuation_strategy else "REV "
@@ -2764,7 +2992,9 @@ class ProductionForexPredictor:
         else:
             h4_atr = current_atr * 4  # fallback: scale 15m ATR
             
-        dynamic_dist = self.get_scan_distance(h4_atr, self.symbol)
+        # Feed zone_tracker with the maximum zone scan distance (OB multiplier)
+        # so active Order Blocks waiting for retracement are not prematurely purged.
+        dynamic_dist = self.get_scan_distance(h4_atr, self.symbol, zone_type="OB")
         self.zone_tracker.distance_threshold_pips = dynamic_dist
 
         expired_count = self.zone_tracker.cleanup_expired(current_time, current_price)
@@ -3047,17 +3277,24 @@ class ProductionForexPredictor:
         # the log yet still fired freely in either direction: the daily bias
         # field was informational only on this path, not an actual gate.
         #
-        # Mirrors the _hard_bias pattern already used correctly in the HTF FVG
-        # and HTF OB gates elsewhere in this file: D1 is the hard gate whenever
-        # it has a clear (non-neutral) structure trend; 4H only takes over as
-        # the fallback when D1 itself is neutral/consolidating.
-        # daily_structure is computed on closed-D1 bars only (see get_htf_context).
-        _d1_trend  = htf_context.get('daily_structure', {}).get('trend', 'neutral') if htf_context else 'neutral'
+        # D1 SOURCE: uses d1_ema_trend (EMA20/50 crossover, cached on
+        # htf_context by get_htf_context) — the SAME calculation the model was
+        # trained on (see label_generator.calculate_htf_trend_alignment /
+        # smc_detector.get_d1_trend) — rather than the swing/structure-based
+        # daily_structure['trend']. Those two D1 definitions can disagree;
+        # gating on the EMA version keeps the live filter and the model's own
+        # probability score reasoning about the same D1 signal.
+        # daily_structure['trend'] is still computed and exported separately
+        # below for human-readable logging, it's just not used to gate anymore.
+        # _bars['1day/90'] is closed-bar-filtered once at the top of
+        # generate_signals() now — see the fix there. No re-filtering needed.
+        _df_d1_gate = _bars['1day/90']
+        _d1_trend_structure = htf_context.get('daily_structure', {}).get('trend', 'neutral') if htf_context else 'neutral'
+        _d1_trend  = htf_context.get('d1_ema_trend', 'neutral') if htf_context else 'neutral'
         _hard_bias = _d1_trend if _d1_trend != 'neutral' else h4_trend
 
         # ── v7 HARD GATE 2: D1 Premium / Discount ─────────────────────────────
         _d1_pd = 0  # default: equilibrium (no gate)
-        _df_d1_gate = _bars['1day/90']
         if _df_d1_gate is not None and len(_df_d1_gate) >= 20:
             _tail60  = _df_d1_gate.tail(60)
             _d1_high = float(np.percentile(_tail60["high"], 95))
@@ -3158,14 +3395,24 @@ class ProductionForexPredictor:
                 zone['m5_entry_candle_quality'] = _m5_conf['m5_entry_candle_quality']
 
             if 'fvg_overlap' not in zone and 'h4_fvg_zone' not in zone:
-                _h4_fvgs = htf_context.get('h4_fvgs', [])
-                _z_top   = zone.get('price_high', zone.get('price_mid', 0))
-                _z_bot   = zone.get('price_low',  zone.get('price_mid', 0))
-                zone['fvg_overlap'] = any(
-                    not (fvg.get('top', fvg.get('price_high', 0)) < _z_bot or
-                         fvg.get('bottom', fvg.get('price_low', 0)) > _z_top)
-                    for fvg in _h4_fvgs
-                )
+                # FIX: smc_detector.py's training-side fvg_overlap computation
+                # only ever applies to order_block-sourced zones (a zone can't
+                # confirm itself). This live fallback was missing that guard —
+                # an FVG-sourced zone's own price range will typically overlap
+                # itself (or a near-duplicate) in _h4_fvgs, recreating the same
+                # circularity via geometry instead of an explicit flag. Only
+                # compute this for OB-sourced zones, matching training exactly.
+                if 'order_block' in zone.get('sources', []):
+                    _h4_fvgs = htf_context.get('h4_fvgs', [])
+                    _z_top   = zone.get('price_high', zone.get('price_mid', 0))
+                    _z_bot   = zone.get('price_low',  zone.get('price_mid', 0))
+                    zone['fvg_overlap'] = any(
+                        not (fvg.get('top', fvg.get('price_high', 0)) < _z_bot or
+                             fvg.get('bottom', fvg.get('price_low', 0)) > _z_top)
+                        for fvg in _h4_fvgs
+                    )
+                else:
+                    zone['fvg_overlap'] = False
 
             if 'htf_alignment' not in zone:
                 if zone['type'] == 'demand':
@@ -3194,9 +3441,10 @@ class ProductionForexPredictor:
                     (datetime.utcnow() - history['last_touch']).total_seconds() / 3600,
                     2000)
             # staleness_penalty REMOVED — no training equivalent.
-            # zone_age_bars is already a model feature; the model learned its effect.
-            # Post-hoc subtraction double-penalises old zones and breaks calibration.
-            zone_age_bars = len(df) - zone.get('index', len(df) - 1)
+            # zone_age_bars IS a model feature (v9) — the model learns its effect
+            # directly. Post-hoc subtraction here would double-penalise old zones.
+            # Matches feature_builder._compute_raw_features: (len(df)-1) - zone_index.
+            zone_age_bars = len(df) - 1 - zone.get('index', len(df) - 1)
 
             # NOTE: confluence boost removed — was never validated in backtesting.
             # Raw base_probability is used directly. The model already learned
@@ -3242,7 +3490,15 @@ class ProductionForexPredictor:
             ) if d1_trend != 'neutral' else False
 
             _hour = datetime.utcnow().hour
-            _base_threshold = min(self.prob_threshold, 0.62) if not is_cont else self.prob_threshold
+            # FIX: was min(self.prob_threshold, 0.62) — per the post-fix
+            # calibration table, the 0.6-0.7 bucket's actual win rate was
+            # 37.5%, below the ~40% breakeven for this 1:1.5 RR (1/(1+1.5)).
+            # Signals clearing the old 0.62-0.65 gate were losing money on
+            # average in the backtest, not just "overconfident" — the 0.7-0.8
+            # bucket is the first one that clears breakeven with real margin
+            # (54.5% actual vs 40% needed). Raised to 0.75 to match the HTF
+            # FVG/OB path's gate, which was already correctly here.
+            _base_threshold = 0.75 if not is_cont else self.prob_threshold
             effective_threshold = _base_threshold + (0.03 if counter_trend else 0.0)
             if base_probability < 0.55 or probability < effective_threshold:
                 rejected_cnt += 1
@@ -3313,10 +3569,21 @@ class ProductionForexPredictor:
                 '5min_refined':    refinement is not None,
                 'confluence_score': zone.get('htf_confluence', {}).get('score', 0),
                 'counter_trend':   counter_trend,
-                'd1_trend':        htf_context.get('daily_structure', {}).get('trend', 'neutral'),
+                # FIX: 'd1_trend' now reports _d1_trend (EMA20/50) — the value
+                # that actually gates this signal (see _hard_bias above) and
+                # matches what the model was trained on. Swing-structure value
+                # preserved separately as 'd1_structure_trend'.
+                'd1_trend':        _d1_trend,
+                'd1_structure_trend': _d1_trend_structure,
                 'h4_trend':        htf_context.get('h4_structure', {}).get('trend', 'neutral'),
                 'zone_age_bars':   zone_age_bars,
-                'touch_count':     touch_count,
+                # FIX: 'touch_count' referenced an undefined local variable —
+                # confirmed via full-file search, it was never assigned
+                # anywhere in this function's scope. Replaced with the same
+                # _calculate_touch_count() call already used correctly in the
+                # HTF FVG/OB path, so both paths compute this consistently
+                # and match what the model was actually trained on.
+                'touch_count':     self._calculate_touch_count(zone, df),
                 'session':         _canonical_get_session(datetime.utcnow().hour),
             }
             if is_cont and flip_info:
@@ -3751,33 +4018,33 @@ def run_dual_strategy(symbols: Optional[List[str]] = None):
         key = PAIR_API_KEYS.get(sym, _FALLBACK_KEY)
         rev  = ProductionForexPredictor(
             api_key=key,
-            model_path="models/model_v5_reversion.pkl",
-            scaler_path="models/scaler_v5_reversion.pkl",
-            encoders_path="models/encoders_v5_reversion.pkl",
-            stats_path="models/training_stats_v5_reversion.pkl",
+            model_path="models/model_v6_reversion.pkl",
+            scaler_path="models/scaler_v6_reversion.pkl",
+            encoders_path="models/encoders_v6_reversion.pkl",
+            stats_path="models/training_stats_v6_reversion.pkl",
             symbol=sym,
-            prob_threshold=0.62,   # FIX-THRESHOLD: lowered from 0.72 → 0.62
+            prob_threshold=0.70,   # per disagreement_diagnostic_v2 STEP 4: 0.70 no-gate precision 89.6% (n=154)
             max_rr=8.0, min_risk_atr=2.5, max_distance_pips=p['max_distance_pips_rev'],  # min_risk_atr: 1.5→2.5
             min_strength_atr=0.50, use_5min_refinement=True,
             refine_max_dist_multiplier=2.0, enable_continuation=False,
             use_htf_analysis=True, min_confluence_score=1,
-            zone_ttl_hours=5.8, zone_distance_threshold=p['zone_distance_threshold'],
+            zone_ttl_hours=24.0, zone_distance_threshold=p['zone_distance_threshold'],
             htf_fvg_min_gap_atr=0.5, htf_ob_min_reaction_atr=2.5,
             is_continuation_strategy=False, require_zone_close=True, debug=True
         )
         cont = ProductionForexPredictor(
             api_key=key,
-            model_path="models/model_v5_continuation.pkl",
-            scaler_path="models/scaler_v5_continuation.pkl",
-            encoders_path="models/encoders_v5_continuation.pkl",
-            stats_path="models/training_stats_v5_continuation.pkl",
+            model_path="models/model_v6_continuation.pkl",
+            scaler_path="models/scaler_v6_continuation.pkl",
+            encoders_path="models/encoders_v6_continuation.pkl",
+            stats_path="models/training_stats_v6_continuation.pkl",
             symbol=sym,
-            prob_threshold=0.65,
+            prob_threshold=0.60,
             max_rr=10.0, min_risk_atr=2.5, max_distance_pips=p['max_distance_pips_cont'],  # min_risk_atr: 1.5→2.5
             min_strength_atr=0.50, use_5min_refinement=True,
             refine_max_dist_multiplier=2.0, enable_continuation=True,
             use_htf_analysis=True, min_confluence_score=1,
-            zone_ttl_hours=5.8, zone_distance_threshold=p['zone_distance_threshold'],
+            zone_ttl_hours=24.0, zone_distance_threshold=p['zone_distance_threshold'],
             htf_fvg_min_gap_atr=0.5, htf_ob_min_reaction_atr=2.5,
             is_continuation_strategy=True, debug=True
         )
@@ -3802,8 +4069,9 @@ def run_dual_strategy(symbols: Optional[List[str]] = None):
 
     try:
         while True:
-            iteration   += 1
-            cycle_time   = datetime.utcnow()
+            iteration    += 1
+            cycle_start   = time.monotonic()
+            cycle_time    = datetime.utcnow()
 
             print(f"\n{'═'*100}")
             print(f"CYCLE #{iteration} │ {cycle_time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
@@ -3919,7 +4187,8 @@ def run_dual_strategy(symbols: Optional[List[str]] = None):
             print(f"\n{'─'*100}")
             print(f"⏰ Next cycle: {(cycle_time + timedelta(minutes=15)).strftime('%H:%M:%S UTC')}")
             print(f"{'─'*100}\n")
-            time.sleep(900)
+            elapsed = time.monotonic() - cycle_start
+            time.sleep(max(0, 900 - elapsed))
 
     except KeyboardInterrupt:
         print("\n\n╔════════════════════════════════════════════════════════════════╗")

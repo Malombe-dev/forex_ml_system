@@ -622,6 +622,8 @@ class SMCDetector:
         annotated_zones = []
         n_h1_confirmed  = 0
         n_d1_aligned    = 0
+        _fvg_match_ages: List[int] = []  # DIAGNOSTIC: bars between zone and its matched FVG
+        _h1_sweep_magnitudes: List[float] = []  # DIAGNOSTIC: sweep excursion size / ATR
 
         for zone in merged_4h:
             zone_time = pd.to_datetime(zone['time'])
@@ -658,18 +660,43 @@ class SMCDetector:
             final_confluence = zone.get('confluence', 1) + confluence_boost
 
             # ── v7: detailed 1H features stored on zone for feature_builder ──
-            h1_trend_val, h1_mss_val, h1_disp_val, h1_sweep_val = \
+            h1_trend_val, h1_mss_val, h1_disp_val, h1_sweep_val, h1_sweep_mag = \
                 self._compute_h1_zone_features(df_1h, zone_time, zone.get('type', 'demand'))
+            if h1_sweep_mag is not None:
+                _h1_sweep_magnitudes.append(h1_sweep_mag)
 
             # FVG overlap check (v9 alignment)
+            # FIX: h4_fvgs is the FULL-HISTORY list detected once for the whole
+            # dataset (see extract_all_features_mtf, computed before this loop
+            # even starts) — it contains FVGs from before AND after this zone's
+            # own formation time. Checking overlap against the unfiltered list
+            # is look-ahead leakage: a zone could be flagged as "FVG-backed"
+            # because of a 4H FVG that only formed months/years later, which
+            # live trading could never have known about at signal time. This is
+            # almost certainly why h4_fvg_inside is true for ~87% of zones and
+            # dominates feature importance (45-60%) even after the feature_
+            # builder.py circular-reference fix — the leak was one layer
+            # upstream of that fix, here. Only FVGs already formed as of this
+            # zone's own 4H bar index are eligible.
             fvg_overlap_flag = False
             if 'order_block' in zone.get('sources', []):
+                _zone_4h_idx = zone.get('index', -1)
+                _best_match_age = None  # bars between this zone and its matched FVG
                 for fvg_item in h4_fvgs:
+                    if fvg_item.get('index', -1) > _zone_4h_idx:
+                        continue  # FVG hadn't formed yet at this zone's time — skip
                     fb = fvg_item.get('price_low', 0)
                     ft = fvg_item.get('price_high', 0)
                     if fb < zone['price_high'] and ft > zone['price_low']:
                         fvg_overlap_flag = True
-                        break
+                        _age = _zone_4h_idx - fvg_item.get('index', _zone_4h_idx)
+                        if _best_match_age is None or _age < _best_match_age:
+                            _best_match_age = _age
+                        # NOTE: not breaking here (temporarily) so we find the
+                        # CLOSEST match for the diagnostic below, not just the
+                        # first one found in list order.
+                if fvg_overlap_flag:
+                    _fvg_match_ages.append(_best_match_age)
 
             annotated_zones.append({
                 **zone,
@@ -688,6 +715,44 @@ class SMCDetector:
                 'h1_displacement':       h1_disp_val,
                 'h1_liquidity_sweep':    h1_sweep_val,
             })
+
+        # DIAGNOSTIC: distribution of how far back (in 4H bars) the matched
+        # FVG was relative to the zone it confirmed. 1 bar = 4 hours, so
+        # 6 bars/day. This tells us whether fvg_overlap is catching genuinely
+        # recent/relevant FVGs or matching against arbitrarily old ones from
+        # years earlier in the dataset (same price level revisited by chance).
+        # DIAGNOSTIC: distribution of H1 liquidity sweep excursion sizes, in
+        # ATR units. Bounding the window (tail(60), sp2=10) only reduced the
+        # near-constant rate slightly (100% -> 98.7% in one run) — the
+        # remaining near-constancy may mean most "sweeps" are real but
+        # economically tiny (a fraction of a pip beyond the recent extreme).
+        # If most magnitudes below are small, a minimum-magnitude threshold
+        # (e.g. requiring the excursion to exceed some fraction of 1H ATR,
+        # the same style already used for h1_displacement) would separate
+        # genuine liquidity grabs from mechanical noise-crossings.
+        if _h1_sweep_magnitudes:
+            import numpy as _np
+            _mags = _np.array(_h1_sweep_magnitudes)
+            logger.info(f"\n📏 H1 sweep magnitude diagnostic (excursion size / ATR):")
+            logger.info(f"  n sweeps detected: {len(_mags)}")
+            logger.info(f"  min={_mags.min():.3f}  p10={_np.percentile(_mags,10):.3f}  "
+                        f"p25={_np.percentile(_mags,25):.3f}  median={_np.median(_mags):.3f}  "
+                        f"p75={_np.percentile(_mags,75):.3f}  max={_mags.max():.3f}")
+            for _bound in [0.05, 0.10, 0.20, 0.30, 0.50]:
+                _pct = (_mags < _bound).mean() * 100
+                logger.info(f"  below {_bound:.2f}×ATR: {_pct:5.1f}% of detected sweeps")
+
+        if _fvg_match_ages:
+            import numpy as _np
+            _ages = _np.array(_fvg_match_ages)
+            logger.info(f"\n📏 FVG match-age diagnostic (bars back, 1 bar = 4h):")
+            logger.info(f"  n matches: {len(_ages)}")
+            logger.info(f"  min={_ages.min()}  p25={_np.percentile(_ages,25):.0f}  "
+                        f"median={_np.median(_ages):.0f}  p75={_np.percentile(_ages,75):.0f}  "
+                        f"p90={_np.percentile(_ages,90):.0f}  max={_ages.max()}")
+            for _bound, _label in [(30, '<5 days'), (180, '<30 days'), (1080, '<6 months'), (2160, '<1 year')]:
+                _pct = (_ages <= _bound).mean() * 100
+                logger.info(f"  {_label:10s} (≤{_bound:5d} bars): {_pct:5.1f}%")
 
         logger.info(f"\n4H Zone Annotation Summary:")
         logger.info(f"  Total 4H zones:      {len(merged_4h)}")
@@ -733,7 +798,7 @@ class SMCDetector:
         h1_displacement    : max impulse candle body / ATR in last 20 1H bars
         h1_liquidity_sweep : 1 if 1H swept swing low/high before reversal (last 30 bars)
         """
-        defaults = (0, 0, 0.0, 0)
+        defaults = (0, 0, 0.0, 0, None)
         try:
             sub = df_1h[pd.to_datetime(df_1h['time']) <= zone_time].copy()
             if len(sub) < 20:
@@ -785,24 +850,51 @@ class SMCDetector:
             bodies = (r20['close'] - r20['open']).abs()
             h1_disp = float(min(bodies.max() / atr_1h, 10.0))
 
-            # liquidity sweep — full available history up to zone_time
-            # BUG FIX (Bug 2 — training counterpart): using tail(30) here produced
-            # a 97% hit rate because historical zones always had prior sweeps in their
-            # 30-bar window. The live fix widens _check_1h_confluence to use the full
-            # sub. Keep these two functions consistent so re-training matches live.
+            # liquidity sweep — bounded window (v10 fix)
+            # ROOT CAUSE (found via train/test consistency audit): this was
+            # near-constant regardless of outer window size — tail(30) gave a
+            # 97% hit rate (the original Bug 2), and "fixing" that by widening
+            # to the FULL unbounded history gave 100% (still near-constant,
+            # just differently broken). Neither extreme was the real problem:
+            # sp2=4 is a 4-hour inner swing lookback, trivially broken by
+            # ordinary noise almost every window regardless of how large the
+            # search space is. Same root cause as m5_micro_bos/
+            # m5_sweep_confirmation, fixed the same way: bound the outer
+            # window to a reasonable recent context AND widen the inner
+            # lookback so "swept a swing" requires a genuine move.
+            # liquidity sweep — bounded window + minimum magnitude (v11 fix)
+            # v10 fixed the window/lookback (see comment above) but the flag
+            # was still near-constant (98.7% true) — measured via the
+            # diagnostic added after v10: most detected "sweeps" were real
+            # but economically trivial. Across all 4 symbols the magnitude
+            # distribution was consistent (median 0.176-0.190×ATR, ~52-55%
+            # of detected sweeps below 0.20×ATR). MIN_SWEEP_ATR=0.20 is
+            # chosen from that measured median, not guessed — it roughly
+            # halves the "true" rate, turning this into an actually
+            # discriminating feature instead of a near-constant one.
+            MIN_SWEEP_ATR = 0.20
             h1_sweep = 0
-            cw = sub.reset_index(drop=True)
-            sp2 = 4
+            h1_sweep_magnitude_atr = None  # DIAGNOSTIC: excursion size / ATR
+            cw  = sub.tail(60).reset_index(drop=True)
+            sp2 = 10
             for i in range(sp2, len(cw)):
                 bar     = cw.iloc[i]
                 prev_lo = cw.iloc[max(0, i-sp2):i]['low'].min()
                 prev_hi = cw.iloc[max(0, i-sp2):i]['high'].max()
                 if zone_type == 'demand' and bar['low'] < prev_lo and bar['close'] > prev_lo:
-                    h1_sweep = 1; break
+                    _mag = (prev_lo - bar['low']) / atr_1h
+                    if _mag >= MIN_SWEEP_ATR:
+                        h1_sweep = 1
+                        h1_sweep_magnitude_atr = _mag
+                        break
                 if zone_type == 'supply' and bar['high'] > prev_hi and bar['close'] < prev_hi:
-                    h1_sweep = 1; break
+                    _mag = (bar['high'] - prev_hi) / atr_1h
+                    if _mag >= MIN_SWEEP_ATR:
+                        h1_sweep = 1
+                        h1_sweep_magnitude_atr = _mag
+                        break
 
-            return (h1_trend, h1_mss, round(h1_disp, 4), h1_sweep)
+            return (h1_trend, h1_mss, round(h1_disp, 4), h1_sweep, h1_sweep_magnitude_atr)
 
         except Exception as e:
             logger.warning(f"_compute_h1_zone_features failed: {e}")

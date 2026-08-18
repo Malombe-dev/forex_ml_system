@@ -234,6 +234,9 @@ def _compute_raw_features(
     candle_body  = abs(t_close_val - t_open)
     candle_body_ratio = (candle_body / candle_range) if candle_range > 0 else 0.5
 
+    # zone_age_bars: computed but NOT in NUMERIC_FEATURES (see features.py note)
+    # — kept here only in case a future redesign wants raw ingredients to
+    # build a proper train/serve-consistent staleness signal.
     zone_age_bars = float(t_idx - zone_index)
     zone_age_bars = max(0.0, min(zone_age_bars, 500.0))
 
@@ -432,15 +435,16 @@ def _compute_h1_features(
         h1_displacement = min(h1_displacement, 10.0)
 
         # ── h1_liquidity_sweep ────────────────────────────────────────────────
-        # Detect: price spiked below a swing low (or above swing high) and
-        # closed back inside structure.
-        # FIX 3: scan full `sub` (all 1H bars up to touch_time) instead of
-        # tail(30). tail(30) missed sweeps that occurred earlier in the zone's
-        # lifetime, producing near-zero values vs training mean of 0.972 —
-        # a −5.85 z-score that systematically suppressed model scores.
+        # FIX (v11): v10 fixed the window/lookback but the flag was still
+        # near-constant (98.7%) — most detected sweeps were real but
+        # economically trivial. MIN_SWEEP_ATR=0.20 chosen from the measured
+        # excursion-magnitude distribution across all 4 symbols (median
+        # ~0.18-0.19×ATR) — see smc_detector.py for the full write-up.
+        # Kept in sync with that function and production_predictor.py exactly.
+        MIN_SWEEP_ATR = 0.20
         h1_liquidity_sweep = 0
-        check_window = sub.reset_index(drop=True)
-        sp = 4
+        check_window = sub.tail(60).reset_index(drop=True)
+        sp = 10
         for i in range(sp, len(check_window)):
             bar     = check_window.iloc[i]
             prev_lo = check_window.iloc[max(0, i-sp):i]["low"].min()
@@ -449,14 +453,16 @@ def _compute_h1_features(
             # Bullish sweep: wick below prior swing low, closed back above
             if (bar["low"] < prev_lo and
                     bar["close"] > prev_lo and
-                    zone_type == "demand"):
+                    zone_type == "demand" and
+                    (prev_lo - bar["low"]) / atr_1h >= MIN_SWEEP_ATR):
                 h1_liquidity_sweep = 1
                 break
 
             # Bearish sweep: wick above prior swing high, closed back below
             if (bar["high"] > prev_hi and
                     bar["close"] < prev_hi and
-                    zone_type == "supply"):
+                    zone_type == "supply" and
+                    (bar["high"] - prev_hi) / atr_1h >= MIN_SWEEP_ATR):
                 h1_liquidity_sweep = 1
                 break
 
@@ -571,8 +577,14 @@ def _compute_m5_features(
             atr_5m = pip_size * 5
 
         # ── m5_micro_bos ──────────────────────────────────────────────────────
+        # FIX 2 (v10): sp widened from 3 -> 10 bars. A 3-bar (15-min) swing
+        # lookback made "breaking a swing" trivially easy — over ~56 check
+        # opportunities in the 60-bar window, ordinary noise almost always
+        # broke SOME 15-minute high/low at least once (train-vs-test audit
+        # found this near-constant at 99.7% true, carrying ~zero information).
+        # 10 bars (~50 min) requires a more meaningful local extreme.
         m5_micro_bos = 0
-        sp = 3
+        sp = 10
         for i in range(sp, len(recent) - 1):
             bar = recent.iloc[i]
             if zone_type == "demand":
@@ -589,11 +601,14 @@ def _compute_m5_features(
                     break
 
         # ── m5_sweep_confirmation ─────────────────────────────────────────────
+        # FIX 2 (v10): lookback widened from 4 -> 10 bars, same reasoning as
+        # above (was near-constant at 99.9% true).
         m5_sweep_confirmation = 0
-        for i in range(4, len(recent)):
+        _sweep_lb = 10
+        for i in range(_sweep_lb, len(recent)):
             bar     = recent.iloc[i]
-            prev_lo = recent.iloc[max(0, i-4):i]["low"].min()
-            prev_hi = recent.iloc[max(0, i-4):i]["high"].max()
+            prev_lo = recent.iloc[max(0, i-_sweep_lb):i]["low"].min()
+            prev_hi = recent.iloc[max(0, i-_sweep_lb):i]["high"].max()
 
             if zone_type == "demand":
                 if bar["low"] < prev_lo and bar["close"] > prev_lo:
