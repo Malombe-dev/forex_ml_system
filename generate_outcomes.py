@@ -7,11 +7,11 @@ STRATEGIES
 ----------
   REVERSION    : demand zone → BUY, supply zone → SELL
                  Label column : 'label'
-                 Models       : model_v5_reversion.pkl
+                 Models       : model_v6_reversion.pkl
 
   CONTINUATION : trades in direction of HTF trend
                  Label column : 'label_cont'
-                 Models       : model_v5_continuation.pkl
+                 Models       : model_v6_continuation.pkl
 
 Both strategies use the SAME label files and SAME feature columns.
 The only difference is which label column is used for scoring.
@@ -339,12 +339,12 @@ if RUN_REVERSION:
     else:
         print("Loading REVERSION models...")
         rev_models = {
-            'xgb':   pickle.load(open('models/model_v5_reversion.pkl', 'rb')),
-            'rf':    pickle.load(open('models/rf_v5_reversion.pkl',    'rb')),
-            'ridge': pickle.load(open('models/lr_v5_reversion.pkl',    'rb')),
+            'xgb':   pickle.load(open('models/model_v6_reversion.pkl', 'rb')),
+            'rf':    pickle.load(open('models/rf_v6_reversion.pkl',    'rb')),
+            'ridge': pickle.load(open('models/lr_v6_reversion.pkl',    'rb')),
         }
-        rev_scaler   = pickle.load(open('models/scaler_v5_reversion.pkl',   'rb'))
-        rev_encoders = pickle.load(open('models/encoders_v5_reversion.pkl', 'rb'))
+        rev_scaler   = pickle.load(open('models/scaler_v6_reversion.pkl',   'rb'))
+        rev_encoders = pickle.load(open('models/encoders_v6_reversion.pkl', 'rb'))
 
         test_rev = test_df.copy()
         test_rev = encode_categoricals(test_rev, rev_encoders)
@@ -381,11 +381,11 @@ if RUN_CONTINUATION:
     else:
         # Check model files
         cont_files = [
-            'models/model_v5_continuation.pkl',
-            'models/rf_v5_continuation.pkl',
-            'models/lr_v5_continuation.pkl',
-            'models/scaler_v5_continuation.pkl',
-            'models/encoders_v5_continuation.pkl',
+            'models/model_v6_continuation.pkl',
+            'models/rf_v6_continuation.pkl',
+            'models/lr_v6_continuation.pkl',
+            'models/scaler_v6_continuation.pkl',
+            'models/encoders_v6_continuation.pkl',
         ]
         missing = [f for f in cont_files if not Path(f).exists()]
         if missing:
@@ -395,12 +395,12 @@ if RUN_CONTINUATION:
         else:
             print("Loading CONTINUATION models...")
             cont_models = {
-                'xgb':   pickle.load(open('models/model_v5_continuation.pkl', 'rb')),
-                'rf':    pickle.load(open('models/rf_v5_continuation.pkl',    'rb')),
-                'ridge': pickle.load(open('models/lr_v5_continuation.pkl',   'rb')),
+                'xgb':   pickle.load(open('models/model_v6_continuation.pkl', 'rb')),
+                'rf':    pickle.load(open('models/rf_v6_continuation.pkl',    'rb')),
+                'ridge': pickle.load(open('models/lr_v6_continuation.pkl',   'rb')),
             }
-            cont_scaler   = pickle.load(open('models/scaler_v5_continuation.pkl',   'rb'))
-            cont_encoders = pickle.load(open('models/encoders_v5_continuation.pkl', 'rb'))
+            cont_scaler   = pickle.load(open('models/scaler_v6_continuation.pkl',   'rb'))
+            cont_encoders = pickle.load(open('models/encoders_v6_continuation.pkl', 'rb'))
 
             test_cont = test_df.copy()
             test_cont = encode_categoricals(test_cont, cont_encoders)

@@ -748,8 +748,8 @@ class ProductionForexPredictor:
 
         key = "cont" if is_continuation_strategy else "rev"
         validated_stats = {
-            "rev":  {"base_prob": 0.65, "max_boost": 0.07},
-            "cont": {"base_prob": 0.65, "max_boost": 0.06}
+            "rev":  {"base_prob": 0.65, "max_boost": 0.0},
+            "cont": {"base_prob": 0.65, "max_boost": 0.0}
         }[key]
 
         self.prob_threshold  = validated_stats["base_prob"] if prob_threshold is None else prob_threshold
@@ -961,10 +961,10 @@ class ProductionForexPredictor:
         """
         is_gold = 'XAU' in symbol or 'GOLD' in symbol.upper()
         if zone_type == "OB":
-            multiplier = 3.0 if is_gold else 2.5  # matches OB's own 2.0-2.5x ATR formation distance
+            multiplier = 3.0 if is_gold else 2.5
         else:
-            multiplier = 1.5 if is_gold else 1.0  # FVGs sit close to price; unchanged
-        return current_atr * multiplier / self.pip_size  # convert to pips
+            multiplier = 1.5 if is_gold else 1.0   # FVGs — unchanged
+        return current_atr * multiplier / self.pip_size
 
     def _get_session(self, hour: int) -> str:
         return _canonical_get_session(hour)
@@ -1943,7 +1943,7 @@ class ProductionForexPredictor:
                                                        df_5m=df_5m, df_d1=df_d1), 0)
 
     def apply_boost_ceiling(self, base: float, boost: float) -> float:
-        return min(base + min(boost, self.max_boost), 0.95)
+        return min(base, 0.95)
 
     def _find_swing_points(self, df: pd.DataFrame, lookback: int, pivot_width: int = 2) -> Tuple[List[float], List[float]]:
         """
@@ -2433,19 +2433,12 @@ class ProductionForexPredictor:
         if h4_trend == 'neutral' and htf_context:
             h4_trend = htf_context.get('h4_structure', {}).get('trend', 'neutral')
 
-        # ── D1 HARD BIAS GATE ─────────────────────────────────────────────────
-        # D1 is the higher authority. When D1 has a clear bias it overrules 4H.
-        # When D1 is neutral (consolidating), 4H holds the gate as fallback.
-        # This fixes the GBP/USD case: h4=bullish but D1=bearish → BUY blocked.
-        #
-        # D1 SOURCE: uses d1_ema_trend (EMA20/50 crossover, cached on
-        # htf_context by get_htf_context) — the SAME calculation the model was
-        # trained on — rather than the swing/structure-based
-        # daily_structure['trend']. Those two D1 definitions can disagree;
-        # gating on the EMA version keeps the live filter and the model's own
-        # probability score reasoning about the same D1 signal.
+        # ── D1 & 4H HARD BIAS AGREEMENT GATE ──────────────────────────────────
+        # Both D1 and 4H must agree (or neither can oppose the trade direction).
+        # - For BUY: Neither D1 (EMA or Structure) nor 4H can be bearish.
+        # - For SELL: Neither D1 (EMA or Structure) nor 4H can be bullish.
+        _d1_trend_structure = htf_context.get('daily_structure', {}).get('trend', 'neutral') if htf_context else 'neutral'
         _d1_trend   = htf_context.get('d1_ema_trend', 'neutral') if htf_context else 'neutral'
-        _hard_bias  = _d1_trend if _d1_trend != 'neutral' else h4_trend
         # ─────────────────────────────────────────────────────────────────────
 
         # D1 Premium / Discount gate calculation
@@ -2486,8 +2479,7 @@ class ProductionForexPredictor:
 
         def _build_setup(zone_obj, zone_type_str, direction, entry, sl, tp_target,
                          risk, reward, rr, base_prob, conf_str, confirmations):
-            final_prob = self.apply_boost_ceiling(
-                base_prob, min(confirmations * 0.02, self.max_boost))
+            final_prob = base_prob
             return {
                 'timestamp':    datetime.utcnow().isoformat(),
                 'symbol':       self.symbol,
@@ -2559,7 +2551,7 @@ class ProductionForexPredictor:
             # — the zone's actual invalidation point — plus a small ATR buffer
             # so an ordinary wick past the edge doesn't stop the trade out.
             _gap      = abs(fvg['top'] - fvg['bottom'])
-            _atr_buf  = df['atr'].iloc[-1] * 0.2 if 'atr' in df.columns else 0.0002
+            _atr_buf  = df['atr'].iloc[-1] * 0.35 if 'atr' in df.columns else 0.0003
             if direction == 'BUY':
                 entry = fvg['bottom'] + 0.75 * _gap   # 3/4 toward near edge (top)
                 sl    = fvg['bottom'] - _atr_buf      # past the real far edge, wick-buffered
@@ -2567,18 +2559,18 @@ class ProductionForexPredictor:
                 entry = fvg['top'] - 0.75 * _gap      # 3/4 toward near edge (bottom)
                 sl    = fvg['top'] + _atr_buf         # past the real far edge, wick-buffered
 
-            # ── D1/4H HARD BIAS BLOCK (HTF FVG) ──────────────────────────────
-            # D1 is the hard gate when it has a clear bias; 4H is fallback.
-            # Bullish bias → block SELL. Bearish bias → block BUY.
-            if _hard_bias == 'bullish' and direction == 'SELL':
+            # ── D1/4H HARD BIAS AGREEMENT BLOCK (HTF FVG) ─────────────────────
+            # BUY requires non-bearish D1 (EMA & structure) and 4H.
+            # SELL requires non-bullish D1 (EMA & structure) and 4H.
+            if direction == 'SELL' and (_d1_trend == 'bullish' or _d1_trend_structure == 'bullish' or h4_trend == 'bullish'):
                 htf_fvg_rejected['direction'] += 1
                 if self.debug:
-                    print(f"     ⛔ HTF FVG HARD BLOCK: SELL blocked — D1/4H bias is bullish (d1={_d1_trend} h4={h4_trend})")
+                    print(f"     ⛔ HTF FVG HARD BLOCK: SELL blocked — D1/4H bias conflict (d1_ema={_d1_trend} d1_struct={_d1_trend_structure} h4={h4_trend})")
                 continue
-            if _hard_bias == 'bearish' and direction == 'BUY':
+            if direction == 'BUY' and (_d1_trend == 'bearish' or _d1_trend_structure == 'bearish' or h4_trend == 'bearish'):
                 htf_fvg_rejected['direction'] += 1
                 if self.debug:
-                    print(f"     ⛔ HTF FVG HARD BLOCK: BUY blocked — D1/4H bias is bearish (d1={_d1_trend} h4={h4_trend})")
+                    print(f"     ⛔ HTF FVG HARD BLOCK: BUY blocked — D1/4H bias conflict (d1_ema={_d1_trend} d1_struct={_d1_trend_structure} h4={h4_trend})")
                 continue
 
             # ── D1 Premium / Discount Gate (HTF FVG) ───────────────────────────
@@ -2685,10 +2677,8 @@ class ProductionForexPredictor:
                 fvg_zone_for_model, df, tf, htf_context=htf_context,
                 zone_override=fvg_zone_for_model,
                 df_4h=df, df_1h=_df_1h, df_5m=_df_5m, df_d1=_df_d1)
-            # Gate raised to 0.75 — calibration shows 0.60–0.89 range is
-            # overconfident by 25–30pp. Only 0.75+ signals have reliable edge.
-            # Asia/pre-London softer gate removed — not justified by calibration.
-            _ml_gate = 0.75
+            # ML probability gate: respects self.prob_threshold (default 0.70 for reversion)
+            _ml_gate = self.prob_threshold if getattr(self, 'prob_threshold', None) is not None else 0.70
 
             if base_prob < _ml_gate:
                 if self.debug:
@@ -2718,18 +2708,18 @@ class ProductionForexPredictor:
 
             direction = 'BUY' if ob['type'] == 'bullish' else 'SELL'
 
-            # ── D1/4H HARD BIAS BLOCK (HTF OB) ───────────────────────────────
-            # D1 is the hard gate when it has a clear bias; 4H is fallback.
-            # Bullish bias → block SELL. Bearish bias → block BUY.
-            if _hard_bias == 'bullish' and direction == 'SELL':
+            # ── D1/4H HARD BIAS AGREEMENT BLOCK (HTF OB) ──────────────────────
+            # BUY requires non-bearish D1 (EMA & structure) and 4H.
+            # SELL requires non-bullish D1 (EMA & structure) and 4H.
+            if direction == 'SELL' and (_d1_trend == 'bullish' or _d1_trend_structure == 'bullish' or h4_trend == 'bullish'):
                 htf_ob_rejected['direction'] += 1
                 if self.debug:
-                    print(f"     ⛔ HTF OB HARD BLOCK: SELL blocked — D1/4H bias is bullish (d1={_d1_trend} h4={h4_trend})")
+                    print(f"     ⛔ HTF OB HARD BLOCK: SELL blocked — D1/4H bias conflict (d1_ema={_d1_trend} d1_struct={_d1_trend_structure} h4={h4_trend})")
                 continue
-            if _hard_bias == 'bearish' and direction == 'BUY':
+            if direction == 'BUY' and (_d1_trend == 'bearish' or _d1_trend_structure == 'bearish' or h4_trend == 'bearish'):
                 htf_ob_rejected['direction'] += 1
                 if self.debug:
-                    print(f"     ⛔ HTF OB HARD BLOCK: BUY blocked — D1/4H bias is bearish (d1={_d1_trend} h4={h4_trend})")
+                    print(f"     ⛔ HTF OB HARD BLOCK: BUY blocked — D1/4H bias conflict (d1_ema={_d1_trend} d1_struct={_d1_trend_structure} h4={h4_trend})")
                 continue
 
             # ── D1 Premium / Discount Gate (HTF OB) ────────────────────────────
@@ -2746,7 +2736,7 @@ class ProductionForexPredictor:
                         print(f"     ⛔ HTF OB D1 DISCOUNT BLOCK: SELL blocked — price in D1 discount and 4H is bullish")
                     continue
 
-            _atr_buf = df['atr'].iloc[-1] * 0.2 if 'atr' in df.columns else 0.0002
+            _atr_buf = df['atr'].iloc[-1] * 0.35 if 'atr' in df.columns else 0.0003
             if direction == 'BUY':
                 entry = ob['top']               # proximal body edge for demand
                 sl    = ob['bottom'] - _atr_buf # distal wick + ATR buffer
@@ -2900,9 +2890,8 @@ class ProductionForexPredictor:
                  'mid': ob['mid'], 'top': ob['top'], 'bottom': ob['bottom']},
                 df, tf, htf_context=htf_context, zone_override=full_ob_zone,
                 df_4h=df, df_1h=_df_1h, df_5m=_df_5m, df_d1=_df_d1)
-            # Gate raised to 0.75 — calibration shows 0.60–0.89 range is
-            # overconfident by 25–30pp. Only 0.75+ signals have reliable edge.
-            _ml_gate = 0.75
+            # ML probability gate: respects self.prob_threshold (default 0.70 for reversion)
+            _ml_gate = self.prob_threshold if getattr(self, 'prob_threshold', None) is not None else 0.70
 
             if base_prob < _ml_gate:
                 if self.debug:
@@ -3291,7 +3280,6 @@ class ProductionForexPredictor:
         _df_d1_gate = _bars['1day/90']
         _d1_trend_structure = htf_context.get('daily_structure', {}).get('trend', 'neutral') if htf_context else 'neutral'
         _d1_trend  = htf_context.get('d1_ema_trend', 'neutral') if htf_context else 'neutral'
-        _hard_bias = _d1_trend if _d1_trend != 'neutral' else h4_trend
 
         # ── v7 HARD GATE 2: D1 Premium / Discount ─────────────────────────────
         _d1_pd = 0  # default: equilibrium (no gate)
@@ -3329,29 +3317,28 @@ class ProductionForexPredictor:
             is_cont  = zone.get('is_continuation', False)
             flip_info = zone.get('flip_info')
 
-            # ── Apply D1/4H bias gate — HARD BLOCK ───────────────────────────
-            # D1 is the hard gate when it has a clear bias; 4H is fallback
-            # (see _hard_bias derivation above). Bullish bias → block SELL.
-            # Bearish bias → block BUY. Matches the HTF FVG / HTF OB gates.
-            if _hard_bias == 'bullish' and zone['type'] == 'supply':
+            # ── Apply D1/4H bias agreement gate — HARD BLOCK ──────────────────
+            # BUY requires non-bearish D1 (EMA & structure) and 4H.
+            # SELL requires non-bullish D1 (EMA & structure) and 4H.
+            if zone['type'] == 'supply' and (_d1_trend == 'bullish' or _d1_trend_structure == 'bullish' or h4_trend == 'bullish'):
                 rejected_cnt += 1
                 reject_reasons['d1_premium_discount'] += 1
-                observation_signals.append(_make_obs_signal(zone, 'd1_4h_bullish_blocks_sell'))
-                msg = f"  ⛔ D1/4H BIAS HARD BLOCK: supply (SELL) zone at {zone.get('price_mid', 0.0):.5f} blocked — bias is bullish (d1={_d1_trend} h4={h4_trend})"
+                observation_signals.append(_make_obs_signal(zone, 'd1_4h_bias_conflict_blocks_sell'))
+                msg = f"  ⛔ D1/4H BIAS HARD BLOCK: supply (SELL) zone at {zone.get('price_mid', 0.0):.5f} blocked — bias conflict (d1_ema={_d1_trend} d1_struct={_d1_trend_structure} h4={h4_trend})"
                 logger.info(msg)
                 if self.debug:
                     print(msg)
                 continue
-            elif _hard_bias == 'bearish' and zone['type'] == 'demand':
+            elif zone['type'] == 'demand' and (_d1_trend == 'bearish' or _d1_trend_structure == 'bearish' or h4_trend == 'bearish'):
                 rejected_cnt += 1
                 reject_reasons['d1_premium_discount'] += 1
-                observation_signals.append(_make_obs_signal(zone, 'd1_4h_bearish_blocks_buy'))
-                msg = f"  ⛔ D1/4H BIAS HARD BLOCK: demand (BUY) zone at {zone.get('price_mid', 0.0):.5f} blocked — bias is bearish (d1={_d1_trend} h4={h4_trend})"
+                observation_signals.append(_make_obs_signal(zone, 'd1_4h_bias_conflict_blocks_buy'))
+                msg = f"  ⛔ D1/4H BIAS HARD BLOCK: demand (BUY) zone at {zone.get('price_mid', 0.0):.5f} blocked — bias conflict (d1_ema={_d1_trend} d1_struct={_d1_trend_structure} h4={h4_trend})"
                 logger.info(msg)
                 if self.debug:
                     print(msg)
                 continue
-            _h4_counter_trend_penalty = 0.0  # no penalty needed — counter-trend already blocked
+            _h4_counter_trend_penalty = 0.0
 
             if _d1_pd == 1 and zone['type'] == 'demand':
                 # Price in D1 premium — block demand unless 4H is also bullish
@@ -3490,15 +3477,11 @@ class ProductionForexPredictor:
             ) if d1_trend != 'neutral' else False
 
             _hour = datetime.utcnow().hour
-            # FIX: was min(self.prob_threshold, 0.62) — per the post-fix
-            # calibration table, the 0.6-0.7 bucket's actual win rate was
-            # 37.5%, below the ~40% breakeven for this 1:1.5 RR (1/(1+1.5)).
-            # Signals clearing the old 0.62-0.65 gate were losing money on
-            # average in the backtest, not just "overconfident" — the 0.7-0.8
-            # bucket is the first one that clears breakeven with real margin
-            # (54.5% actual vs 40% needed). Raised to 0.75 to match the HTF
-            # FVG/OB path's gate, which was already correctly here.
-            _base_threshold = 0.75 if not is_cont else self.prob_threshold
+            # Calibration audit confirmed: the 0.60–0.70 bucket was overconfident (predicted ~65%
+            # vs ~39% actual win rate, below 1:1.5 breakeven). Setting threshold >= 0.70 filters
+            # out the underperforming 0.60–0.70 bucket while preserving the validated 0.70+ edge
+            # (test set precision: 89.6% at 0.70+).
+            _base_threshold = self.prob_threshold if getattr(self, 'prob_threshold', None) is not None else (0.60 if is_cont else 0.70)
             effective_threshold = _base_threshold + (0.03 if counter_trend else 0.0)
             if base_probability < 0.55 or probability < effective_threshold:
                 rejected_cnt += 1
@@ -3724,17 +3707,379 @@ class PriceZoneMonitor:
 
     def __init__(self, predictors: List['ProductionForexPredictor'],
                  signals_file: str = "signals/all_signals.json",
-                 alert_callback=None):
-        self.predictors       = predictors
-        self.signals_file     = Path(signals_file)
-        self.alert_callback   = alert_callback or self._default_alert
-        self.alerted_signals  = set()
+                 alert_callback=None,
+                 approach_log_file: str = "logs/pre_entry_approach_log.jsonl",
+                 final_log_file: str = "logs/final_signals.jsonl"):
+        self.predictors        = predictors
+        self.signals_file      = Path(signals_file)
+        self.alert_callback    = alert_callback or self._default_alert
+        self.alerted_signals   = set()
+        # Signals we've already logged an "approaching" (pre-touch) sample for,
+        # so we don't spam the log every 15min cycle while price hovers nearby.
+        self._approach_logged  = set()
+        self.approach_log_file = Path(approach_log_file)
+        self.approach_log_file.parent.mkdir(parents=True, exist_ok=True)
+        # Dual-tracking log: every trigger writes BOTH the original proposed
+        # signal and the recomputed final signal (or a skip record), linked
+        # by original_signal_id, so we can later measure whether the
+        # recompute step actually improves outcomes vs. the raw signal.
+        self.final_log_file    = Path(final_log_file)
+        self.final_log_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # Thresholds for the trigger-time recompute (see _recompute_final_signal).
+        # Kept as attributes (not magic numbers inline) so they're easy to
+        # retune once more live data comes in — current values are carried
+        # over from the replay_2026-08-20_130934 read (16 triggered signals,
+        # 7 win / 9 loss), not yet validated at scale.
+        #
+        # Replaces the old binary "consec>=2 -> skip" gate with a graduated
+        # exhaustion score built from 5 touch-bar metrics (win_avg vs
+        # loss_avg on that run):
+        #   touch_rejection_wick_atr      0.23 / 1.35  (5.9x — strongest)
+        #   consecutive_directional_bars  0.43 / 1.44  (3.4x)
+        #   touch_bar_size_atr            1.50 / 3.01  (2.0x)
+        #   pre_touch_bar_size_atr        1.15 / 1.97  (1.7x)
+        #   approach_velocity_30m_atr     2.03 / 3.28  (1.6x)
+        # Weights roughly track that separation; caps are roughly loss_avg
+        # so a "typical bad touch" scores ~1.0 on that component alone.
+        # Reweighted 2026-08-24 after checking 3 "adjusted_never_filled" replay
+        # signals against real EUR/USD & USD/JPY bars. consecutive_directional_bars
+        # was maxing out at the minimum qualifying streak (2 bars, cap=2.0), so it
+        # contributed the same 0.25 to every case regardless of severity -- zero
+        # discriminative value, 25% of total weight. touch_rejection_wick_atr was
+        # the feature that actually separated the one case that should NOT have
+        # been adjusted (wick=0.81, unadjusted trade hit TP) from the two that
+        # correctly were (wick=1.85-1.98, unadjusted trades hit SL). Moved weight
+        # off consec onto wick, widened the consec cap so it stops saturating on
+        # a bare 2-bar streak, and raised the mid threshold to match. Validated
+        # against only 3 signals -- rerun replay and check the win-rate breakdown
+        # by tier before trusting this beyond that sample.
+        self.exhaustion_weights = {
+            "touch_rejection_wick_atr":      0.45,
+            "consecutive_directional_bars":  0.15,
+            "touch_bar_size_atr":            0.20,
+            "pre_touch_bar_size_atr":        0.10,
+            "approach_velocity_30m_atr":     0.10,
+        }
+        self.exhaustion_caps = {
+            "touch_rejection_wick_atr":      1.4,
+            "consecutive_directional_bars":  3.0,
+            "touch_bar_size_atr":            3.0,
+            "pre_touch_bar_size_atr":        2.0,
+            "approach_velocity_30m_atr":     3.5,
+        }
+        self.exhaustion_mid_threshold  = 0.58   # score >= this -> adjust_mid (recompute entry/sl/tp)
+        self.exhaustion_high_threshold = 0.75   # score >= this -> adjust_high (recompute harder)
+        self.accel_bar_size_atr_min  = 2.0   # 5min bar range / atr_5min above this = "knife"
+        self.accel_body_ratio_min    = 0.70  # and a solid (low-wick) body
+        self.accel_score_bonus       = 0.30  # score bump when the 5min knife check fires
+        self.sl_pad_base_atr    = 0.40   # flat SL cushion, in ATR units, regardless of wick size
+        self.sl_pad_wick_atr    = 0.60   # extra SL cushion proportional to the observed rejection wick
+        self.entry_push_vel_atr = 0.35   # entry push proportional to approach velocity
+        self.tier_scale = {"mid": 1.0, "high": 1.75}  # how much harder "high" pushes than "mid"
+        self.min_rr_floor = 1.5          # same floor concept as MIN_RR in the TP-construction code
+
+        # How long to wait for price to reach a pushed entry before it's
+        # abandoned as "adjusted but never filled". A flat 6h window was
+        # penalizing lower-volatility pairs: in the 2026-08-24 replay,
+        # EUR/USD expired 2/2 adjusted signals and USD/JPY 1/4, while
+        # XAU/USD and GBP/USD filled every adjusted signal (2/2, 1/1) —
+        # gold's absolute pip moves retrace into a pushed limit fast
+        # enough that 6h is generous, but EUR/USD/GBP/USD/JPY often need
+        # longer to travel the same ATR-relative distance back. Override
+        # per symbol (same pattern as zone_ttl_overrides in the replay
+        # engine); falls back to adjust_fill_window_hours if a symbol
+        # isn't listed.
+        self.adjust_fill_window_hours = 6.0
+        self.adjust_fill_window_overrides = {
+            "EUR/USD": 10.0,
+            "GBP/USD": 10.0,
+            "USD/JPY": 8.0,
+            "XAU/USD": 6.0,
+        }
+
+        # Cap on how far entry can be pushed, in ATR units, regardless of
+        # how high approach_velocity_30m_atr runs. Without this, a very
+        # fast approach can push the entry further than the pair typically
+        # retraces within the fill window at all — the window fix alone
+        # doesn't help if the target price itself is unreachable. Tune
+        # tighter for pairs that showed no-fill issues.
+        self.max_entry_push_atr = {
+            "EUR/USD": 1.0,
+            "GBP/USD": 1.0,
+            "USD/JPY": 1.2,
+            "XAU/USD": 1.5,
+        }
+        self.max_entry_push_atr_default = 1.2
+
+    def _fill_window_hours(self, symbol: str) -> float:
+        """Per-symbol override of adjust_fill_window_hours, falling back to
+        the flat default for any symbol not explicitly tuned."""
+        return self.adjust_fill_window_overrides.get(symbol, self.adjust_fill_window_hours)
+
+    def _exhaustion_score(self, features: Dict) -> float:
+        """Weighted composite of touch-bar exhaustion metrics, ~0 (clean
+        touch) to ~1.5+ (severe). See exhaustion_weights/caps above."""
+        score = 0.0
+        for key, weight in self.exhaustion_weights.items():
+            val = features.get(key, 0.0) or 0.0
+            cap = self.exhaustion_caps[key]
+            score += weight * min(val / cap, 1.5)
+        return round(score, 4)
 
     def _default_alert(self, signal: Dict):
         emoji = "🟢" if signal['direction'] == 'BUY' else "🔴"
-        print(f"\n🚨 ZONE HIT → {emoji} {signal['symbol']} {signal['direction']} "
+        tag   = f" (ADJUSTED — {signal.get('tier')})" if signal.get('adjusted') else ""
+        fill_note = " [LIMIT — awaiting fill]" if signal.get('pending_fill') else ""
+        print(f"\n🚨 ZONE HIT{tag} → {emoji} {signal['symbol']} {signal['direction']}{fill_note} "
               f"| Entry: {signal['entry']} | SL: {signal['sl']} | TP: {signal['tp']} "
               f"| Prob: {signal['probability']}%")
+        if signal.get('adjusted'):
+            print(f"    ↳ original was Entry: {signal.get('original_entry')} | "
+                  f"SL: {signal.get('original_sl')} | TP: {signal.get('original_tp')} "
+                  f"— {signal.get('adjustment_reason')}")
+
+    @staticmethod
+    def _compute_pre_entry_features(df, direction: str, pip_size: float) -> Dict:
+        """Same 8 features as backtest_replay.simulate_trigger_and_outcome's
+        approach_metrics, computed on live bars so live logs are directly
+        comparable to backtest results. `df` is 15min bars, most-recent bar
+        last (df.iloc[-1] = "now").
+        """
+        out = {}
+        try:
+            hi, lo, cl = df['high'], df['low'], df['close']
+            tr = pd.concat([hi - lo, (hi - cl.shift(1)).abs(), (lo - cl.shift(1)).abs()], axis=1).max(axis=1)
+            atr_15m = float(tr.rolling(14).mean().iloc[-1])
+            if not np.isfinite(atr_15m) or atr_15m <= 0:
+                atr_15m = pip_size * 10 if pip_size else 0.0010
+
+            b_touch = df.iloc[-1]
+            b_1ago  = df.iloc[-2] if len(df) >= 2 else b_touch
+            b_2ago  = df.iloc[-3] if len(df) >= 3 else b_1ago
+
+            if direction == 'BUY':
+                approach_vel_atr = (b_2ago['open'] - b_touch['low']) / atr_15m
+                touch_wick_atr   = (b_touch['close'] - b_touch['low']) / atr_15m
+            else:
+                approach_vel_atr = (b_touch['high'] - b_2ago['open']) / atr_15m
+                touch_wick_atr   = (b_touch['high'] - b_touch['close']) / atr_15m
+
+            pre_bar_range  = b_1ago['high'] - b_1ago['low']
+            pre_bar_size_atr = pre_bar_range / atr_15m
+            pre_body_ratio   = abs(b_1ago['close'] - b_1ago['open']) / (pre_bar_range + 1e-9)
+
+            touch_bar_range   = b_touch['high'] - b_touch['low']
+            touch_bar_size_atr = touch_bar_range / atr_15m
+            touch_body_ratio   = abs(b_touch['close'] - b_touch['open']) / (touch_bar_range + 1e-9)
+
+            consec = 0
+            for k in range(1, min(7, len(df))):
+                prev_b = df.iloc[-1 - k]
+                is_dir = (prev_b['close'] < prev_b['open']) if direction == 'BUY' else (prev_b['close'] > prev_b['open'])
+                if is_dir:
+                    consec += 1
+                else:
+                    break
+
+            out = {
+                "atr_15m":                     round(float(atr_15m), 6),
+                "approach_velocity_30m_atr":   round(float(approach_vel_atr), 3),
+                "pre_touch_bar_size_atr":      round(float(pre_bar_size_atr), 3),
+                "pre_touch_body_ratio":        round(float(pre_body_ratio), 3),
+                "touch_bar_size_atr":          round(float(touch_bar_size_atr), 3),
+                "touch_body_ratio":            round(float(touch_body_ratio), 3),
+                "touch_rejection_wick_atr":    round(float(touch_wick_atr), 3),
+                "consecutive_directional_bars": int(consec),
+            }
+        except Exception as e:
+            out = {"approach_metrics_error": str(e)}
+        return out
+
+    def _append_approach_log(self, event: str, sig: Dict, features: Dict,
+                              extra: Optional[Dict] = None):
+        """Append one JSONL record so approaching/touch samples accumulate
+        across live cycles for later hypothesis testing (e.g. via the same
+        pandas analysis used on the backtest replay output)."""
+        record = {
+            "logged_at": datetime.utcnow().isoformat(),
+            "event":     event,   # "approaching" (pre-touch) or "touch" (zone entered)
+            "symbol":    sig.get('symbol'),
+            "direction": sig.get('direction'),
+            "entry":     sig.get('entry'),
+            "sl":        sig.get('sl'),
+            "tp":        sig.get('tp'),
+            "probability": sig.get('probability'),
+            **features,
+        }
+        if extra:
+            record.update(extra)
+        try:
+            with open(self.approach_log_file, 'a') as f:
+                f.write(json.dumps(record) + "\n")
+        except Exception as e:
+            logger.warning(f"PriceMonitor: failed to write approach log — {e}")
+
+    def _recompute_final_signal(self, sig: Dict, sig_id: str, features: Dict,
+                                 zone_top: float, zone_bottom: float,
+                                 pred: 'ProductionForexPredictor') -> Dict:
+        """Stage-3 trigger-time recompute. Runs once price is inside the zone.
+
+        Decision, in order:
+          1. Compute _exhaustion_score() from the touch-bar metrics
+             (touch_rejection_wick_atr, consecutive_directional_bars,
+             touch_bar_size_atr, pre_touch_bar_size_atr,
+             approach_velocity_30m_atr). Add accel_score_bonus if the 5-min
+             bar right now is an accelerating "knife" (large range + solid
+             body vs 5min ATR) — this folds the old separate 5min-accel
+             check into the same score instead of it being independent.
+          2. score < exhaustion_mid_threshold  -> "unchanged", take as proposed.
+          3. score < exhaustion_high_threshold -> "adjust_mid": recompute
+             entry, SL, and TP, pushed/padded by tier_scale["mid"].
+          4. score >= exhaustion_high_threshold -> "adjust_high": same
+             recompute, pushed/padded harder by tier_scale["high"].
+
+        Both adjust tiers push the entry FURTHER in the direction price was
+        already moving when it touched the zone (wait for more of the
+        apparent sweep to happen before filling — this becomes a LIMIT order
+        at a price not yet reached, not a market fill) and pad the SL beyond
+        the observed rejection wick, since sl_overflow on real losses
+        (avg 8.6 pips, wick-correlated in the 16-trade replay read) is what
+        this is meant to absorb. TP is recomputed off the new risk distance
+        to hold the original R:R (floored at min_rr_floor), not left
+        floating.
+
+        Returns a dict: {"action": "unchanged"|"adjust_mid"|"adjust_high",
+                          "reason": str, "score": float,
+                          "final_signal": dict|None}
+        """
+        direction = sig.get('direction', 'BUY')
+        pip_size  = pred.pip_size
+
+        score = self._exhaustion_score(features)
+
+        # 5-min intrabar acceleration check. Deliberately NOT reusing the
+        # 15-min ATR here — 5-min bars need their own ATR (see
+        # refine_entry_with_5min elsewhere in this file for the same pattern).
+        accel_detected = False
+        try:
+            df5 = pred.fetch_bars(interval="5min", outputsize=30)
+            if df5 is not None and len(df5) >= 15:
+                hi5, lo5, cl5 = df5['high'], df5['low'], df5['close']
+                tr5 = pd.concat([hi5 - lo5, (hi5 - cl5.shift(1)).abs(), (lo5 - cl5.shift(1)).abs()], axis=1).max(axis=1)
+                atr_5m = float(tr5.rolling(14).mean().iloc[-1])
+                if not np.isfinite(atr_5m) or atr_5m <= 0:
+                    atr_5m = pip_size * 5
+
+                b = df5.iloc[-1]
+                bar_range = b['high'] - b['low']
+                if bar_range > 0:
+                    bar_size_atr = bar_range / atr_5m
+                    body_ratio   = abs(b['close'] - b['open']) / bar_range
+                    if bar_size_atr >= self.accel_bar_size_atr_min and body_ratio >= self.accel_body_ratio_min:
+                        accel_detected = True
+        except Exception as e:
+            logger.debug(f"PriceMonitor: 5min accel check failed for {sig_id} — {e}")
+
+        if accel_detected:
+            score = round(score + self.accel_score_bonus, 4)
+
+        if score < self.exhaustion_mid_threshold:
+            return {"action": "unchanged", "reason": f"score={score:.2f} — clean touch",
+                    "score": score, "final_signal": None}
+
+        tier  = "mid" if score < self.exhaustion_high_threshold else "high"
+        scale = self.tier_scale[tier]
+
+        orig_entry = float(sig['entry'])
+        orig_sl    = float(sig['sl'])
+        orig_tp    = float(sig['tp'])
+        atr_15m    = features.get("atr_15m") or (pip_size * 10)
+
+        sign = 1.0 if direction == "SELL" else -1.0  # push further into the direction price was already running
+
+        symbol = sig.get('symbol', '')
+
+        entry_push = self.entry_push_vel_atr * features.get("approach_velocity_30m_atr", 0.0) * atr_15m * scale
+        # Cap the push in ATR units so a very fast approach doesn't shove the
+        # entry further than this pair typically retraces within the fill
+        # window — otherwise widening the window alone doesn't help, because
+        # the target price itself becomes unreachable. See
+        # max_entry_push_atr / adjust_fill_window_overrides above.
+        max_push = self.max_entry_push_atr.get(symbol, self.max_entry_push_atr_default) * atr_15m
+        push_was_capped = entry_push > max_push
+        entry_push = min(entry_push, max_push)
+
+        sl_pad     = (self.sl_pad_base_atr + self.sl_pad_wick_atr * features.get("touch_rejection_wick_atr", 0.0)) * atr_15m * scale
+
+        new_entry = orig_entry + sign * entry_push
+        new_sl    = orig_sl + sign * sl_pad
+        new_risk  = abs(new_entry - new_sl)
+        if new_risk <= 0:
+            return {"action": "unchanged", "reason": "degenerate risk after recompute — kept original",
+                    "score": score, "final_signal": None}
+
+        orig_risk   = abs(orig_entry - orig_sl)
+        orig_reward = abs(orig_tp - orig_entry)
+        rr = max(orig_reward / orig_risk, self.min_rr_floor) if orig_risk > 0 else self.min_rr_floor
+        new_reward = new_risk * rr
+        new_tp = new_entry - sign * new_reward
+
+        final_signal = dict(sig)
+        final_signal.update({
+            "entry":       round(new_entry, 5),
+            "sl":          round(new_sl, 5),
+            "tp":          round(new_tp, 5),
+            "risk_pips":   round(new_risk / pip_size, 1),
+            "reward_pips": round(new_reward / pip_size, 1),
+            "risk_reward": f"1:{rr:.1f}",
+            "rr":          f"1:{rr:.1f}",
+            "adjusted":    True,
+            "tier":        tier,
+            "adjustment_reason": f"score={score:.2f} ({tier}) — entry pushed {entry_push / pip_size:.1f}p"
+                                  f"{' (capped)' if push_was_capped else ''}, "
+                                  f"SL padded {sl_pad / pip_size:.1f}p beyond original, TP recomputed to hold R:R {rr:.1f}",
+            "original_signal_id": sig_id,
+            "original_entry":  orig_entry,
+            "original_sl":      orig_sl,
+            "original_tp":      orig_tp,
+            "original_risk_pips": sig.get('risk_pips'),
+            # This is now a LIMIT order at a price the market hasn't reached
+            # yet, not a market-fill at current price — see check() below,
+            # which persists this back into signals_file with status still
+            # 'pending' so outcome tracking waits for the fill instead of
+            # assuming it happened immediately.
+            "pending_fill":         True,
+            "fill_deadline":        (datetime.utcnow() + timedelta(hours=self._fill_window_hours(symbol))).isoformat(),
+        })
+        return {
+            "action": f"adjust_{tier}",
+            "reason": final_signal["adjustment_reason"],
+            "score": score,
+            "final_signal": final_signal,
+        }
+
+    def _append_dual_signal_log(self, sig_id: str, original_sig: Dict,
+                                 decision: Dict, features: Dict):
+        """Persist original + final side by side (or the skip decision) so
+        outcomes can later be compared: did the recompute step actually help,
+        or would the raw original have done just as well / better?"""
+        record = {
+            "logged_at":           datetime.utcnow().isoformat(),
+            "original_signal_id":  sig_id,
+            "action":              decision["action"],
+            "reason":              decision["reason"],
+            "original_signal":     {k: original_sig.get(k) for k in
+                                     ("symbol", "direction", "entry", "sl", "tp",
+                                      "risk_pips", "reward_pips", "risk_reward", "probability")},
+            "final_signal":        decision.get("final_signal"),
+            "trigger_features":    features,
+        }
+        try:
+            with open(self.final_log_file, 'a') as f:
+                f.write(json.dumps(record) + "\n")
+        except Exception as e:
+            logger.warning(f"PriceMonitor: failed to write final signal log — {e}")
 
     def check(self):
         if not self.signals_file.exists():
@@ -3771,7 +4116,10 @@ class PriceZoneMonitor:
             if pred is None:
                 continue
 
-            df = pred.fetch_bars(interval="15min", outputsize=5)
+            # outputsize=30 (not 5) so ATR(14) and the consecutive-directional-bar
+            # lookback (up to 6 bars back) have enough history, matching the
+            # backtest replay's window.
+            df = pred.fetch_bars(interval="15min", outputsize=30)
             if df is None or len(df) == 0:
                 continue
 
@@ -3794,8 +4142,109 @@ class PriceZoneMonitor:
                            current_price <= zone_top + pred.pip_size * 2)
 
             if in_zone:
+                features = self._compute_pre_entry_features(df, direction, pred.pip_size)
+                atr_15m  = features.get("atr_15m", pred.pip_size * 10)
+                logger.info(
+                    f"🎯 [{symbol}] ZONE TOUCH DYNAMICS (30m pre-entry): "
+                    f"vel_30m={features.get('approach_velocity_30m_atr')}x ATR | "
+                    f"pre_bar={features.get('pre_touch_bar_size_atr')}x ATR "
+                    f"(body={features.get('pre_touch_body_ratio')}) | "
+                    f"rejection_wick={features.get('touch_rejection_wick_atr')}x ATR | "
+                    f"consec={features.get('consecutive_directional_bars')} bars"
+                )
+                self._append_approach_log("touch", sig, features,
+                                           extra={"trigger_price": bar_low if direction == 'BUY' else bar_high})
+
+                # ── Stage 3: trigger-time recompute ──────────────────────────
+                decision = self._recompute_final_signal(sig, sig_id, features, zone_top, zone_bot, pred)
+                self._append_dual_signal_log(sig_id, sig, decision, features)
+
                 self.alerted_signals.add(sig_id)
+
+                if decision["action"] == "unchanged":
+                    self.alert_callback(sig)
+                    continue
+
+                final_sig = decision["final_signal"]
+                if final_sig is None:
+                    # degenerate-risk fallback inside _recompute_final_signal
+                    self.alert_callback(sig)
+                    continue
+
+                logger.info(
+                    f"🔧 [{symbol}] SIGNAL ADJUSTED ({decision.get('score')}, {final_sig.get('tier')}) — "
+                    f"{decision['reason']} | orig entry {sig['entry']} -> final entry {final_sig['entry']} "
+                    f"| orig sl {sig['sl']} -> final sl {final_sig['sl']} "
+                    f"| orig tp {sig['tp']} -> final tp {final_sig['tp']} "
+                    f"(risk {sig.get('risk_pips')}p -> {final_sig.get('risk_pips')}p)"
+                )
+
+                # PERSIST the recomputed entry/sl/tp back into signals_file so
+                # downstream outcome tracking (SignalOutcomeTrackerV2, in
+                # outcome_tracker.py) watches the levels you're actually
+                # placing at the broker, not the original proposal. Without
+                # this, the alert shows the right numbers but the tracker
+                # would silently keep monitoring the stale original entry/
+                # sl/tp — same class of bug the "re-anchor timestamp" fix
+                # elsewhere in this file (save_signals_to_single_file) exists
+                # to prevent, applied here at the trigger-time recompute
+                # point instead of the re-detection point.
+                sig['entry']       = final_sig['entry']
+                sig['sl']          = final_sig['sl']
+                sig['tp']          = final_sig['tp']
+                sig['risk_pips']   = final_sig.get('risk_pips')
+                sig['reward_pips'] = final_sig.get('reward_pips')
+                sig['risk_reward'] = final_sig.get('risk_reward')
+                sig['rr']          = final_sig.get('rr')
+                sig['adjusted']         = True
+                sig['tier']             = final_sig.get('tier')
+                sig['adjustment_reason']= final_sig.get('adjustment_reason')
+                sig['original_entry']   = final_sig.get('original_entry')
+                sig['original_sl']      = final_sig.get('original_sl')
+                sig['original_tp']      = final_sig.get('original_tp')
+                sig['pending_fill']     = True
+                sig['fill_deadline']    = final_sig.get('fill_deadline')
+                # Status stays 'pending' — the new entry is a limit order not
+                # yet filled. Re-anchor timestamp so outcome tracking doesn't
+                # replay bars from before this exact (adjusted) zone existed.
+                sig['timestamp'] = now.isoformat()
+
+                try:
+                    with open(self.signals_file, 'w') as f:
+                        json.dump(all_sigs, f, indent=2, default=str)
+                except Exception as e:
+                    logger.warning(f"PriceMonitor: failed to persist adjusted signal {sig_id} — {e}")
+
                 self.alert_callback(sig)
+                continue
+
+            # ── Pre-touch "approaching" sample ───────────────────────────────
+            # Price hasn't reached the zone yet, but is close (within 0.5x ATR
+            # of the proximal edge). Log exactly one sample per signal here so
+            # we can later compare approach dynamics *before* touch against
+            # what actually happens at/after touch (the hypothesis being
+            # tested: does high pre-touch momentum predict sweeps/overflows?).
+            if sig_id not in self._approach_logged:
+                try:
+                    hi, lo, cl = df['high'], df['low'], df['close']
+                    tr = pd.concat([hi - lo, (hi - cl.shift(1)).abs(), (lo - cl.shift(1)).abs()], axis=1).max(axis=1)
+                    atr_now = float(tr.rolling(14).mean().iloc[-1])
+                    if not np.isfinite(atr_now) or atr_now <= 0:
+                        atr_now = pred.pip_size * 10
+
+                    proximal_edge = zone_top if direction == 'BUY' else zone_bot
+                    distance_atr  = abs(current_price - proximal_edge) / atr_now
+
+                    if distance_atr <= 0.5:
+                        features = self._compute_pre_entry_features(df, direction, pred.pip_size)
+                        self._append_approach_log(
+                            "approaching", sig, features,
+                            extra={"distance_to_zone_atr": round(distance_atr, 3),
+                                   "current_price": float(current_price)},
+                        )
+                        self._approach_logged.add(sig_id)
+                except Exception as e:
+                    logger.debug(f"PriceMonitor: approach-sample skipped for {sig_id} — {e}")
 
 
 
