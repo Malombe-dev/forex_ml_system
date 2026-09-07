@@ -40,6 +40,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Callable
 
+from milestone_tracking import evaluate_milestone, log_milestone_event, summarize_milestones
+
 logger = logging.getLogger(__name__)
 
 
@@ -234,11 +236,20 @@ class SignalOutcomeTrackerV2:
         pip_size: float             = 0.0001,
         entry_tolerance_pips: float = 0.5,
         expire_after_hours: float   = 48.0,
+        milestone_log_path: str     = None,
     ):
         self.signals_file          = Path(signals_file)
         self.pip_size              = pip_size
         self.entry_tolerance_pips  = entry_tolerance_pips
         self.expire_after_hours    = expire_after_hours
+        # Every TP1 hit's momentum evaluation (banked-at-TP1 or
+        # extended-to-TP2, and whether TP2 was actually achieved) is
+        # appended here as JSONL, one line per event. Defaults to a
+        # sibling file next to signals_file.
+        self.milestone_log_path = (
+            Path(milestone_log_path) if milestone_log_path
+            else self.signals_file.parent / f"{self.signals_file.stem}_milestones.jsonl"
+        )
 
     # ── Public API (same signature as original) ───────────────────────────────
     def check_outcomes(self, fetch_fn: Callable) -> Dict:
@@ -445,6 +456,32 @@ class SignalOutcomeTrackerV2:
                         _touch = _entry_bar.get("high") if direction == "SELL" else _entry_bar.get("low")
                         if _touch is not None:
                             sig["entry_slippage_pips"] = round(abs(float(_touch) - entry) / _pip, 2)
+
+                    # ── MILESTONE TP1/TP2 TRACKING (Method 1) ─────────────────
+                    # tp here is TP1 (the baseline target). Evaluate the touch
+                    # bar's momentum to decide whether the trade would have
+                    # locked profit and extended to TP2, log the decision, and
+                    # persist tp1/tp2 achievement onto the signal record.
+                    if new_status == Status.HIT_TP and _rb is not None:
+                        try:
+                            touch_time = _rb.get("time") or _rb.get("datetime")
+                            bars_after_tp1 = bars_after[bars_after["time"] > touch_time] \
+                                if "time" in bars_after.columns else bars_after.iloc[0:0]
+                            prior_bars_tp1 = df[df[time_col] < touch_time].tail(10)
+                            milestone = evaluate_milestone(
+                                touch_bar=_rb, bars_after=bars_after_tp1, direction=direction,
+                                entry=entry, tp1=tp, sl=sl, symbol=sig.get("symbol", ""), pip_size=_pip,
+                                prior_bars=prior_bars_tp1,
+                            )
+                            sig["milestone"] = milestone
+                            log_milestone_event(self.milestone_log_path, {
+                                "signal_id": sig.get("id", sig.get("signal_id")),
+                                "symbol": sig.get("symbol"), "direction": direction,
+                                "timestamp": sig.get("timestamp"),
+                                "entry": entry, "sl": sl, "tp1": tp, **milestone,
+                            })
+                        except Exception as e:
+                            logger.warning(f"OutcomeTrackerV2: milestone evaluation failed — {e}")
 
                     counts["updated"] += 1
 
@@ -653,6 +690,28 @@ class SignalOutcomeTrackerV2:
                         _ts.isoformat() if _ts is not None and hasattr(_ts, "isoformat")
                         else datetime.utcnow().isoformat()
                     )
+
+                    if new_status == Status.HIT_TP and _rb is not None:
+                        try:
+                            touch_time = _rb.get("time") or _rb.get("datetime")
+                            bars_after_tp1 = bars_after[bars_after["time"] > touch_time] \
+                                if "time" in bars_after.columns else bars_after.iloc[0:0]
+                            prior_bars_tp1 = df[df[time_col] < touch_time].tail(10)
+                            milestone = evaluate_milestone(
+                                touch_bar=_rb, bars_after=bars_after_tp1, direction=direction,
+                                entry=entry, tp1=tp, sl=sl, symbol=sig.get("symbol", ""), pip_size=_pip,
+                                prior_bars=prior_bars_tp1,
+                            )
+                            sig["milestone"] = milestone
+                            log_milestone_event(self.milestone_log_path, {
+                                "signal_id": sig.get("id", sig.get("signal_id")),
+                                "symbol": sig.get("symbol"), "direction": direction,
+                                "timestamp": sig.get("timestamp"),
+                                "entry": entry, "sl": sl, "tp1": tp, **milestone,
+                            })
+                        except Exception as e:
+                            logger.warning(f"OutcomeTrackerV2: milestone evaluation failed — {e}")
+
                     counts["updated"] += 1
 
                     if new_status == Status.HIT_TP:

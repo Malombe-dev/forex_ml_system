@@ -731,7 +731,7 @@ class ProductionForexPredictor:
                  continuation_prob_boost: float = 0.05,
                  use_htf_analysis: bool = True,
                  min_confluence_score: int = 4,
-                 zone_ttl_hours: float = 24.0,
+                 zone_ttl_hours: float = 48.0,
                  zone_distance_threshold: float = 50.0,
                  htf_fvg_min_gap_atr: float = 0.5,
                  htf_ob_min_reaction_atr: float = 2.0,
@@ -961,9 +961,9 @@ class ProductionForexPredictor:
         """
         is_gold = 'XAU' in symbol or 'GOLD' in symbol.upper()
         if zone_type == "OB":
-            multiplier = 3.0 if is_gold else 2.5
+            multiplier = 4.0 if is_gold else 3.5
         else:
-            multiplier = 1.5 if is_gold else 1.0   # FVGs — unchanged
+            multiplier = 2.2 if is_gold else 1.8
         return current_atr * multiplier / self.pip_size
 
     def _get_session(self, hour: int) -> str:
@@ -1969,6 +1969,68 @@ class ProductionForexPredictor:
                 swing_highs.append(hi)
         return swing_lows, swing_highs
 
+    def _calculate_dynamic_tp(self, direction: str, entry: float, zone_type: str,
+                              zone_size: float, zone_strength: float,
+                              htf_context: Optional[Dict], df: pd.DataFrame,
+                              fib_levels: Optional[Dict] = None) -> Tuple[float, float, Optional[str]]:
+        """
+        Mechanically calculates pair- and trade-specific Take-Profit target based on:
+          1. Pair baseline expansion profile (USD/JPY: 1.45, GBP/USD: 1.40, XAU/USD: 1.35, EUR/USD: 1.25)
+          2. HTF (D1 + 4H) trend alignment modifier (+0.20 if aligned, -0.15 if opposing)
+          3. Zone displacement strength modifier (+0.15 if strong, -0.10 if weak)
+          4. Opposing HTF structural clamping via _clamp_tp_to_structure
+        
+        Returns (clamped_tp, applied_multiplier, clamp_reason).
+        """
+        pair_baselines = {
+            'USD/JPY': 1.45,
+            'GBP/USD': 1.35,
+            'XAU/USD': 1.20,
+            'EUR/USD': 1.20,
+        }
+        m_pair = pair_baselines.get(self.symbol, 1.25)
+
+        d1_trend = 'neutral'
+        h4_trend = 'neutral'
+        if htf_context:
+            d1_trend = htf_context.get('d1_ema_trend', htf_context.get('d1_trend', 'neutral'))
+            h4_trend = htf_context.get('h4_structure', {}).get('trend', htf_context.get('htf_trend', 'neutral'))
+
+        is_buy = (direction == 'BUY')
+        d1_align = (d1_trend == 'bullish') if is_buy else (d1_trend == 'bearish')
+        h4_align = (h4_trend == 'bullish') if is_buy else (h4_trend == 'bearish')
+        d1_oppose = (d1_trend == 'bearish') if is_buy else (d1_trend == 'bullish')
+        h4_oppose = (h4_trend == 'bearish') if is_buy else (h4_trend == 'bullish')
+
+        if d1_align and h4_align:
+            delta_htf = 0.08
+        elif d1_oppose or h4_oppose:
+            delta_htf = -0.08
+        else:
+            delta_htf = 0.00
+
+        if zone_type == 'OB':
+            delta_str = 0.07 if zone_strength >= 3.5 else (-0.05 if zone_strength < 1.5 else 0.0)
+            base_multiplier = 1.5  # Standard OB baseline
+        else:  # FVG
+            delta_str = 0.07 if zone_strength >= 1.0 else (-0.05 if zone_strength < 0.7 else 0.0)
+            base_multiplier = 2.0  # Standard FVG baseline
+
+        m_total = max(1.0, round(m_pair + delta_htf + delta_str, 2))
+        effective_scale = base_multiplier * m_total
+
+        if is_buy:
+            tp_raw = entry + (zone_size * effective_scale)
+            if fib_levels and '0.5' in fib_levels:
+                tp_raw = max(fib_levels['0.5'], tp_raw)
+        else:
+            tp_raw = entry - (zone_size * effective_scale)
+            if fib_levels and '0.5' in fib_levels:
+                tp_raw = min(fib_levels['0.5'], tp_raw)
+
+        tp_clamped, clamp_reason = self._clamp_tp_to_structure(direction, entry, tp_raw, df, htf_context)
+        return tp_clamped, m_total, clamp_reason
+
     def _clamp_tp_to_structure(self, direction: str, entry: float, tp_raw: float,
                                 df: pd.DataFrame, htf_context: Optional[Dict],
                                 swing_lookback: int = 30) -> Tuple[float, Optional[str]]:
@@ -2552,12 +2614,22 @@ class ProductionForexPredictor:
             # so an ordinary wick past the edge doesn't stop the trade out.
             _gap      = abs(fvg['top'] - fvg['bottom'])
             _atr_buf  = df['atr'].iloc[-1] * 0.35 if 'atr' in df.columns else 0.0003
-            if direction == 'BUY':
-                entry = fvg['bottom'] + 0.75 * _gap   # 3/4 toward near edge (top)
-                sl    = fvg['bottom'] - _atr_buf      # past the real far edge, wick-buffered
+            is_gold   = ('XAU' in self.symbol.upper() or 'GOLD' in self.symbol.upper())
+            if is_gold:
+                _atr_buf = min(2.50, _atr_buf)
+                if direction == 'BUY':
+                    entry = fvg['bottom'] + 0.85 * _gap   # 85% toward near edge for Gold BUY (shallow pullback)
+                    sl    = fvg['bottom'] - _atr_buf
+                else:
+                    entry = fvg['top'] - 0.85 * _gap
+                    sl    = fvg['top'] + _atr_buf
             else:
-                entry = fvg['top'] - 0.75 * _gap      # 3/4 toward near edge (bottom)
-                sl    = fvg['top'] + _atr_buf         # past the real far edge, wick-buffered
+                if direction == 'BUY':
+                    entry = fvg['bottom'] + 0.75 * _gap   # 3/4 toward near edge (top)
+                    sl    = fvg['bottom'] - _atr_buf      # past the real far edge, wick-buffered
+                else:
+                    entry = fvg['top'] - 0.75 * _gap      # 3/4 toward near edge (bottom)
+                    sl    = fvg['top'] + _atr_buf         # past the real far edge, wick-buffered
 
             # ── D1/4H HARD BIAS AGREEMENT BLOCK (HTF FVG) ─────────────────────
             # BUY requires non-bearish D1 (EMA & structure) and 4H.
@@ -2593,13 +2665,18 @@ class ProductionForexPredictor:
             if direction == 'BUY'  and fvg['mid'] > current_price + atr_tol: htf_fvg_rejected['direction'] += 1; continue
             if direction == 'SELL' and fvg['mid'] < current_price - atr_tol: htf_fvg_rejected['direction'] += 1; continue
 
-            tp_target = (max(fib_levels.get('0.5', entry + fvg['size'] * 2), entry + fvg['size'] * 2)
-                         if direction == 'BUY' else
-                         min(fib_levels.get('0.5', entry - fvg['size'] * 2), entry - fvg['size'] * 2))
-
-            tp_target, _clamp_reason = self._clamp_tp_to_structure(direction, entry, tp_target, df, htf_context)
-            if self.debug and _clamp_reason:
-                print(f"     🎯 FVG TP {_clamp_reason}")
+            tp_target, _m_mult, _clamp_reason = self._calculate_dynamic_tp(
+                direction=direction,
+                entry=entry,
+                zone_type='FVG',
+                zone_size=fvg['size'],
+                zone_strength=fvg.get('strength', 0.8),
+                htf_context=htf_context,
+                df=df,
+                fib_levels=fib_levels
+            )
+            if self.debug:
+                print(f"     🎯 FVG Dynamic TP (mult={_m_mult:.2f}): {tp_target:.5f}" + (f" ({_clamp_reason})" if _clamp_reason else ""))
 
             risk   = abs(entry - sl)
             reward = abs(tp_target - entry)
@@ -2677,8 +2754,8 @@ class ProductionForexPredictor:
                 fvg_zone_for_model, df, tf, htf_context=htf_context,
                 zone_override=fvg_zone_for_model,
                 df_4h=df, df_1h=_df_1h, df_5m=_df_5m, df_d1=_df_d1)
-            # ML probability gate: respects self.prob_threshold (default 0.70 for reversion)
-            _ml_gate = self.prob_threshold if getattr(self, 'prob_threshold', None) is not None else 0.70
+            # ML probability gate: respects self.prob_threshold (default 0.60 for reversion)
+            _ml_gate = self.prob_threshold if getattr(self, 'prob_threshold', None) is not None else 0.60
 
             if base_prob < _ml_gate:
                 if self.debug:
@@ -2737,24 +2814,31 @@ class ProductionForexPredictor:
                     continue
 
             _atr_buf = df['atr'].iloc[-1] * 0.35 if 'atr' in df.columns else 0.0003
+            if 'XAU' in self.symbol.upper() or 'GOLD' in self.symbol.upper():
+                _atr_buf = min(2.50, _atr_buf)
             if direction == 'BUY':
                 entry = ob['top']               # proximal body edge for demand
-                sl    = ob['bottom'] - _atr_buf # distal wick + ATR buffer
+                sl    = ob['bottom'] - _atr_buf # distal wick + minimal ATR buffer
             else:
                 entry = ob['bottom']            # proximal body edge for supply
-                sl    = ob['top'] + _atr_buf    # distal wick + ATR buffer
+                sl    = ob['top'] + _atr_buf    # distal wick + minimal ATR buffer
 
             # Direction filter uses ob['mid'] — correctly identifies zone side
             # relative to price without being confused by the candle wick
             if direction == 'BUY'  and ob['mid'] > current_price + atr_tol: htf_ob_rejected['direction'] += 1; continue
             if direction == 'SELL' and ob['mid'] < current_price - atr_tol: htf_ob_rejected['direction'] += 1; continue
 
-            tp_raw = (entry + ob['reaction_size'] * 1.5 if direction == 'BUY'
-                    else entry - ob['reaction_size'] * 1.5)
-
-            tp_raw, _clamp_reason = self._clamp_tp_to_structure(direction, entry, tp_raw, df, htf_context)
-            if self.debug and _clamp_reason:
-                print(f"     🎯 OB TP {_clamp_reason}")
+            tp_raw, _m_mult, _clamp_reason = self._calculate_dynamic_tp(
+                direction=direction,
+                entry=entry,
+                zone_type='OB',
+                zone_size=ob['reaction_size'],
+                zone_strength=ob.get('strength', 2.0),
+                htf_context=htf_context,
+                df=df
+            )
+            if self.debug:
+                print(f"     🎯 OB Dynamic TP (mult={_m_mult:.2f}): {tp_raw:.5f}" + (f" ({_clamp_reason})" if _clamp_reason else ""))
 
             # For non-Gold pairs, clamp TP so RR never exceeds MAX_HTF_RR ceiling
             # Gold is untouched — its reaction_size already produces valid RR naturally
@@ -2890,8 +2974,8 @@ class ProductionForexPredictor:
                  'mid': ob['mid'], 'top': ob['top'], 'bottom': ob['bottom']},
                 df, tf, htf_context=htf_context, zone_override=full_ob_zone,
                 df_4h=df, df_1h=_df_1h, df_5m=_df_5m, df_d1=_df_d1)
-            # ML probability gate: respects self.prob_threshold (default 0.70 for reversion)
-            _ml_gate = self.prob_threshold if getattr(self, 'prob_threshold', None) is not None else 0.70
+            # ML probability gate: respects self.prob_threshold (default 0.60 for reversion)
+            _ml_gate = self.prob_threshold if getattr(self, 'prob_threshold', None) is not None else 0.60
 
             if base_prob < _ml_gate:
                 if self.debug:
@@ -3481,7 +3565,7 @@ class ProductionForexPredictor:
             # vs ~39% actual win rate, below 1:1.5 breakeven). Setting threshold >= 0.70 filters
             # out the underperforming 0.60–0.70 bucket while preserving the validated 0.70+ edge
             # (test set precision: 89.6% at 0.70+).
-            _base_threshold = self.prob_threshold if getattr(self, 'prob_threshold', None) is not None else (0.60 if is_cont else 0.70)
+            _base_threshold = self.prob_threshold if getattr(self, 'prob_threshold', None) is not None else 0.60
             effective_threshold = _base_threshold + (0.03 if counter_trend else 0.0)
             if base_probability < 0.55 or probability < effective_threshold:
                 rejected_cnt += 1
@@ -3792,25 +3876,23 @@ class PriceZoneMonitor:
         # isn't listed.
         self.adjust_fill_window_hours = 6.0
         self.adjust_fill_window_overrides = {
-            "EUR/USD": 10.0,
-            "GBP/USD": 10.0,
-            "USD/JPY": 8.0,
-            "XAU/USD": 6.0,
+            "EUR/USD": 13.5,
+            "GBP/USD": 13.5,
+            "USD/JPY": 13.0,
+            "XAU/USD": 12.0,
         }
 
         # Cap on how far entry can be pushed, in ATR units, regardless of
         # how high approach_velocity_30m_atr runs. Without this, a very
         # fast approach can push the entry further than the pair typically
-        # retraces within the fill window at all — the window fix alone
-        # doesn't help if the target price itself is unreachable. Tune
-        # tighter for pairs that showed no-fill issues.
+        # retraces within the fill window at all.
         self.max_entry_push_atr = {
-            "EUR/USD": 1.0,
-            "GBP/USD": 1.0,
-            "USD/JPY": 1.2,
-            "XAU/USD": 1.5,
+            "EUR/USD": 0.5,
+            "GBP/USD": 0.6,
+            "USD/JPY": 0.6,
+            "XAU/USD": 0.5,
         }
-        self.max_entry_push_atr_default = 1.2
+        self.max_entry_push_atr_default = 0.6
 
     def _fill_window_hours(self, symbol: str) -> float:
         """Per-symbol override of adjust_fill_window_hours, falling back to
@@ -3999,18 +4081,41 @@ class PriceZoneMonitor:
         sign = 1.0 if direction == "SELL" else -1.0  # push further into the direction price was already running
 
         symbol = sig.get('symbol', '')
+        is_gold = ('XAU' in symbol.upper() or 'GOLD' in symbol.upper())
+        is_jpy  = ('JPY' in symbol.upper())
 
-        entry_push = self.entry_push_vel_atr * features.get("approach_velocity_30m_atr", 0.0) * atr_15m * scale
-        # Cap the push in ATR units so a very fast approach doesn't shove the
-        # entry further than this pair typically retraces within the fill
-        # window — otherwise widening the window alone doesn't help, because
-        # the target price itself becomes unreachable. See
-        # max_entry_push_atr / adjust_fill_window_overrides above.
-        max_push = self.max_entry_push_atr.get(symbol, self.max_entry_push_atr_default) * atr_15m
+        # ── Wick Damping: if touch candle already formed a strong rejection wick, reduce entry push ──
+        touch_wick_atr = features.get("touch_rejection_wick_atr", 0.0) or 0.0
+        wick_damping = max(0.10, 1.0 - 0.60 * min(touch_wick_atr, 1.5))
+
+        entry_push = self.entry_push_vel_atr * features.get("approach_velocity_30m_atr", 0.0) * atr_15m * scale * wick_damping
+        
+        # Apply strict per-pair cap scaled by tier
+        if is_gold:
+            max_push = atr_15m * 0.50 * scale if atr_15m and atr_15m > 0 else 5.0 * scale
+        elif is_jpy:
+            max_push = 6.0 * pip_size * scale
+        elif 'GBP' in symbol.upper():
+            max_push = 6.0 * pip_size * scale
+        else:
+            max_push = 4.0 * pip_size * scale
+
         push_was_capped = entry_push > max_push
         entry_push = min(entry_push, max_push)
 
-        sl_pad     = (self.sl_pad_base_atr + self.sl_pad_wick_atr * features.get("touch_rejection_wick_atr", 0.0)) * atr_15m * scale
+        # Minimal baseline buffer to prevent minor sweep wick-outs
+        if is_gold:
+            baseline_sl_pad = 0.35 * atr_15m if atr_15m and atr_15m > 0 else 3.50
+        elif is_jpy:
+            baseline_sl_pad = 4.0 * pip_size
+        else:
+            baseline_sl_pad = 3.0 * pip_size
+
+        # ── Dynamic SL padding: combine base ATR cushion with observed rejection wick ──
+        dyn_sl_pad = (self.sl_pad_base_atr + self.sl_pad_wick_atr * touch_wick_atr) * atr_15m
+        # Prevent risk compression: SL pad must at least cover entry_push + baseline buffer,
+        # and absorb incoming momentum wicks (dyn_sl_pad).
+        sl_pad = max(baseline_sl_pad, dyn_sl_pad, entry_push + baseline_sl_pad)
 
         new_entry = orig_entry + sign * entry_push
         new_sl    = orig_sl + sign * sl_pad
@@ -4019,11 +4124,18 @@ class PriceZoneMonitor:
             return {"action": "unchanged", "reason": "degenerate risk after recompute — kept original",
                     "score": score, "final_signal": None}
 
-        orig_risk   = abs(orig_entry - orig_sl)
-        orig_reward = abs(orig_tp - orig_entry)
-        rr = max(orig_reward / orig_risk, self.min_rr_floor) if orig_risk > 0 else self.min_rr_floor
-        new_reward = new_risk * rr
-        new_tp = new_entry - sign * new_reward
+        # Preserve structural target if it provides adequate R:R (>= self.min_rr_floor),
+        # otherwise recompute off new risk to maintain the floor.
+        struct_reward = abs(orig_tp - new_entry)
+        struct_rr = struct_reward / new_risk if new_risk > 0 else 0.0
+        if struct_rr >= self.min_rr_floor:
+            new_tp = orig_tp
+            new_reward = struct_reward
+            final_rr = struct_rr
+        else:
+            new_reward = new_risk * self.min_rr_floor
+            new_tp = new_entry - sign * new_reward
+            final_rr = self.min_rr_floor
 
         final_signal = dict(sig)
         final_signal.update({
@@ -4032,13 +4144,13 @@ class PriceZoneMonitor:
             "tp":          round(new_tp, 5),
             "risk_pips":   round(new_risk / pip_size, 1),
             "reward_pips": round(new_reward / pip_size, 1),
-            "risk_reward": f"1:{rr:.1f}",
-            "rr":          f"1:{rr:.1f}",
+            "risk_reward": f"1:{final_rr:.1f}",
+            "rr":          f"1:{final_rr:.1f}",
             "adjusted":    True,
             "tier":        tier,
-            "adjustment_reason": f"score={score:.2f} ({tier}) — entry pushed {entry_push / pip_size:.1f}p"
+            "adjustment_reason": f"score={score:.2f} ({tier}) — entry pushed {entry_push / pip_size:.1f}p (wick_damped)"
                                   f"{' (capped)' if push_was_capped else ''}, "
-                                  f"SL padded {sl_pad / pip_size:.1f}p beyond original, TP recomputed to hold R:R {rr:.1f}",
+                                  f"SL buffered {sl_pad / pip_size:.1f}p, TP preserved/held R:R {final_rr:.1f}",
             "original_signal_id": sig_id,
             "original_entry":  orig_entry,
             "original_sl":      orig_sl,
@@ -4472,12 +4584,12 @@ def run_dual_strategy(symbols: Optional[List[str]] = None):
             encoders_path="models/encoders_v6_reversion.pkl",
             stats_path="models/training_stats_v6_reversion.pkl",
             symbol=sym,
-            prob_threshold=0.70,   # per disagreement_diagnostic_v2 STEP 4: 0.70 no-gate precision 89.6% (n=154)
+            prob_threshold=0.60,
             max_rr=8.0, min_risk_atr=2.5, max_distance_pips=p['max_distance_pips_rev'],  # min_risk_atr: 1.5→2.5
             min_strength_atr=0.50, use_5min_refinement=True,
             refine_max_dist_multiplier=2.0, enable_continuation=False,
             use_htf_analysis=True, min_confluence_score=1,
-            zone_ttl_hours=24.0, zone_distance_threshold=p['zone_distance_threshold'],
+            zone_ttl_hours=48.0, zone_distance_threshold=p['zone_distance_threshold'],
             htf_fvg_min_gap_atr=0.5, htf_ob_min_reaction_atr=2.5,
             is_continuation_strategy=False, require_zone_close=True, debug=True
         )
@@ -4493,7 +4605,7 @@ def run_dual_strategy(symbols: Optional[List[str]] = None):
             min_strength_atr=0.50, use_5min_refinement=True,
             refine_max_dist_multiplier=2.0, enable_continuation=True,
             use_htf_analysis=True, min_confluence_score=1,
-            zone_ttl_hours=24.0, zone_distance_threshold=p['zone_distance_threshold'],
+            zone_ttl_hours=48.0, zone_distance_threshold=p['zone_distance_threshold'],
             htf_fvg_min_gap_atr=0.5, htf_ob_min_reaction_atr=2.5,
             is_continuation_strategy=True, debug=True
         )
