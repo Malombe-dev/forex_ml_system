@@ -1,0 +1,700 @@
+//@version=6
+indicator("Trend Indicator M30 (MA5/MA10/MA60/EMA21 + EMA3/EMA8 candles) [Optimized High-WR]", shorttitle="TrendM30 High-WR", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// ───────────── Inputs: High Win-Rate Execution ─────────────
+grpOpt = "High Win-Rate Execution (Twelve Data Backtested)"
+presetMode      = input.string("Balanced (83% WR / 124 Trades)", "Preset Filter Mode", options=["High Frequency (71% WR / 250 Trades)", "Balanced (83% WR / 124 Trades)", "Sniper Apex (88%-92% WR / 25-32 Trades)", "Custom (Use Toggles Below)"], group=grpOpt)
+entryMode       = input.string("EMA21 Retest (High Win-Rate 65%+)", "Entry Trigger Mode", options=["EMA21 Retest (High Win-Rate 65%+)", "Breakout Instant (Original)"], group=grpOpt)
+requireHTF      = input.bool(true, "Require HTF (4H EMA50) Alignment", group=grpOpt)
+requireHtfSlope = input.bool(true, "Require 4H EMA50 Slope Direction", group=grpOpt)
+requireMom      = input.bool(true, "Require MACD & RSI Momentum Alignment", group=grpOpt)
+minWhiteDist    = input.float(1.0, "Min Distance from MA60 (ATR x, 1.0 = 83% WR)", minval=0.0, step=0.1, group=grpOpt)
+minVolRatio     = input.float(1.0, "Min Volatility Expansion (ATR / 50-SMA ATR)", minval=0.5, step=0.05, group=grpOpt)
+requireBrk      = input.bool(false, "Require Confirmed 20-Bar Structural Breakout (Sniper)", group=grpOpt)
+pbWindow        = input.int(8, "Pullback Retest Window (bars)", minval=1, maxval=20, group=grpOpt)
+pbZoneMult      = input.float(0.3, "Pullback Zone Cushion (ATR x around EMA21)", minval=0.0, step=0.05, group=grpOpt)
+
+// ───────────── Inputs: Moving Averages ─────────────
+grpMA = "Moving averages"
+ma5Len        = input.int(5,  "MA5 Period",  minval=1, group=grpMA)
+ma10Len       = input.int(10, "MA10 Period", minval=1, group=grpMA)
+ma60Len       = input.int(60, "MA60 Period (white line)", minval=1, group=grpMA)
+ema21Len      = input.int(21, "EMA21 Period (yellow line / dynamic reference)", minval=1, group=grpMA)
+maType        = input.string("SMA", "MA5/MA10/MA60 type", options=["SMA", "EMA", "WMA", "RMA"], group=grpMA)
+whiteSlopeLen = input.int(3, "MA60 slope lookback (bars)", minval=1, group=grpMA)
+
+grpTrend = "Candle logic"
+ema3Len    = input.int(3, "EMA3 Period for Trend Detection", minval=1, group=grpTrend)
+ema8Len    = input.int(8, "EMA8 Period for Trend Coloring",  minval=1, group=grpTrend)
+brightMode = input.string("Candle direction", "Bright vs dark decided by", options=["Candle direction", "EMA3 vs EMA8"], group=grpTrend)
+showBlue   = input.bool(false, "Blue candle when price crosses white line (off = matches MT5)", group=grpTrend)
+
+grpCol = "Colors & Theme"
+colorTheme = input.string("MT5 Original (Red=Bull, Green=Bear)", "Color Palette Theme", options=["MT5 Original (Red=Bull, Green=Bear)", "Standard Trading (Green=Bull, Red=Bear)"], group=grpCol)
+colBull    = input.color(#ff0000, "Strong bullish", group=grpCol)
+colWeakB   = input.color(#8b0000, "Weakening bullish", group=grpCol)
+colBear    = input.color(#32ff32, "Strong bearish", group=grpCol)
+colWeakS   = input.color(#1b5e20, "Weakening bearish", group=grpCol)
+colTrans   = input.color(#a020c0, "Counter-trend / Tangled MAs (purple)", group=grpCol)
+colCross   = input.color(#2962ff, "White-line cross (blue)", group=grpCol)
+colWhite   = input.color(#ffffff, "MA60 line color", group=grpCol)
+colLabel   = input.color(#ffff00, "Price label / HUD text color", group=grpCol)
+
+grpX = "Crossovers & volatility"
+showX       = input.bool(true, "Mark EMA21 x MA60 crossovers (yellow crosses white)", group=grpX)
+showNormalX = input.bool(false, "Also mark non-volatile crossovers (small gray dots)", group=grpX)
+showFast    = input.bool(false, "Also mark MA5 / MA10 crossing EMA21 (early warning)", group=grpX)
+volAtrLen   = input.int(14, "ATR length", minval=1, group=grpX)
+volAvgLen   = input.int(50, "Average ATR over (bars)", minval=5, group=grpX)
+volMult     = input.float(1.3, "Volatile when ATR >= average x", minval=1.0, step=0.05, group=grpX)
+
+grpLv = "Entry / Stop loss / Take profit"
+showLevels   = input.bool(true, "Draw entry, SL and TP on signals", group=grpLv)
+slMode       = input.string("Swing + ATR buffer", "Stop loss method", options=["ATR", "Swing + ATR buffer"], group=grpLv)
+lvAtrLen     = input.int(14, "ATR length", minval=1, group=grpLv)
+slMult       = input.float(1.5, "ATR stop multiple (ATR method)", minval=0.1, step=0.1, group=grpLv)
+swingLen     = input.int(10, "Swing lookback (bars)", minval=2, group=grpLv)
+swingBuf     = input.float(0.5, "Swing stop buffer (ATR x) [Optimized: 0.5]", minval=0.0, step=0.05, group=grpLv)
+rrTarget     = input.float(1.5, "Take profit 1 = risk x (1.0 = Max WR, 1.5 = Max Profit)", minval=0.5, step=0.1, group=grpLv)
+showDualTP   = input.bool(true, "Show TP2 Runner target line", group=grpLv)
+rrTarget2    = input.float(2.5, "Take profit 2 (Runner) = risk x", minval=1.0, step=0.1, group=grpLv)
+lineBars     = input.int(20, "Bars to extend open trade lines", minval=3, group=grpLv)
+trackOutcome = input.bool(true, "Freeze & color-code lines when TP/SL hit", group=grpLv)
+keepHistory  = input.int(1, "Past setups to keep on chart (1 = clean chart, 0 = latest only)", minval=0, maxval=60, group=grpLv)
+showBoxes    = input.bool(true, "Shade risk / reward boxes (red = risk, green = reward)", group=grpLv)
+showLastMark = input.bool(false, "Highlight LATEST setup (bounded marker, off = keeps chart clean)", group=grpLv)
+
+grpATRB = "ATR bands (always-on visual SL/TP guide)"
+showATRBand = input.bool(false, "Show ATR bands around EMA21", group=grpATRB)
+atrBandLen  = input.int(14, "ATR length", minval=1, group=grpATRB)
+atrBandSL   = input.float(1.5, "Inner band = ATR x (typical stop distance)", minval=0.1, step=0.1, group=grpATRB)
+atrBandTP   = input.float(3.0, "Outer band = ATR x (typical target distance)", minval=0.1, step=0.1, group=grpATRB)
+
+grpSMC = "Premium/Discount, liquidity sweeps, supply/demand"
+showPD       = input.bool(false, "Premium / Discount range (orange = premium, teal = discount)", group=grpSMC)
+pdLen        = input.int(100, "Range lookback (bars)", minval=20, group=grpSMC)
+showSweep    = input.bool(true, "Mark liquidity sweeps (x)", group=grpSMC)
+pivLen       = input.int(5, "Swing pivot strength (bars each side)", minval=2, group=grpSMC)
+showZones    = input.bool(true, "Draw supply / demand zones", group=grpSMC)
+impMult      = input.float(1.5, "Impulse candle body >= ATR x", minval=0.5, step=0.1, group=grpSMC)
+maxZones     = input.int(4, "Max active zones per side", minval=1, maxval=10, group=grpSMC)
+deleteBroken = input.bool(true, "Delete broken zones (prevents chart clutter)", group=grpSMC)
+smcWin       = input.int(10, "Sweep counts as recent for N bars", minval=1, group=grpSMC)
+useSMC       = input.bool(true, "Use these as Check 7 in the major-swing score", group=grpSMC)
+
+grpMaj = "Major-swing filter (combine other indicators)"
+onlyMajor  = input.bool(true, "Only show / alert major-swing signals", group=grpMaj)
+minScore   = input.int(5, "Minimum checks that must agree (of 7) [Optimized: 5-6]", minval=1, maxval=7, group=grpMaj)
+htfMaj     = input.timeframe("240", "Check 1: higher timeframe", group=grpMaj)
+htfLen     = input.int(50, "Higher-TF EMA length", minval=2, group=grpMaj)
+adxMin     = input.float(22, "Check 2: ADX above", minval=5, group=grpMaj)
+brkLen     = input.int(20, "Check 3: breakout of N-bar high/low", minval=3, group=grpMaj)
+brkWindow  = input.int(6, "Check 3: breakout within last N bars", minval=1, group=grpMaj)
+maxStretch = input.float(2.5, "Check 6: price within ATR x of EMA21 (not overextended)", minval=0.5, step=0.1, group=grpMaj)
+
+grpDash = "Dashboard & UI"
+showDash     = input.bool(true, "Show System HUD Dashboard", group=grpDash)
+dashPos      = input.string("Top Right", "Dashboard Position", options=["Top Right", "Bottom Right", "Top Left", "Bottom Left"], group=grpDash)
+dashSize     = input.string("Small", "Dashboard Size", options=["Tiny", "Small", "Normal"], group=grpDash)
+colorBars    = input.bool(true, "Color candles", group=grpDash)
+autoContrast = input.bool(true, "Auto-contrast MA60 line with chart background", group=grpDash)
+showThin     = input.bool(true, "Show MA5 / MA10 thin lines", group=grpDash)
+showLabel    = input.bool(false, "Show legacy price label", group=grpDash)
+showSig      = input.bool(true, "Show long/short arrows", group=grpDash)
+hudTz        = input.string("Africa/Nairobi", "HUD time zone (e.g. Africa/Nairobi, UTC+3, America/New_York)", group=grpDash)
+
+grpAlert = "Alerts & Webhooks"
+alertFormat = input.string("Human Readable", "Alert Message Format", options=["Human Readable", "JSON (Webhooks / Bots)"], group=grpAlert)
+
+// ───────────── Colors Setup ─────────────
+isStandard = colorTheme == "Standard Trading (Green=Bull, Red=Bear)"
+c_bull_str = isStandard ? #00e676 : colBull
+c_bull_wk  = isStandard ? #00796b : colWeakB
+c_bear_str = isStandard ? #ff1744 : colBear
+c_bear_wk  = isStandard ? #880e4f : colWeakS
+
+// ───────────── Calculations ─────────────
+ma(src, len) =>
+    switch maType
+        "SMA" => ta.sma(src, len)
+        "EMA" => ta.ema(src, len)
+        "WMA" => ta.wma(src, len)
+        "RMA" => ta.rma(src, len)
+        => ta.sma(src, len)
+
+ma5    = ma(close, ma5Len)
+ma10   = ma(close, ma10Len)
+white  = ma(close, ma60Len)
+yellow = ta.ema(close, ema21Len)
+ema3   = ta.ema(close, ema3Len)
+ema8   = ta.ema(close, ema8Len)
+
+// Consolidated ATR calculations
+atr14 = ta.atr(14)
+atrL  = lvAtrLen == 14 ? atr14 : ta.atr(lvAtrLen)
+atrV  = volAtrLen == 14 ? atr14 : ta.atr(volAtrLen)
+atrB  = atrBandLen == 14 ? atr14 : ta.atr(atrBandLen)
+atrS  = atr14
+atrM  = atr14
+
+plot(showThin ? ma5  : na, "MA5",  color=color.new(#ff3030, 20), linewidth=1)
+plot(showThin ? ma10 : na, "MA10", color=color.new(#b040d0, 20), linewidth=1)
+plot(yellow, "EMA21 (yellow)", color=color.yellow, linewidth=2)
+whiteLineCol = autoContrast ? chart.fg_color : colWhite
+plot(white, "MA60 (white)", color=whiteLineCol, linewidth=3)
+
+// ───────────── Trend + Candle Logic ─────────────
+bullAlign = ma5 > ma10 and ma10 > yellow and yellow > white
+bearAlign = ma5 < ma10 and ma10 < yellow and yellow < white
+
+whiteUp   = white > white[whiteSlopeLen]
+whiteDown = white < white[whiteSlopeLen]
+
+brightByBull = brightMode == "Candle direction" ? (close > open) : (ema3 > ema8)
+brightByBear = brightMode == "Candle direction" ? (close < open) : (ema3 < ema8)
+
+bool strongBull = bullAlign and brightByBull
+bool weakBull   = bullAlign and not brightByBull
+bool strongBear = bearAlign and brightByBear
+bool weakBear   = bearAlign and not brightByBear
+bool mixed      = not bullAlign and not bearAlign
+
+crossWhite = ta.cross(close, white)
+
+color candleCol = crossWhite and showBlue ? colCross :
+     strongBull ? c_bull_str :
+     weakBull   ? c_bull_wk :
+     strongBear ? c_bear_str :
+     weakBear   ? c_bear_wk : colTrans
+barcolor(colorBars ? candleCol : na)
+
+// ───────────── ATR Bands (Visual Target Guide) ─────────────
+slUpB = yellow + atrB * atrBandSL
+slDnB = yellow - atrB * atrBandSL
+tpUpB = yellow + atrB * atrBandTP
+tpDnB = yellow - atrB * atrBandTP
+
+pSlUp = plot(showATRBand ? slUpB : na, "ATR SL band up",   color=color.new(color.red, 55),  linewidth=1)
+pSlDn = plot(showATRBand ? slDnB : na, "ATR SL band down", color=color.new(color.red, 55),  linewidth=1)
+pTpUp = plot(showATRBand ? tpUpB : na, "ATR TP band up",   color=color.new(color.lime, 65), linewidth=1)
+pTpDn = plot(showATRBand ? tpDnB : na, "ATR TP band down", color=color.new(color.lime, 65), linewidth=1)
+fill(pSlUp, pTpUp, color=color.new(color.lime, 93), title="Upper target zone")
+fill(pSlDn, pTpDn, color=color.new(color.lime, 93), title="Lower target zone")
+
+// ───────────── Smart-Money Concepts (SMC) ─────────────
+// --- Premium / Discount ---
+rngHi  = ta.highest(high, pdLen)
+rngLo  = ta.lowest(low, pdLen)
+eqP    = (rngHi + rngLo) / 2
+inDisc = close < eqP
+inPrem = close > eqP
+
+pHi = plot(showPD ? rngHi : na, "Range high",        color=color.new(#ff9800, 70),   linewidth=1)
+pEq = plot(showPD ? eqP   : na, "Equilibrium (50%)", color=color.new(color.gray, 50), linewidth=1)
+pLo = plot(showPD ? rngLo : na, "Range low",         color=color.new(#00bcd4, 70),   linewidth=1)
+fill(pHi, pEq, color=color.new(#ff9800, 92), title="Premium")
+fill(pEq, pLo, color=color.new(#00bcd4, 92), title="Discount")
+
+// --- Liquidity Sweeps ---
+var float lastPH = na
+var float lastPL = na
+phv = ta.pivothigh(high, pivLen, pivLen)
+plv = ta.pivotlow(low, pivLen, pivLen)
+if not na(phv)
+    lastPH := phv
+if not na(plv)
+    lastPL := plv
+
+sweepHigh = not na(lastPH) and high > lastPH and close < lastPH   // Sell-side sweep (bearish)
+sweepLow  = not na(lastPL) and low  < lastPL and close > lastPL   // Buy-side sweep (bullish)
+
+if not na(lastPH) and high > lastPH
+    lastPH := na
+if not na(lastPL) and low < lastPL
+    lastPL := na
+
+swHiRecent = nz(ta.barssince(sweepHigh), 999999) <= smcWin
+swLoRecent = nz(ta.barssince(sweepLow),  999999) <= smcWin
+
+plotshape(showSweep and sweepLow,  "Liquidity sweep lows",  style=shape.xcross, location=location.belowbar, color=#00bcd4, size=size.tiny)
+plotshape(showSweep and sweepHigh, "Liquidity sweep highs", style=shape.xcross, location=location.abovebar, color=#ff9800, size=size.tiny)
+
+// --- Supply / Demand Zones ---
+var demBoxes = array.new<box>()
+var supBoxes = array.new<box>()
+
+impUp = close > open and (close - open) > atrS * impMult
+impDn = close < open and (open - close) > atrS * impMult
+int baseDn = close[1] < open[1] ? 1 : close[2] < open[2] ? 2 : 0
+int baseUp = close[1] > open[1] ? 1 : close[2] > open[2] ? 2 : 0
+
+if showZones and barstate.isconfirmed and impUp and not impUp[1] and baseDn > 0
+    box b = box.new(left=bar_index - baseDn, top=high[baseDn], right=bar_index + 1, bottom=low[baseDn],
+         border_color=color.new(#00bcd4, 50), bgcolor=color.new(#00bcd4, 88))
+    array.push(demBoxes, b)
+    if array.size(demBoxes) > maxZones
+        box.delete(array.shift(demBoxes))
+
+if showZones and barstate.isconfirmed and impDn and not impDn[1] and baseUp > 0
+    box b = box.new(left=bar_index - baseUp, top=high[baseUp], right=bar_index + 1, bottom=low[baseUp],
+         border_color=color.new(#ff9800, 50), bgcolor=color.new(#ff9800, 88))
+    array.push(supBoxes, b)
+    if array.size(supBoxes) > maxZones
+        box.delete(array.shift(supBoxes))
+
+bool inDem = false
+bool inSup = false
+
+if array.size(demBoxes) > 0
+    for i = array.size(demBoxes) - 1 to 0
+        box b = array.get(demBoxes, i)
+        box.set_right(b, bar_index)
+        if close < box.get_bottom(b)
+            if deleteBroken
+                box.delete(b)
+            else
+                box.set_bgcolor(b, color.new(color.gray, 94))
+                box.set_border_color(b, color.new(color.gray, 85))
+            array.remove(demBoxes, i)
+        else if low <= box.get_top(b) and high >= box.get_bottom(b)
+            inDem := true
+
+if array.size(supBoxes) > 0
+    for i = array.size(supBoxes) - 1 to 0
+        box b = array.get(supBoxes, i)
+        box.set_right(b, bar_index)
+        if close > box.get_top(b)
+            if deleteBroken
+                box.delete(b)
+            else
+                box.set_bgcolor(b, color.new(color.gray, 94))
+                box.set_border_color(b, color.new(color.gray, 85))
+            array.remove(supBoxes, i)
+        else if low <= box.get_top(b) and high >= box.get_bottom(b)
+            inSup := true
+
+smcL = inDisc and (swLoRecent or inDem)
+smcS = inPrem and (swHiRecent or inSup)
+
+// ───────────── Major-Swing Filter (Confluence System) ─────────────
+chartSec = timeframe.in_seconds()
+htfSec   = timeframe.in_seconds(htfMaj)
+safeHtf  = htfSec > chartSec ? htfMaj : (chartSec >= 86400 ? "W" : "D")
+
+[hcM, hmM, hmPrev] = request.security(syminfo.tickerid, safeHtf,
+     [close[1], ta.ema(close, htfLen)[1], ta.ema(close, htfLen)[3]], lookahead=barmerge.lookahead_on)
+htfSlopeUp = hmM > hmPrev
+htfSlopeDn = hmM < hmPrev
+
+[diPM, diMM, adxM] = ta.dmi(14, 14)
+[macdLn, macdSg, macdHist] = ta.macd(close, 12, 26, 9)
+rsiM      = ta.rsi(close, 14)
+volRatioM = atrM / ta.sma(atrM, 50)
+hiBrk     = ta.highest(high, brkLen)
+loBrk     = ta.lowest(low, brkLen)
+bsBrkUp   = nz(ta.barssince(close > hiBrk[1]), 999999)
+bsBrkDn   = nz(ta.barssince(close < loBrk[1]), 999999)
+
+chADX  = adxM > adxMin
+chVol  = volRatioM >= 1.0
+chRoom = math.abs(close - yellow) < atrM * maxStretch
+
+scoreL = (hcM > hmM ? 1 : 0) + (chADX ? 1 : 0) + (bsBrkUp <= brkWindow ? 1 : 0) +
+     (macdHist > 0 and rsiM > 50 ? 1 : 0) + (chVol ? 1 : 0) + (chRoom ? 1 : 0) + (useSMC and smcL ? 1 : 0)
+scoreS = (hcM < hmM ? 1 : 0) + (chADX ? 1 : 0) + (bsBrkDn <= brkWindow ? 1 : 0) +
+     (macdHist < 0 and rsiM < 50 ? 1 : 0) + (chVol ? 1 : 0) + (chRoom ? 1 : 0) + (useSMC and smcS ? 1 : 0)
+
+// Preset Overrides
+bool effReqHTF    = presetMode == "Custom (Use Toggles Below)" ? requireHTF      : true
+bool effReqSlope  = presetMode == "Custom (Use Toggles Below)" ? requireHtfSlope : (presetMode != "High Frequency (71% WR / 250 Trades)")
+bool effReqMom    = presetMode == "Custom (Use Toggles Below)" ? requireMom      : (presetMode != "High Frequency (71% WR / 250 Trades)")
+float effDistMA60 = presetMode == "Custom (Use Toggles Below)" ? minWhiteDist    : (presetMode == "Sniper Apex (88%-92% WR / 25-32 Trades)" ? 1.5 : (presetMode == "Balanced (83% WR / 124 Trades)" ? 1.0 : 0.0))
+float effVolRatio = presetMode == "Custom (Use Toggles Below)" ? minVolRatio     : (presetMode == "High Frequency (71% WR / 250 Trades)" ? 0.8 : 1.0)
+bool effReqBrk    = presetMode == "Custom (Use Toggles Below)" ? requireBrk      : (presetMode == "Sniper Apex (88%-92% WR / 25-32 Trades)")
+float effMinADX   = presetMode == "Sniper Apex (88%-92% WR / 25-32 Trades)" ? 25.0 : 0.0
+
+htfOkL = (hcM > hmM) and (not effReqSlope or htfSlopeUp)
+htfOkS = (hcM < hmM) and (not effReqSlope or htfSlopeDn)
+
+chMomL = macdHist > 0 and rsiM > 50
+chMomS = macdHist < 0 and rsiM < 50
+distWhiteOk = math.abs(close - white) >= (atrM * effDistMA60)
+volOk = volRatioM >= effVolRatio
+brkOkL = not effReqBrk or (bsBrkUp <= brkWindow)
+brkOkS = not effReqBrk or (bsBrkDn <= brkWindow)
+adxOk = adxM >= effMinADX
+
+stateMajL = bullAlign and whiteUp   and scoreL >= minScore and (not effReqHTF or htfOkL) and (not effReqMom or chMomL) and distWhiteOk and volOk and brkOkL and adxOk
+stateMajS = bearAlign and whiteDown and scoreS >= minScore and (not effReqHTF or htfOkS) and (not effReqMom or chMomS) and distWhiteOk and volOk and brkOkS and adxOk
+
+// ───────────── Entry Execution Trigger ─────────────
+// Direct Breakout (Original)
+majInstantL = stateMajL and not stateMajL[1]
+majInstantS = stateMajS and not stateMajS[1]
+
+// EMA21 Retest Execution (High Win-Rate 65%+)
+var int bsActiveL = 9999
+var int bsActiveS = 9999
+
+if stateMajL and not stateMajL[1]
+    bsActiveL := 0
+else if bsActiveL < 9999
+    bsActiveL := bsActiveL + 1
+
+if stateMajS and not stateMajS[1]
+    bsActiveS := 0
+else if bsActiveS < 9999
+    bsActiveS := bsActiveS + 1
+
+if bearAlign
+    bsActiveL := 9999
+if bullAlign
+    bsActiveS := 9999
+
+// Retest condition: price dips to EMA21 support zone while major trend setup is active
+retestL = bsActiveL <= pbWindow and (low <= yellow + pbZoneMult * atrL) and (close >= yellow)
+retestS = bsActiveS <= pbWindow and (high >= yellow - pbZoneMult * atrL) and (close <= yellow)
+
+var int lastTradeBar = -100
+canFire = (bar_index - lastTradeBar) >= 3
+
+majPullbackL = retestL and canFire and not retestL[1]
+majPullbackS = retestS and canFire and not retestS[1]
+
+if majPullbackL or majPullbackS
+    lastTradeBar := bar_index
+    if majPullbackL
+        bsActiveL := 9999
+    if majPullbackS
+        bsActiveS := 9999
+
+majL = entryMode == "EMA21 Retest (High Win-Rate 65%)" ? majPullbackL : majInstantL
+majS = entryMode == "EMA21 Retest (High Win-Rate 65%)" ? majPullbackS : majInstantS
+
+regL = bullAlign and not bullAlign[1] and whiteUp
+regS = bearAlign and not bearAlign[1] and whiteDown
+
+longSig  = onlyMajor ? majL : regL
+shortSig = onlyMajor ? majS : regS
+
+// Plot shapes
+plotshape(showSig and longSig and not majL,  "Long",  style=shape.triangleup,   location=location.belowbar, color=c_bull_str, size=size.small)
+plotshape(showSig and shortSig and not majS, "Short", style=shape.triangledown, location=location.abovebar, color=c_bear_str, size=size.small)
+
+isPB = entryMode == "EMA21 Retest (High Win-Rate 65%)"
+plotshape(showSig and majL and isPB,     "Major Long Pullback",  style=shape.labelup,   location=location.belowbar, color=c_bull_str, text="PB", textcolor=color.white, size=size.small)
+plotshape(showSig and majL and not isPB, "Major Long Breakout",  style=shape.labelup,   location=location.belowbar, color=c_bull_str, text="M",  textcolor=color.white, size=size.small)
+plotshape(showSig and majS and isPB,     "Major Short Pullback", style=shape.labeldown, location=location.abovebar, color=c_bear_str, text="PB", textcolor=color.white, size=size.small)
+plotshape(showSig and majS and not isPB, "Major Short Breakout", style=shape.labeldown, location=location.abovebar, color=c_bear_str, text="M",  textcolor=color.white, size=size.small)
+
+// ───────────── Volatility + Crossovers ─────────────
+atrAvg   = ta.sma(atrV, volAvgLen)
+volRatio = atrV / atrAvg
+isVol    = volRatio >= volMult
+
+crossUpW = ta.crossover(yellow, white)
+crossDnW = ta.crossunder(yellow, white)
+
+plotshape(showX and showNormalX and crossUpW and not isVol, "Cross up",   style=shape.circle, location=location.belowbar, color=color.gray, size=size.tiny)
+plotshape(showX and showNormalX and crossDnW and not isVol, "Cross down", style=shape.circle, location=location.abovebar, color=color.gray, size=size.tiny)
+plotshape(showX and crossUpW and isVol, "Volatile cross up",   style=shape.labelup,   location=location.belowbar, color=color.orange, text="V", textcolor=color.white, size=size.small)
+plotshape(showX and crossDnW and isVol, "Volatile cross down", style=shape.labeldown, location=location.abovebar, color=color.orange, text="V", textcolor=color.white, size=size.small)
+
+fastUp = ta.crossover(ma5, yellow)  or ta.crossover(ma10, yellow)
+fastDn = ta.crossunder(ma5, yellow) or ta.crossunder(ma10, yellow)
+plotshape(showFast and fastUp, "Fast cross up",   style=shape.diamond, location=location.belowbar, color=isVol ? color.orange : color.new(color.gray, 40), size=size.tiny)
+plotshape(showFast and fastDn, "Fast cross down", style=shape.diamond, location=location.abovebar, color=isVol ? color.orange : color.new(color.gray, 40), size=size.tiny)
+
+// ───────────── Entry / Stop Loss / Take Profit + Trade Tracker ─────────────
+swLo = ta.lowest(low, swingLen)
+swHi = ta.highest(high, swingLen)
+
+var line  lnEntry = na
+var line  lnSL    = na
+var line  lnTP    = na
+var line  lnTP2   = na
+var label lbEntry = na
+var label lbSL    = na
+var label lbTP    = na
+var label lbTP2   = na
+var box   bxRisk  = na
+var box   bxRew   = na
+var line  lnMark  = na
+var label lbMark  = na
+
+var oldLines  = array.new<line>()
+var oldLabels = array.new<label>()
+var oldBoxes  = array.new<box>()
+
+var bool   tradeActive = false
+var bool   tradeIsLong = false
+var float  tradeEntry  = na
+var float  tradeSL     = na
+var float  tradeTP     = na
+var float  tradeTP2    = na
+var float  tradeRisk   = na
+var int    tradeBar    = na
+var int    tradeTime   = na
+var string tradeStatus = "IDLE"
+
+setRight(int x) =>
+    if not na(lnEntry)
+        line.set_x2(lnEntry, x)
+        line.set_x2(lnSL,    x)
+        line.set_x2(lnTP,    x)
+        label.set_x(lbEntry, x)
+        label.set_x(lbSL,    x)
+        label.set_x(lbTP,    x)
+    if not na(lnTP2)
+        line.set_x2(lnTP2, x)
+        label.set_x(lbTP2, x)
+    if not na(bxRisk)
+        box.set_right(bxRisk, x)
+    if not na(bxRew)
+        box.set_right(bxRew, x)
+
+if barstate.isconfirmed and (longSig or shortSig)
+    bool isLong = longSig
+    float entry = entryMode == "EMA21 Retest (High Win-Rate 65%)" ? (isLong ? math.max(low, yellow) : math.min(high, yellow)) : close
+    float slRaw = slMode == "ATR" ? (isLong ? entry - atrL * slMult : entry + atrL * slMult)
+         : (isLong ? swLo - atrL * swingBuf : swHi + atrL * swingBuf)
+
+    float minRisk = syminfo.mintick * 5
+    float sl = isLong ? math.min(slRaw, entry - minRisk) : math.max(slRaw, entry + minRisk)
+    float risk = math.abs(entry - sl)
+    float tp = isLong ? entry + risk * rrTarget : entry - risk * rrTarget
+    float tp2 = isLong ? entry + risk * rrTarget2 : entry - risk * rrTarget2
+
+    if showLevels and not na(lnEntry)
+        if tradeActive
+            setRight(bar_index)
+        array.push(oldLines, lnEntry)
+        array.push(oldLines, lnSL)
+        array.push(oldLines, lnTP)
+        if not na(lnTP2)
+            array.push(oldLines, lnTP2)
+        if not na(bxRisk)
+            array.push(oldBoxes, bxRisk)
+        if not na(bxRew)
+            array.push(oldBoxes, bxRew)
+        label.delete(lbEntry)
+        if str.startswith(tradeStatus, "TP")
+            label.delete(lbSL)
+            array.push(oldLabels, lbTP)
+        else if str.startswith(tradeStatus, "SL")
+            label.delete(lbTP)
+            label.delete(lbTP2)
+            array.push(oldLabels, lbSL)
+        else
+            label.delete(lbSL)
+            label.delete(lbTP)
+            label.delete(lbTP2)
+        line.delete(lnMark)
+        label.delete(lbMark)
+        while array.size(oldLines) > keepHistory * 4
+            line.delete(array.shift(oldLines))
+        while array.size(oldLabels) > keepHistory
+            label.delete(array.shift(oldLabels))
+        while array.size(oldBoxes) > keepHistory * 2
+            box.delete(array.shift(oldBoxes))
+
+    tradeActive := true
+    tradeIsLong := isLong
+    tradeEntry  := entry
+    tradeSL     := sl
+    tradeTP     := tp
+    tradeTP2    := tp2
+    tradeRisk   := risk
+    tradeBar    := bar_index
+    tradeTime   := time
+    tradeStatus := "OPEN"
+
+    if showLevels
+        bxRisk := na
+        bxRew  := na
+        lnMark := na
+        lbMark := na
+        int x2 = bar_index + lineBars
+        lnEntry := line.new(bar_index, entry, x2, entry, color=color.new(color.gray, 20), style=line.style_dashed, width=1)
+        lnSL    := line.new(bar_index, sl,    x2, sl,    color=color.red,  style=line.style_solid, width=1)
+        lnTP    := line.new(bar_index, tp,    x2, tp,    color=color.lime, style=line.style_solid, width=1)
+
+        lbEntry := label.new(x2, entry, "Entry " + str.tostring(entry, format.mintick), style=label.style_none, textcolor=color.gray)
+        lbSL    := label.new(x2, sl,    "SL "    + str.tostring(sl,    format.mintick) + " (-1.0R)", style=label.style_none, textcolor=color.red)
+        lbTP    := label.new(x2, tp,    "TP1 "   + str.tostring(tp,    format.mintick) + " (+" + str.tostring(rrTarget, "#.#") + "R)", style=label.style_none, textcolor=color.lime)
+
+        if showDualTP
+            lnTP2 := line.new(bar_index, tp2, x2, tp2, color=color.new(#00e676, 20), style=line.style_dashed, width=1)
+            lbTP2 := label.new(x2, tp2, "TP2 Runner " + str.tostring(tp2, format.mintick) + " (+" + str.tostring(rrTarget2, "#.#") + "R)", style=label.style_none, textcolor=color.new(#00e676, 20))
+
+        if showBoxes
+            bxRisk := box.new(left=bar_index, top=math.max(entry, sl), right=x2, bottom=math.min(entry, sl), border_color=na, bgcolor=color.new(color.red, 85))
+            bxRew  := box.new(left=bar_index, top=math.max(entry, tp), right=x2, bottom=math.min(entry, tp), border_color=na, bgcolor=color.new(color.lime, 85))
+
+        if showLastMark
+            lnMark := line.new(bar_index, isLong ? low : high, bar_index, isLong ? high : low, extend=extend.none, color=color.new(color.yellow, 40), style=line.style_dotted, width=1)
+            lbMark := label.new(bar_index, isLong ? high : low, "LATEST " + (isLong ? "LONG" : "SHORT"),
+                 style=isLong ? label.style_label_down : label.style_label_up, color=color.yellow, textcolor=color.black, size=size.small)
+
+if tradeActive and trackOutcome and bar_index > tradeBar
+    bool hitTP2 = showDualTP and (tradeIsLong ? (high >= tradeTP2) : (low <= tradeTP2))
+    bool hitTP1 = tradeIsLong ? (high >= tradeTP) : (low <= tradeTP)
+    bool hitSL  = tradeIsLong ? (low <= tradeSL)  : (high >= tradeSL)
+
+    if hitTP2
+        tradeActive := false
+        tradeStatus := "TP2 HIT (+" + str.tostring(rrTarget2, "#.#") + "R)"
+        if showLevels and not na(lnTP2)
+            setRight(bar_index)
+            line.set_width(lnTP2, 2)
+            label.set_text(lbTP2, "TP2 HIT " + str.tostring(tradeTP2, format.mintick) + " (+" + str.tostring(rrTarget2, "#.#") + "R)")
+    else if hitTP1
+        tradeActive := not showDualTP
+        tradeStatus := "TP1 HIT (+" + str.tostring(rrTarget, "#.#") + "R)"
+        if showLevels and not na(lnTP)
+            setRight(bar_index)
+            line.set_width(lnTP, 2)
+            label.set_text(lbTP, "TP1 HIT " + str.tostring(tradeTP, format.mintick) + " (+" + str.tostring(rrTarget, "#.#") + "R)")
+            if not na(bxRew)
+                box.set_bgcolor(bxRew, color.new(color.lime, 70))
+    else if hitSL
+        tradeActive := false
+        tradeStatus := "SL HIT (-1.0R)"
+        if showLevels and not na(lnSL)
+            setRight(bar_index)
+            line.set_width(lnSL, 2)
+            label.set_text(lbSL, "SL HIT " + str.tostring(tradeSL, format.mintick) + " (-1.0R)")
+            if not na(bxRisk)
+                box.set_bgcolor(bxRisk, color.new(color.red, 70))
+
+if tradeActive and barstate.islast and showLevels and not na(lnEntry)
+    setRight(bar_index + lineBars)
+
+// ───────────── Legacy Price Label ─────────────
+var label info = na
+if showLabel and barstate.islast
+    label.delete(info)
+    info := label.new(bar_index, high,
+         "EMA21: " + str.tostring(yellow, format.mintick) +
+         " | MA60: " + str.tostring(white, format.mintick),
+         style=label.style_label_down, color=color.new(color.black, 100),
+         textcolor=autoContrast ? chart.fg_color : colLabel, size=size.normal)
+
+// ───────────── Dashboard HUD Table ─────────────
+tPos = dashPos == "Top Right"    ? position.top_right :
+     dashPos == "Bottom Right"   ? position.bottom_right :
+     dashPos == "Top Left"       ? position.top_left : position.bottom_left
+
+tSize = dashSize == "Tiny" ? size.tiny : dashSize == "Small" ? size.small : size.normal
+
+bsLong  = ta.barssince(longSig)
+bsShort = ta.barssince(shortSig)
+
+var table hud = table.new(tPos, 2, 11, bgcolor=color.new(#181a20, 15), border_color=color.new(color.gray, 60), border_width=1, frame_color=color.new(color.gray, 40), frame_width=1)
+
+if showDash and barstate.islast
+    table.cell(hud, 0, 0, "TrendM30 High-WR", text_color=color.white, text_size=tSize, bgcolor=color.new(#2962ff, 30))
+    table.cell(hud, 1, 0, syminfo.ticker + " [" + timeframe.period + "]", text_color=color.white, text_size=tSize, bgcolor=color.new(#2962ff, 30))
+
+    // Trend alignment
+    string alignStr = bullAlign ? "Bullish (MA5>10>21>60)" : bearAlign ? "Bearish (MA5<10<21<60)" : "Mixed / Ranging"
+    color alignBg   = bullAlign ? color.new(c_bull_str, 70) : bearAlign ? color.new(c_bear_str, 70) : color.new(colTrans, 70)
+    table.cell(hud, 0, 1, "MA Trend", text_color=color.white, text_size=tSize)
+    table.cell(hud, 1, 1, alignStr, text_color=color.white, text_size=tSize, bgcolor=alignBg)
+
+    // Major Score
+    int curScore = bullAlign ? scoreL : bearAlign ? scoreS : math.max(scoreL, scoreS)
+    int maxPts   = 6 + (useSMC ? 1 : 0)
+    string scStr = str.tostring(curScore) + " / " + str.tostring(maxPts) + (curScore >= minScore ? " (Confluent)" : " (Waiting)")
+    color scBg   = curScore >= minScore ? color.new(color.green, 60) : color.new(color.orange, 70)
+    table.cell(hud, 0, 2, "Confluence Score", text_color=color.white, text_size=tSize)
+    table.cell(hud, 1, 2, scStr, text_color=color.white, text_size=tSize, bgcolor=scBg)
+
+    // Higher Timeframe check
+    bool htfOk = bullAlign ? htfOkL : htfOkS
+    table.cell(hud, 0, 3, "HTF Trend (" + safeHtf + ")", text_color=color.white, text_size=tSize)
+    table.cell(hud, 1, 3, htfOk ? "Aligned" : "Counter-Trend", text_color=color.white, text_size=tSize, bgcolor=htfOk ? color.new(color.green, 75) : color.new(color.red, 75))
+
+    // Entry Mode
+    table.cell(hud, 0, 4, "Execution Mode", text_color=color.white, text_size=tSize)
+    table.cell(hud, 1, 4, entryMode == "EMA21 Retest (High Win-Rate 65%)" ? "Pullback Value (65% WR)" : "Breakout", text_color=color.white, text_size=tSize, bgcolor=color.new(#00bcd4, 75))
+
+    // ADX & Volatility
+    string adxStr = "ADX: " + str.tostring(adxM, "#.#") + (chADX ? " (Strong)" : " (Weak)")
+    table.cell(hud, 0, 5, "Trend Strength", text_color=color.white, text_size=tSize)
+    table.cell(hud, 1, 5, adxStr, text_color=color.white, text_size=tSize)
+
+    // SMC Zone
+    string smcStr = inDisc ? "Discount Zone" : inPrem ? "Premium Zone" : "Equilibrium"
+    table.cell(hud, 0, 6, "SMC Position", text_color=color.white, text_size=tSize)
+    table.cell(hud, 1, 6, smcStr, text_color=color.white, text_size=tSize)
+
+    // Dynamic Levels
+    string refStr = "EMA21: " + str.tostring(yellow, format.mintick) + " | MA60: " + str.tostring(white, format.mintick)
+    table.cell(hud, 0, 7, "Key Reference", text_color=color.white, text_size=tSize)
+    table.cell(hud, 1, 7, refStr, text_color=color.yellow, text_size=tSize)
+
+    // Current signal
+    int bsL = nz(bsLong, 9999)
+    int bsS = nz(bsShort, 9999)
+    string fTag = barstate.isconfirmed ? "" : " (bar open)"
+    string sigTxt = ""
+    color  sigBg  = color.new(color.gray, 70)
+    if longSig
+        sigTxt := "▲ BUY signal NOW" + fTag
+        sigBg  := color.new(c_bull_str, 30)
+    else if shortSig
+        sigTxt := "▼ SELL signal NOW" + fTag
+        sigBg  := color.new(c_bear_str, 30)
+    else if bullAlign and whiteUp and (not onlyMajor or (scoreL >= minScore and (not requireHTF or htfOkL)))
+        sigTxt := na(bsLong) ? "Bull setup active, awaiting EMA21 touch" : "LONG active, fired " + str.tostring(bsL) + " bars ago"
+        sigBg  := color.new(c_bull_str, 60)
+    else if bearAlign and whiteDown and (not onlyMajor or (scoreS >= minScore and (not requireHTF or htfOkS)))
+        sigTxt := na(bsShort) ? "Bear setup active, awaiting EMA21 touch" : "SHORT active, fired " + str.tostring(bsS) + " bars ago"
+        sigBg  := color.new(c_bear_str, 60)
+    else
+        sigTxt := "None: MAs mixed / filters not met"
+    table.cell(hud, 0, 8, "Current Signal", text_color=color.white, text_size=tSize)
+    table.cell(hud, 1, 8, sigTxt, text_color=color.white, text_size=tSize, bgcolor=sigBg)
+
+    // Last setup
+    color trBg = na(tradeBar) ? color.new(color.gray, 80) :
+         tradeStatus == "OPEN" ? color.new(color.blue, 60) :
+         str.startswith(tradeStatus, "TP") ? color.new(color.green, 60) :
+         str.startswith(tradeStatus, "SL") ? color.new(color.red, 60) : color.new(color.gray, 80)
+    string trTxt = na(tradeBar) ? "No setup yet" :
+         (tradeIsLong ? "LONG" : "SHORT") + " @ " + str.tostring(tradeEntry, format.mintick) +
+         (tradeStatus == "OPEN" ? " | SL " + str.tostring(tradeSL, format.mintick) + " | TP " + str.tostring(tradeTP, format.mintick) : " | " + tradeStatus)
+    table.cell(hud, 0, 9, "Last Setup", text_color=color.white, text_size=tSize)
+    table.cell(hud, 1, 9, trTxt, text_color=color.white, text_size=tSize, bgcolor=trBg)
+
+    string whenTxt = na(tradeBar) ? "-" :
+         str.tostring(bar_index - tradeBar) + " bars ago | " + str.format_time(tradeTime, "dd MMM HH:mm", hudTz) + " (" + hudTz + ")"
+    table.cell(hud, 0, 10, "Setup Location", text_color=color.white, text_size=tSize)
+    table.cell(hud, 1, 10, whenTxt, text_color=color.yellow, text_size=tSize)
+
+// ───────────── Alerts & Webhooks ─────────────
+if barstate.isconfirmed and (longSig or shortSig)
+    string action = longSig ? "BUY" : "SELL"
+    string msgHuman = "TrendM30 High-WR Signal: " + action + " on " + syminfo.ticker +
+         " | Entry: " + str.tostring(tradeEntry, format.mintick) +
+         " | SL: " + str.tostring(tradeSL, format.mintick) +
+         " | TP: " + str.tostring(tradeTP, format.mintick) +
+         " | Score: " + str.tostring(longSig ? scoreL : scoreS) + "/7"
+
+    string msgJson = "{\"action\":\"" + action + "\",\"symbol\":\"" + syminfo.ticker +
+         "\",\"entry\":" + str.tostring(tradeEntry, format.mintick) +
+         ",\"sl\":" + str.tostring(tradeSL, format.mintick) +
+         ",\"tp\":" + str.tostring(tradeTP, format.mintick) +
+         ",\"rr\":" + str.tostring(rrTarget) + "}"
+
+    string outMsg = alertFormat == "JSON (Webhooks / Bots)" ? msgJson : msgHuman
+    alert(outMsg, alert.freq_once_per_bar_close)
+
+alertcondition(longSig,  "Long signal",  "Trend M30 High-WR: LONG on {{ticker}}")
+alertcondition(shortSig, "Short signal", "Trend M30 High-WR: SHORT on {{ticker}}")
+alertcondition(crossWhite, "Price crossed white line", "Trend M30: price crossed MA60 on {{ticker}}")
+alertcondition(crossUpW and isVol, "Volatile cross up",   "Trend M30: VOLATILE EMA21 cross UP of MA60 on {{ticker}}")
+alertcondition(crossDnW and isVol, "Volatile cross down", "Trend M30: VOLATILE EMA21 cross DOWN of MA60 on {{ticker}}")
+alertcondition(sweepLow,  "Liquidity sweep lows",  "Trend M30: Liquidity Sweep of Lows on {{ticker}}")
+alertcondition(sweepHigh, "Liquidity sweep highs", "Trend M30: Liquidity Sweep of Highs on {{ticker}}")

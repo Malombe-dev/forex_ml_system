@@ -16,6 +16,11 @@ from feature_builder import build_feature_row
 from features import get_session as _canonical_get_session
 from outcome_tracker import SignalOutcomeTrackerV2
 from news_filter import ForexFactoryNewsFilter
+try:
+    from signal_advisor import advise as _advisor_advise   # shadow-mode advisor: labels only, never blocks
+except Exception:
+    _advisor_advise = None
+from zone_arrival_engine import ZoneState, ZoneArrivalConfig, evaluate_zone_step, compute_arrival_features
 
 warnings.filterwarnings('ignore')
 
@@ -28,7 +33,63 @@ logger = logging.getLogger(__name__)
 # the cache just prevents the duplicate within the same cycle.
 _SHARED_BAR_CACHE: Dict[tuple, Dict] = {}
 _SHARED_BAR_CACHE_LOCK = threading.Lock()
+
+# Closed-bars-only (parity with backtest_replay_patched.py --closed-bars-only).
+# Twelve Data returns the still-forming candle as the newest row. Scoring on it makes
+# zones/scores repaint every cycle and cannot be reproduced in replay. Set the env var
+# CLOSED_BARS_ONLY=0 to restore the old behaviour.
+CLOSED_BARS_ONLY = os.getenv("CLOSED_BARS_ONLY", "1") != "0"
+ADVISOR_GATE = os.getenv("ADVISOR_GATE", "1") != "0"
+# Bars (15m) after first zone touch during which a non-qualified signal is held and
+# re-checked (rejection wick forms AFTER the touch) before the gate finalizes it as SKIP.
+ADVISOR_RECHECK_BARS = int(os.getenv("ADVISOR_RECHECK_BARS", "6"))
+HTF_BIAS_GATE = os.getenv("HTF_BIAS_GATE", "0") != "0"   # Keep OFF (0) to match the +99R replay book
+TWO_STAGE_LIVE = os.getenv("TWO_STAGE_LIVE", "1") != "0"   # 1 = same execution logic as backtest --two-stage
+_BAR_MINUTES = {"5min": 5, "15min": 15, "1h": 60, "4h": 240, "1day": 1440}
+
+def _log_bar_fetch(symbol, interval, outputsize, df):
+    """Append one CSV row per API bar fetch so bar timing can be audited (logs/bar_checks.csv)."""
+    try:
+        os.makedirs("logs", exist_ok=True)
+        path = os.path.join("logs", "bar_checks.csv")
+        new = not os.path.exists(path)
+        last_open = df["time"].iloc[-1]
+        mins = _BAR_MINUTES.get(interval, 0)
+        now_utc = datetime.utcnow()
+        # raw gap between "now" and the close of the newest closed bar, in minutes.
+        # Provider/broker time offset is a constant, so look at how this VALUE behaves:
+        # it should sit steady (0..interval) once the offset is removed.
+        gap = (now_utc - (last_open + pd.Timedelta(minutes=mins))).total_seconds() / 60.0
+        dup = int(df["time"].duplicated().sum())
+        sorted_ok = bool(df["time"].is_monotonic_increasing)
+        steps = df["time"].diff().dropna().dt.total_seconds() / 60.0
+        irregular = int((steps != mins).sum()) if mins else 0   # gaps (weekend) or odd steps
+        with open(path, "a") as f:
+            if new:
+                f.write("utc_now,symbol,interval,outputsize,rows,newest_closed_open,gap_min,duplicates,sorted,irregular_steps\n")
+            f.write(f"{now_utc:%Y-%m-%d %H:%M:%S},{symbol},{interval},{outputsize},{len(df)},"
+                    f"{last_open},{gap:.1f},{dup},{sorted_ok},{irregular}\n")
+    except Exception as _e:
+        logger.debug(f"bar log failed: {_e}")
 _SHARED_BAR_CACHE_TTL  = 60.0   # seconds — long enough for REV→CONT within one cycle
+
+# Bar-boundary-aware cache: a frame stays valid until the next bar of that interval
+# can have closed (5m -> next 5m boundary, 15m -> next 15m boundary, 1h/4h/1d -> next
+# hourly boundary, which is cheap and avoids assuming how the provider aligns 4h/1d bars).
+_CACHE_GRACE_SECS   = 30     # provider may publish a new bar a few secs after the boundary
+_CYCLE_SECS         = int(os.getenv("CYCLE_SECS", "300"))       # monitor loop period (5 min)
+_SCAN_EVERY_SECS    = int(os.getenv("SCAN_EVERY_SECS", "900"))  # full signal scan period (15 min)
+_CYCLE_OFFSET_SECS  = 40     # run each cycle this long after the wall-clock boundary
+
+def _cache_expiry(interval: str, now: float = None) -> float:
+    now = time.time() if now is None else now
+    g = min(_BAR_MINUTES.get(interval, 15), 60) * 60
+    if (now % g) < _CACHE_GRACE_SECS:
+        # fetched right after a boundary: the provider may not have the new bar yet,
+        # so only trust this frame briefly and re-poll
+        return now + 60.0
+    return (int(now // g) + 1) * g
+
 
 class _RateLimiter:
     def __init__(self, max_calls: int = 7, window_seconds: float = 62.0):
@@ -143,10 +204,44 @@ class HTFInstitutionalAnalyzer:
 
     def __init__(self, pip_size: float = 0.0001,
                  fvg_min_gap_atr: float = 0.4,
-                 ob_min_reaction_atr: float = 1.8):
+                 ob_min_reaction_atr: float = 1.8,
+                 ob_drop_violated: bool = True,
+                 ob_require_unmitigated: bool = False,
+                 max_zone_age_hours: Optional[float] = None):
         self.pip_size = pip_size
         self.fvg_min_gap_atr = fvg_min_gap_atr
         self.ob_min_reaction_atr = ob_min_reaction_atr
+        # WIRING FIX (2026-09-17): these three were previously read via
+        # getattr(self, ..., default) inside detect_order_blocks/detect_fvg,
+        # but were only ever set as attributes on ProductionForexPredictor --
+        # a *different* object from this analyzer. They silently always fell
+        # back to their defaults. Now actually threaded through from the
+        # caller (see ProductionForexPredictor.__init__).
+        self.ob_drop_violated       = ob_drop_violated
+        self.ob_require_unmitigated = ob_require_unmitigated
+        # Stored as HOURS, not bars: this analyzer is called on 4H, 1H and
+        # daily bars from the same instance (see call sites at
+        # htf_trade_detect), so the hours->bars conversion has to happen
+        # per-call using each method's own `timeframe` argument, not once
+        # here. None = no cap (legacy behaviour).
+        self.max_zone_age_hours     = max_zone_age_hours
+
+    _TF_HOURS = {'4h': 4.0, '1h': 1.0, '1d': 24.0, 'daily': 24.0, '15m': 0.25}
+
+    def _max_zone_age_bars(self, timeframe: str) -> Optional[int]:
+        if self.max_zone_age_hours is None:
+            return None
+        # Scoped to 4H only. smc_detector.py's PRIMARY zone detection (what
+        # label_generator.py actually built the 30h touch-horizon labels
+        # from) runs on 4H bars -- see smc_detector.py header: "Primary
+        # detection on 4H, confirmed by 1H, entries on 15min." This class's
+        # 1H/daily order-block lists feed confluence checks (h1_trend_
+        # alignment etc.), not the trade candidates themselves, and I have
+        # no evidence those need the same cutoff -- leaving them uncapped
+        # rather than guessing.
+        if timeframe.lower() != '4h':
+            return None
+        return int(self.max_zone_age_hours / 4.0)
 
     def _recent_extreme(self, df: pd.DataFrame, lookback: int = 5) -> Dict:
         recent = df.tail(lookback)
@@ -157,8 +252,15 @@ class HTFInstitutionalAnalyzer:
         fvgs = []
         current_price = df['close'].iloc[-1]
         min_gap_atr = self.fvg_min_gap_atr
+        # TRAIN/LIVE PARITY: don't even scan candles old enough that a zone
+        # formed there could never have contributed a training label. See
+        # ProductionForexPredictor.max_zone_age_hours for the full rationale.
+        min_i = 2
+        _max_age = self._max_zone_age_bars(timeframe)
+        if _max_age is not None:
+            min_i = max(min_i, len(df) - 3 - _max_age)
 
-        for i in range(2, len(df) - 3):
+        for i in range(min_i, len(df) - 3):
             candle  = df.iloc[i]
             prev_c  = df.iloc[i - 1]
             next_c  = df.iloc[i + 1]
@@ -171,14 +273,20 @@ class HTFInstitutionalAnalyzer:
                 gap_size = next_c['low'] - prev_c['high']
                 if gap_size < atr * min_gap_atr:
                     continue
-                future_bars = df.iloc[i + 1:]
-                if (future_bars['low'] <= prev_c['high']).any():
-                    continue
-                if candle['close'] <= candle['open']:
-                    continue
                 top    = next_c['low']
                 bottom = prev_c['high']
                 mid    = (top + bottom) / 2
+                # FIX: was checking full-edge fill (prev_c['high'], 0% mitigation
+                # tolerance) -- smc_detector.py (training) uses the 50% midpoint
+                # instead. Changed to match, so live and training agree on when
+                # a gap counts as still-open vs already filled.
+                future_bars = df.iloc[i + 1:]
+                if (future_bars['low'] <= mid).any():
+                    continue
+                # FIX: middle-candle direction requirement removed -- not part
+                # of smc_detector.py's (training) FVG definition, which accepts
+                # any qualifying 3-candle gap regardless of the middle candle's
+                # own color.
                 fvgs.append({
                     'type': 'bullish', 'index': i, 'time': candle['time'],
                     'top': top, 'bottom': bottom, 'mid': mid,
@@ -192,14 +300,12 @@ class HTFInstitutionalAnalyzer:
                 gap_size = prev_c['low'] - next_c['high']
                 if gap_size < atr * min_gap_atr:
                     continue
-                future_bars = df.iloc[i + 1:]
-                if (future_bars['high'] >= prev_c['low']).any():
-                    continue
-                if candle['close'] >= candle['open']:
-                    continue
                 top    = prev_c['low']
                 bottom = next_c['high']
                 mid    = (top + bottom) / 2
+                future_bars = df.iloc[i + 1:]
+                if (future_bars['high'] >= mid).any():
+                    continue
                 fvgs.append({
                     'type': 'bearish', 'index': i, 'time': candle['time'],
                     'top': top, 'bottom': bottom, 'mid': mid,
@@ -209,47 +315,113 @@ class HTFInstitutionalAnalyzer:
                 })
         return fvgs
 
+    @staticmethod
+    def _zone_lifecycle(df: pd.DataFrame, i: int, top: float, bottom: float,
+                        bullish: bool, impulse_bars: int = 3) -> Dict:
+        """Classify what has happened to a zone since it formed at bar `i`.
+
+        LIFECYCLE FIX (2026-09-17). detect_fvg() already refuses to return a
+        gap that price has traded back through (see the `future_bars` /
+        midpoint check there), but detect_order_blocks() returned every block
+        it ever found, forever. That asymmetry is the source of the
+        untriggered-signal flood: a block from three weeks ago that price
+        blew clean through was still being offered as a live setup whenever
+        price wandered back within max_distance_pips of it.
+
+        Training never had this problem for free: label_generator evaluates
+        each zone exactly once, at its first touch after formation, so a
+        used-up or blown-through zone simply never appears again in the
+        training set. Live/replay rescans the last N bars on every pass and
+        so needs the lifecycle stated explicitly.
+
+        Returns:
+          violated  -- a later bar CLOSED beyond the far edge. The block is
+                       destroyed; it can never be a valid setup again.
+          mitigated -- price left the block after the impulse and has since
+                       traded back into it. The first touch (the only touch
+                       training ever scored) is already spent.
+        """
+        # Skip the impulse window itself: those bars are still leaving the
+        # block, so they trivially overlap it and would flag every block.
+        start = i + impulse_bars + 1
+        future = df.iloc[start:]
+        if future.empty:
+            return {'violated': False, 'mitigated': False}
+
+        if bullish:
+            violated = bool((future['close'] < bottom).any())
+            left = future['low'] > top
+        else:
+            violated = bool((future['close'] > top).any())
+            left = future['high'] < bottom
+
+        mitigated = False
+        if left.any():
+            first_left = int(np.argmax(left.values))
+            after = future.iloc[first_left:]
+            mitigated = bool((after['low'] <= top).any() if bullish
+                             else (after['high'] >= bottom).any())
+        return {'violated': violated, 'mitigated': mitigated}
+
     def detect_order_blocks(self, df: pd.DataFrame, timeframe: str = '4h') -> List[Dict]:
         obs = []
         current_price = df['close'].iloc[-1]
         min_reaction_atr = self.ob_min_reaction_atr
+        drop_violated        = self.ob_drop_violated
+        require_unmitigated  = self.ob_require_unmitigated
+        min_i = 5
+        _max_age = self._max_zone_age_bars(timeframe)
+        if _max_age is not None:
+            min_i = max(min_i, len(df) - 6 - _max_age)
 
-        for i in range(5, len(df) - 6):
+        for i in range(min_i, len(df) - 6):
             candle    = df.iloc[i]
             atr       = df['atr'].iloc[i]
             if pd.isna(atr) or atr <= 0:
                 continue
-            next_5    = df.iloc[i + 1:i + 6]
+            # FIX: was next_5 = df.iloc[i+1:i+6] (5-bar window). smc_detector.py
+            # (training) measures the reaction over 3 bars -- changed to match.
+            next_3    = df.iloc[i + 1:i + 4]
 
             # Bullish OB
             if candle['close'] < candle['open']:
-                impulse = next_5['high'].max() - candle['low']
+                impulse = next_3['high'].max() - candle['low']
                 if impulse >= atr * min_reaction_atr:
-                    future = df.iloc[i + 1:]
-                    if not (future['close'] < candle['low']).any():
-                        obs.append({
-                            'type': 'bullish', 'index': i, 'time': candle['time'],
-                            'top': candle['high'], 'bottom': candle['low'],
-                            'mid': (candle['high'] + candle['low']) / 2,
-                            'reaction_size': impulse, 'reaction_atr': impulse / atr,
-                            'distance_pips': abs(current_price - ((candle['high'] + candle['low']) / 2)) / self.pip_size,
-                            'violated': False, 'strength': impulse / atr
-                        })
+                    life = self._zone_lifecycle(df, i, candle['high'], candle['low'],
+                                                 bullish=True)
+                    if drop_violated and life['violated']:
+                        continue
+                    if require_unmitigated and life['mitigated']:
+                        continue
+                    obs.append({
+                        'type': 'bullish', 'index': i, 'time': candle['time'],
+                        'top': candle['high'], 'bottom': candle['low'],
+                        'mid': (candle['high'] + candle['low']) / 2,
+                        'reaction_size': impulse, 'reaction_atr': impulse / atr,
+                        'distance_pips': abs(current_price - ((candle['high'] + candle['low']) / 2)) / self.pip_size,
+                        'violated': life['violated'], 'mitigated': life['mitigated'],
+                        'strength': impulse / atr
+                    })
 
             # Bearish OB
             elif candle['close'] > candle['open']:
-                impulse = candle['high'] - next_5['low'].min()
+                impulse = candle['high'] - next_3['low'].min()
                 if impulse >= atr * min_reaction_atr:
-                    future = df.iloc[i + 1:]
-                    if not (future['close'] > candle['high']).any():
-                        obs.append({
-                            'type': 'bearish', 'index': i, 'time': candle['time'],
-                            'top': candle['high'], 'bottom': candle['low'],
-                            'mid': (candle['high'] + candle['low']) / 2,
-                            'reaction_size': impulse, 'reaction_atr': impulse / atr,
-                            'distance_pips': abs(((candle['high'] + candle['low']) / 2) - current_price) / self.pip_size,
-                            'violated': False, 'strength': impulse / atr
-                        })
+                    life = self._zone_lifecycle(df, i, candle['high'], candle['low'],
+                                                 bullish=False)
+                    if drop_violated and life['violated']:
+                        continue
+                    if require_unmitigated and life['mitigated']:
+                        continue
+                    obs.append({
+                        'type': 'bearish', 'index': i, 'time': candle['time'],
+                        'top': candle['high'], 'bottom': candle['low'],
+                        'mid': (candle['high'] + candle['low']) / 2,
+                        'reaction_size': impulse, 'reaction_atr': impulse / atr,
+                        'distance_pips': abs(((candle['high'] + candle['low']) / 2) - current_price) / self.pip_size,
+                        'violated': life['violated'], 'mitigated': life['mitigated'],
+                        'strength': impulse / atr
+                    })
         return obs
 
     def detect_market_structure_shift(self, df: pd.DataFrame) -> Dict:
@@ -330,7 +502,7 @@ class HTFInstitutionalAnalyzer:
         if score == 0:
             score = 1; factors.append('zone_structure')
 
-        session      = self._get_session(datetime.utcnow().hour)
+        session      = self._get_session(self._current_time().hour)
         distance_pips = abs(zone.get('distance_pips', 999))
         if session in ('london', 'ny') and distance_pips < 25:
             score += 1; factors.append('session_lq')
@@ -348,6 +520,14 @@ class HTFInstitutionalAnalyzer:
 
     def _get_session(self, hour: int) -> str:
         return _canonical_get_session(hour)
+
+    def _current_time(self) -> datetime:
+        """Single time source for anything session/time-of-day dependent.
+        Live: wall-clock UTC. Backtest replay must monkeypatch this to return
+        the simulated bar time (same pattern as fetch_bars) -- otherwise
+        datetime.utcnow() returns the moment 'run' was clicked, not the
+        historical bar's time."""
+        return datetime.utcnow()
 
 
 
@@ -493,11 +673,11 @@ def save_signals_to_single_file(signals: List[Dict],
             existing_signals = []
 
     # Resolved statuses that must never be overwritten
-    RESOLVED_STATUSES = {'hit_tp', 'hit_sl', 'expired', 'entry_missed'}
+    RESOLVED_STATUSES = {'hit_tp', 'hit_sl', 'expired', 'entry_missed', 'violated'}
 
     def get_signal_id(signal):
         sym   = str(signal.get('symbol', ''))
-        entry = float(signal.get('entry', 0))
+        entry = float(signal.get('original_entry') if signal.get('original_entry') is not None else signal.get('entry', 0))
         if 'XAU' in sym or 'GOLD' in sym.upper():
             pip_size = 1.0        # $1 = 1 pip, matches training convention
         elif 'JPY' in sym:
@@ -520,7 +700,8 @@ def save_signals_to_single_file(signals: List[Dict],
         else:
             bucket_width = pip_size * 0.5
         entry_bucketed = round(entry / bucket_width) * bucket_width
-        return (f"{sym}_{signal.get('direction')}_"
+        strat = signal.get('strategy', 'REVERSION')
+        return (f"{sym}_{strat}_{signal.get('direction')}_"
                 f"{entry_bucketed}_{signal.get('timeframe', '')}")
 
     existing_ids = {get_signal_id(s): i for i, s in enumerate(existing_signals)}
@@ -591,6 +772,7 @@ def save_signals_to_single_file(signals: List[Dict],
                 ex['reward_pips']  = signal.get('reward_pips', ex.get('reward_pips'))
                 ex['risk_reward']  = signal.get('risk_reward', ex.get('risk_reward'))
                 ex['rr']           = signal.get('rr',          ex.get('rr'))
+                ex['strategy']     = signal.get('strategy',    ex.get('strategy', 'REVERSION'))
                 ex['probability']      = float(signal.get('probability', 0))
                 ex['base_probability'] = float(signal.get('base_probability', signal.get('probability', 0)))
                 ex['confluence']    = signal.get('confluence',    ex.get('confluence'))
@@ -610,6 +792,16 @@ def save_signals_to_single_file(signals: List[Dict],
                     ex['cycle_history'].append(cur_ts)
                 ex['production_count'] = len(ex['cycle_history'])
 
+                # If the zone is already in active tracking (IN_ZONE), confirmed, or scored by advisor,
+                # freeze its geometry, timestamp, and evaluation! Do NOT overwrite with raw proposal levels.
+                if (ex.get('stage') in ('IN_ZONE', 'CONFIRMED', 'VIOLATED', 'EXPIRED')
+                        or ex.get('advisor_qualified') is not None
+                        or ex.get('adjusted')
+                        or ex.get('status') in ('in_zone', 'confirmed', 'skip_low_conviction', 'missed_confirmation')):
+                    ex['last_seen'] = cur_ts
+                    updated += 1
+                    continue
+
                 # Only update signals still awaiting entry
                 if ex.get('status') == 'pending':
                     # Snapshot BEFORE overwrite so we can tell whether the
@@ -626,6 +818,7 @@ def save_signals_to_single_file(signals: List[Dict],
                     ex['reward_pips']  = signal.get('reward_pips', ex.get('reward_pips'))
                     ex['risk_reward']  = signal.get('risk_reward', ex.get('risk_reward'))
                     ex['rr']           = signal.get('rr',          ex.get('rr'))
+                    ex['strategy']     = signal.get('strategy',    ex.get('strategy', 'REVERSION'))
 
                     # FIX: if entry/sl/tp changed, the zone the tracker should be
                     # watching is different from the one it was watching before —
@@ -737,6 +930,10 @@ class ProductionForexPredictor:
                  htf_ob_min_reaction_atr: float = 2.0,
                  is_continuation_strategy: bool = False,
                  require_zone_close: bool = False,
+                 ob_drop_violated: bool = True,
+                 ob_require_unmitigated: bool = False,
+                 max_zone_age_hours: float = 30.0,
+                 require_htf_bias_gate: bool = False,
                  debug: bool = False):
 
         self.api_key     = api_key
@@ -770,6 +967,53 @@ class ProductionForexPredictor:
         self.use_htf_analysis        = use_htf_analysis
         self.is_continuation_strategy = is_continuation_strategy
         self.require_zone_close       = require_zone_close  # IMPROVE: filter blown-through zones
+        # Order-block lifecycle gates -- see _zone_lifecycle() docstring.
+        #   ob_drop_violated:       block destroyed (a later bar CLOSED beyond
+        #                           its far edge). Safe default ON: a destroyed
+        #                           block can never be a valid setup again, so
+        #                           re-proposing it is never correct.
+        #   ob_require_unmitigated: block's first touch is already spent.
+        #                           Matches training semantics exactly but is
+        #                           aggressive -- leave OFF until A/B tested.
+        self.ob_drop_violated         = ob_drop_violated
+        self.ob_require_unmitigated   = ob_require_unmitigated
+        # TRAIN/LIVE PARITY (2026-09-17): label_generator.py's
+        # find_first_touch_index() only searches horizon_bars=120 15-min bars
+        # (30h) forward of zone FORMATION before giving up on that zone
+        # entirely -- an untouched zone past that point contributes no label
+        # at all (see label_generator.py:523-528). The model has literally
+        # zero training examples of a trade entered more than 30h after its
+        # zone formed. detect_order_blocks()/detect_fvg() used to scan the
+        # full lookback window with no age limit, so live routinely proposed
+        # setups on weeks-old zones the model was never trained to price --
+        # this is the root cause of both the untriggered-signal flood and
+        # the flat probability-vs-outcome calibration (any prob bucket can
+        # contain a mix of in-distribution and totally-unseen zones).
+        # Default matches training's horizon exactly; override only after
+        # re-running label_generator with a wider horizon_bars to match.
+        self.max_zone_age_hours       = max_zone_age_hours
+        # TRAIN/LIVE PARITY (2026-09-17): confirmed by direct search of
+        # label_generator.py, smc_detector.py and feature_builder.py -- zero
+        # occurrences of any bias-agreement or premium/discount HARD gate.
+        # Training never filters a zone on D1/4H trend agreement; it only
+        # ever feeds the model *graded* features for this (d1_premium_
+        # discount, h4_premium_discount, htf_trend_alignment) and lets the
+        # ensemble learn how much they matter. This live-only three-way
+        # hard block (D1 EMA + D1 structure + 4H trend must all agree)
+        # accounted for ~83% of all candidate rejections in the
+        # 2026-09-17 replay (6,122 of 7,414 rejections). Default OFF: the
+        # model already has the information these gates duplicate, learned
+        # on data these gates never touched. Set True only after an A/B
+        # replay shows it actually helps -- don't assume it does.
+        self.require_htf_bias_gate    = require_htf_bias_gate
+
+        # Time-of-day gate. Default OFF (both None). Do NOT enable until a
+        # replay run with the corrected 'session' field shows an edge that
+        # survives a cross-tab against symbol -- early data (n=1-4 per
+        # bucket, 7/12 'sydney/asia' trades were XAU) was noise.
+        # allowed_sessions: e.g. {'london', 'ny'}; blocked_hours: e.g. {21, 22}
+        self.allowed_sessions: Optional[set] = None
+        self.blocked_hours:    Optional[set] = None
 
         if not self.is_continuation_strategy:
             # TASK 1: REVERSION STRATEGY
@@ -801,7 +1045,10 @@ class ProductionForexPredictor:
         self.htf_analyzer = HTFInstitutionalAnalyzer(
             pip_size=self.pip_size,
             fvg_min_gap_atr=htf_fvg_min_gap_atr,
-            ob_min_reaction_atr=htf_ob_min_reaction_atr
+            ob_min_reaction_atr=htf_ob_min_reaction_atr,
+            ob_drop_violated=self.ob_drop_violated,
+            ob_require_unmitigated=self.ob_require_unmitigated,
+            max_zone_age_hours=self.max_zone_age_hours,
         )
 
         safe_sym = symbol.replace('/', '_')
@@ -827,7 +1074,7 @@ class ProductionForexPredictor:
         # (symbol, direction, price-bucket) and suppress re-firing within the
         # cooldown window.
         self._recent_zone_signals: Dict[str, datetime] = {}
-        self.zone_dedupe_cooldown_minutes: float = 30.0
+        self.zone_dedupe_cooldown_minutes: float = 360.0
 
         self.stats = {
             'total_iterations': 0, 'total_candidates': 0,
@@ -969,6 +1216,28 @@ class ProductionForexPredictor:
     def _get_session(self, hour: int) -> str:
         return _canonical_get_session(hour)
 
+    def _current_time(self) -> datetime:
+        """Single time source for anything session/time-of-day dependent.
+        Live: wall-clock UTC. Backtest replay must monkeypatch this to return
+        the simulated bar time (same pattern as fetch_bars) -- otherwise
+        datetime.utcnow() returns the moment 'run' was clicked, not the
+        historical bar's time."""
+        return datetime.utcnow()
+
+    def _time_gate_blocks(self, ts: Optional[datetime] = None) -> Tuple[bool, str]:
+        """Single-purpose time-of-day gate. Returns (blocked, reason).
+        No-op unless allowed_sessions / blocked_hours is configured.
+        Pass the bar/trigger time explicitly, or omit to use _current_time()
+        so live and replay share one time source."""
+        ts = ts or self._current_time()
+        if self.blocked_hours and ts.hour in self.blocked_hours:
+            return True, f"blocked_hour_{ts.hour:02d}"
+        if self.allowed_sessions:
+            sess = self._get_session(ts.hour)
+            if sess not in self.allowed_sessions:
+                return True, f"session_{sess}_not_allowed"
+        return False, ""
+
 
     def _calculate_indicators(self, df: pd.DataFrame):
         high       = df['high']
@@ -1008,13 +1277,33 @@ class ProductionForexPredictor:
             df[col] = df[col].fillna(df[col].median())
 
 
+    def _drop_forming_bars(self, df: pd.DataFrame, interval: str) -> pd.DataFrame:
+        """Keep only bars that have fully closed.
+
+        Completeness is judged against the newest 5-minute bar (its open time is
+        within 5 min of 'now'), so no timezone / DST assumption is needed: API bar
+        times are in Twelve Data's exchange timezone, not UTC.
+        A bar is kept when bar_open + interval <= open of the newest 5-min bar.
+        If the 5-min feed is unavailable, fall back to dropping the newest row.
+        """
+        mins = _BAR_MINUTES[interval]
+        if interval == "5min":
+            ref = df["time"].iloc[-1]                      # newest (forming) 5-min bar
+        else:
+            m5  = self.fetch_bars("5min", 60)              # already closed-only, shared-cached
+            ref = None if (m5 is None or m5.empty) else m5["time"].iloc[-1] + pd.Timedelta(minutes=5)
+        if ref is None:
+            logger.warning(f"closed-bars: no 5min reference for {interval}; dropping newest row")
+            return df.iloc[:-1].reset_index(drop=True)
+        keep = df[df["time"] + pd.Timedelta(minutes=mins) <= ref]
+        return keep.reset_index(drop=True)
+
     def fetch_bars(self, interval: str = "15min", outputsize: int = 200) -> Optional[pd.DataFrame]:
         cache_key = (self.symbol, interval, outputsize)
         with _SHARED_BAR_CACHE_LOCK:
             entry = _SHARED_BAR_CACHE.get(cache_key)
             if entry is not None:
-                age = time.time() - entry['ts']
-                if age < _SHARED_BAR_CACHE_TTL:
+                if time.time() < entry.get('exp', 0):
                     return entry['df']
                 # Stale entry — evict and re-fetch
                 del _SHARED_BAR_CACHE[cache_key]
@@ -1022,7 +1311,8 @@ class ProductionForexPredictor:
         endpoint = f"{self.base_url.rstrip()}/time_series"
         params   = {
             "symbol": self.symbol, "interval": interval,
-            "outputsize": outputsize, "apikey": self.api_key, "format": "JSON"
+            "outputsize": outputsize, "apikey": self.api_key, "format": "JSON",
+            "timezone": "UTC"
         }
 
         # Acquire a rate-limit slot — tries this predictor's own key first,
@@ -1073,13 +1363,32 @@ class ProductionForexPredictor:
         df = pd.DataFrame(df_data)
         df.sort_values("time", inplace=True)
         df.reset_index(drop=True, inplace=True)
+        if CLOSED_BARS_ONLY and interval in _BAR_MINUTES:
+            df = self._drop_forming_bars(df, interval)
+            if df.empty:
+                return None
+            _log_bar_fetch(self.symbol, interval, outputsize, df)
         df["avg_spread"] = 0.00005
         self._calculate_indicators(df)
 
         # Store in the shared cache so the sibling predictor (REV↔CONT) can
         # reuse these bars within the same 15-min cycle without a duplicate fetch.
+        # NOTE: the stale-frame check calls fetch_bars() again, so it must run OUTSIDE the cache
+        # lock (the lock is not re-entrant -> holding it here deadlocks cycle 1).
+        _exp = _cache_expiry(interval)
+        try:
+            if CLOSED_BARS_ONLY and interval in ("15min", "1h", "4h"):
+                _m5 = self.fetch_bars("5min", 60)
+                if _m5 is not None and len(_m5):
+                    _ref = _m5["time"].iloc[-1] + pd.Timedelta(minutes=5)
+                    if df["time"].iloc[-1] + pd.Timedelta(minutes=2 * _BAR_MINUTES[interval]) <= _ref:
+                        # a newer closed bar should exist but the provider has not published it yet
+                        _exp = min(_exp, time.time() + 45)
+                        logger.info(f"fetch_bars({self.symbol},{interval}): newest bar looks late - short cache")
+        except Exception:
+            pass
         with _SHARED_BAR_CACHE_LOCK:
-            _SHARED_BAR_CACHE[cache_key] = {'df': df, 'ts': time.time()}
+            _SHARED_BAR_CACHE[cache_key] = {'df': df, 'ts': time.time(), 'exp': _exp}
 
         return df
 
@@ -1516,7 +1825,7 @@ class ProductionForexPredictor:
 
         # ── Spread on SL (entry slip, once) ──────────────────────────────────
         session_spread = {'sydney': 1.5, 'asia': 1.2, 'london': 0.7, 'ny': 0.8}
-        spread_pips    = session_spread.get(self._get_session(datetime.utcnow().hour), 1.0)
+        spread_pips    = session_spread.get(self._get_session(self._current_time().hour), 1.0)
         spread_price   = spread_pips * self.pip_size
         sl   = sl - spread_price * 0.5 if is_buy else sl + spread_price * 0.5
         risk = abs(entry - sl)
@@ -1628,11 +1937,20 @@ class ProductionForexPredictor:
                          if 'atr' in df.columns and not pd.isna(df['atr'].iloc[-1])
                          else self.pip_size * 15)
 
-            # Last bar where price was within 1 ATR of the zone boundaries
+            # Bar where price first arrived within 1 ATR of the zone boundaries
+            # (Matches label_generator.find_first_touch_index)
+            _form_idx = int(zone.get('index', 0)) if int(zone.get('index', 0)) < len(df) else 0
             _near = (df['low']  <= _zone_top + _cur_atr) & \
                     (df['high'] >= _zone_bot - _cur_atr)
-            if _near.any():
-                _touch_index = int(_near.values.nonzero()[0][-1])
+
+            _near_after_form = _near.copy()
+            if 0 < _form_idx < len(df):
+                _near_after_form.iloc[:_form_idx] = False
+
+            if _near_after_form.any():
+                _touch_index = int(_near_after_form.values.nonzero()[0][0])
+            elif _near.any():
+                _touch_index = int(_near.values.nonzero()[0][0])
             else:
                 _touch_index = len(df) - 1   # fallback: current bar
 
@@ -1699,13 +2017,26 @@ class ProductionForexPredictor:
                         except Exception:
                             pass
             if _fingerprint not in _seen:
+                # ── Join-key fields — the replay report already writes zone_top,
+                # zone_bottom, symbol, and proposed_at/trigger_time for every
+                # signal. Mirroring the same zone_top/zone_bottom here (already
+                # computed above as _zone_top/_zone_bot) plus the actual
+                # historical bar time (not the wall-clock logging timestamp)
+                # lets the two files be joined on
+                # (symbol, round(zone_top,5), round(zone_bottom,5), evaluated_at)
+                # instead of the old age/rsi/touch_count zone_id, which has no
+                # relationship to anything in the replay output.
+                _evaluated_at = df['time'].iloc[_touch_index] if 'time' in df.columns else None
                 _log_entry = {
-                    'timestamp': datetime.utcnow().isoformat(),
-                    'symbol':    self.symbol,
-                    'zone_id':   (f"{self.symbol}_age{_d.get('zone_age_bars')}"
-                                  f"_rsi{round(_d.get('rsi', 0), 1)}"
-                                  f"_touch{_d.get('zone_touch_count')}"),
-                    'features':  {k: round(float(v), 6) for k, v in _d.items()},
+                    'timestamp':    datetime.utcnow().isoformat(),
+                    'symbol':       self.symbol,
+                    'zone_id':      (f"{self.symbol}_age{_d.get('zone_age_bars')}"
+                                      f"_rsi{round(_d.get('rsi', 0), 1)}"
+                                      f"_touch{_d.get('zone_touch_count')}"),
+                    'zone_top':     round(float(_zone_top), 5),
+                    'zone_bottom':  round(float(_zone_bot), 5),
+                    'evaluated_at': _evaluated_at.isoformat() if _evaluated_at is not None else None,
+                    'features':     {k: round(float(v), 6) for k, v in _d.items()},
                 }
                 with open(_log_file, 'a') as _lf:
                     _lf.write(json.dumps(_log_entry) + '\n')
@@ -1867,7 +2198,7 @@ class ProductionForexPredictor:
         # called standalone (e.g. outside the main per-cycle batch path).
         _df_1h = df_1h if df_1h is not None else self.fetch_bars(interval="1h",   outputsize=100)
         _df_4h = df_4h if df_4h is not None else self.fetch_bars(interval="4h",   outputsize=100)
-        _df_5m = df_5m if df_5m is not None else self.fetch_bars(interval="5min", outputsize=60)
+        _df_5m = df_5m if df_5m is not None else self.fetch_bars(interval="5min", outputsize=300)
         _df_d1 = df_d1 if df_d1 is not None else self.fetch_bars(interval="1day", outputsize=90)
 
         return self._predict(zone, df, entry, sl,
@@ -1888,16 +2219,16 @@ class ProductionForexPredictor:
             zone_type = zone_override.get('type', 'demand')
             entry = (zone_override['price_high'] if zone_type == 'demand'
                      else zone_override['price_low'])
-            risk  = max(abs(entry - (zone_override['price_low'] if zone_type == 'demand'
-                                     else zone_override['price_high'])),
-                        current_atr * self.min_risk_atr)
-            sl = entry - risk if zone_type == 'demand' else entry + risk
+            # Training used native zone width + 0.15 ATR buffer for feature extraction
+            zone_width = abs(zone_override['price_high'] - zone_override['price_low'])
+            feature_risk = max(zone_width, current_atr * 0.15)
+            feature_sl = entry - feature_risk if zone_type == 'demand' else entry + feature_risk
             _df_1h = df_1h if df_1h is not None else self.fetch_bars(interval="1h",   outputsize=100)
             _df_4h = df_4h if df_4h is not None else self.fetch_bars(interval="4h",   outputsize=100)
-            _df_5m = df_5m if df_5m is not None else self.fetch_bars(interval="5min", outputsize=60)
-            _df_d1 = df_d1 if df_d1 is not None else self.fetch_bars(interval="1day", outputsize=30)
+            _df_5m = df_5m if df_5m is not None else self.fetch_bars(interval="5min", outputsize=300)
+            _df_d1 = df_d1 if df_d1 is not None else self.fetch_bars(interval="1day", outputsize=90)
             return self.apply_boost_ceiling(
-                self._predict(zone_override, df, entry, sl,
+                self._predict(zone_override, df, entry, feature_sl,
                               df_1h=_df_1h, df_4h=_df_4h, df_5m=_df_5m, df_d1=_df_d1), 0)
         current_atr = df['atr'].iloc[-1]
         if pd.isna(current_atr) or current_atr <= 0:
@@ -1933,14 +2264,152 @@ class ProductionForexPredictor:
             'confluence': overlap_count,  # integer, training-compatible
             'index': actual_idx, 'htf_alignment': htf_align
         }
+        zone_width = abs(zone_top - zone_bot)
+        feature_risk = max(zone_width, current_atr * 0.15)
         if zone_type == 'demand':
-            entry = zone_top; risk = max(entry - zone_bot, current_atr * self.min_risk_atr); sl = entry - risk
+            entry = zone_top; feature_sl = entry - feature_risk
         else:
-            entry = zone_bot; risk = max(zone_top - entry, current_atr * self.min_risk_atr); sl = entry + risk
+            entry = zone_bot; feature_sl = entry + feature_risk
 
-        return self.apply_boost_ceiling(self._predict(full_zone, df, entry, sl,
-                                                       df_1h=df_1h, df_4h=df_4h,
-                                                       df_5m=df_5m, df_d1=df_d1), 0)
+        _df_1h = df_1h if df_1h is not None else self.fetch_bars(interval="1h",   outputsize=100)
+        _df_4h = df_4h if df_4h is not None else self.fetch_bars(interval="4h",   outputsize=100)
+        _df_5m = df_5m if df_5m is not None else self.fetch_bars(interval="5min", outputsize=300)
+        _df_d1 = df_d1 if df_d1 is not None else self.fetch_bars(interval="1day", outputsize=90)
+
+        return self.apply_boost_ceiling(self._predict(full_zone, df, entry, feature_sl,
+                                                       df_1h=_df_1h, df_4h=_df_4h,
+                                                       df_5m=_df_5m, df_d1=_df_d1), 0)
+
+    @staticmethod
+    def _json_safe(v):
+        """numpy/pandas scalars -> plain JSON types (json.dump(default=str) would stringify np.int64/np.bool_)."""
+        if isinstance(v, (bool, np.bool_)):
+            return bool(v)
+        if isinstance(v, (np.integer,)):
+            return int(v)
+        if isinstance(v, (np.floating,)):
+            f = float(v)
+            return f if np.isfinite(f) else None
+        if isinstance(v, float):
+            return v if np.isfinite(v) else None
+        if isinstance(v, (int, str)) or v is None:
+            return v
+        return str(v)
+
+    def _make_rescore_ctx(self, kind: str, tf: str, zone: Dict, df: pd.DataFrame,
+                          formation_idx, base_prob: float) -> Optional[Dict]:
+        """
+        Snapshot of EXACTLY what the model was fed at proposal time, stored on the signal so the
+        same score can be recomputed at arrival with fresh bars (rescore_at_arrival).
+        formation_time is the 4H bar the zone formed on; the zone's integer 'index' is a position
+        in a rolling frame that shifts every bar, so it is re-derived from this time at arrival.
+        """
+        try:
+            ft = df['time'].iloc[int(formation_idx)]
+            return {
+                'v': 1, 'kind': kind, 'tf': tf,
+                'zone': {k: self._json_safe(v) for k, v in zone.items()},
+                'formation_time': pd.Timestamp(ft).isoformat(),
+                'prob_at_proposal': round(float(base_prob), 4),
+            }
+        except Exception as e:
+            logger.debug(f"_make_rescore_ctx skipped ({kind}): {e}")
+            return None
+
+    def rescore_at_arrival(self, sig: Dict, now_broker: datetime) -> Dict:
+        """
+        Re-run the SAME model call the scan used (_ml_score_htf_zone with zone_override), but with
+        the arrival-dependent inputs refreshed from bars that are CLOSED as of `now_broker`:
+          - approach_distance / approach_momentum / candle_body_ratio  (15m, last closed bar)
+          - m5_micro_bos / m5_sweep_confirmation / m5_entry_candle_quality  (5m)
+          - h1_* confluence fields and D1 htf_alignment
+          - zone 'index' (re-derived from formation_time) so build_feature_row sees the same bar
+            semantics as the scan, and touch_index (computed inside _predict from the fresh 4H frame)
+        Formation-time properties (strength, confluence, touch_count) are kept as stored.
+        Scoring geometry is deliberately the scan's (entry at proximal edge, zone-based SL), NOT the
+        recomputed trade levels, so the model sees the same geometry it was trained on.
+
+        Fail-safe: returns {'ok': False, 'reason': ...} on ANY problem; callers keep the proposal score.
+        """
+        out: Dict = {'ok': False, 'reason': None}
+        ctx = sig.get('rescore_ctx')
+        if not ctx:
+            out['reason'] = 'no_rescore_ctx'
+            return out
+        try:
+            tf, kind   = ctx['tf'], ctx['kind']
+            zone       = dict(ctx['zone'])
+            direction  = sig.get('direction')
+            formation  = pd.Timestamp(ctx['formation_time'])
+
+            def _closed(frame, minutes):
+                if frame is None or len(frame) == 0:
+                    return frame
+                keep = (pd.to_datetime(frame['time']) + timedelta(minutes=minutes) <= now_broker).values
+                return frame[keep].reset_index(drop=True)
+
+            # Same frames / sizes the scan uses (generate_signals), so shared caches are hit live.
+            df_tf  = self.fetch_bars(interval=tf, outputsize=200)
+            df_15m = _closed(self.fetch_bars(interval="15min", outputsize=700), 15)
+            df_5m  = _closed(self.fetch_bars(interval="5min",  outputsize=300), 5)
+            df_1h  = self.fetch_bars(interval="1h",   outputsize=100)
+            df_d1  = self.fetch_bars(interval="1day", outputsize=90)
+            if df_d1 is not None and len(df_d1) > 0 and 'time' in df_d1.columns:
+                _today = pd.Timestamp(now_broker.date())
+                df_d1 = df_d1[pd.to_datetime(df_d1['time']).dt.normalize() < _today].copy()
+                if len(df_d1) == 0:
+                    df_d1 = None
+
+            if df_tf is None or len(df_tf) < 50:
+                out['reason'] = 'no_tf_bars'; return out
+            if df_15m is None or len(df_15m) < 5:
+                out['reason'] = 'no_15m_bars'; return out
+
+            # Re-derive the zone index exactly as the scan derived it.
+            if kind == 'OB':
+                _matched = (pd.to_datetime(df_15m['time']) <= formation).values
+                if not _matched.any():
+                    out['reason'] = 'formation_out_of_15m_window'; return out
+                zone['index'] = int(_matched.nonzero()[0][-1])
+            else:
+                _times = pd.to_datetime(df_tf['time'])
+                _pos = int(_times.searchsorted(formation))
+                if _pos >= len(_times) or _times.iloc[_pos] != formation:
+                    out['reason'] = 'formation_out_of_tf_window'; return out
+                zone['index'] = _pos
+
+            top, bot  = zone['price_high'], zone['price_low']
+            refreshed = ['index']
+            if 'approach_distance' in zone:
+                zone.update(self._get_15min_approach(top, bot, direction, df_15m))
+                refreshed += ['approach_distance', 'approach_momentum', 'candle_body_ratio']
+            if 'm5_micro_bos' in zone:
+                zone.update(self._check_5min_entry(top, bot, direction, df_5m))
+                refreshed += ['m5_micro_bos', 'm5_sweep_confirmation', 'm5_entry_candle_quality']
+            if 'h1_trend_alignment' in zone:
+                _h1 = self._check_1h_confluence(top, bot, direction, df_1h)
+                for _k in ('h1_trend_alignment', 'h1_structure_shift', 'h1_displacement', 'h1_liquidity_sweep'):
+                    zone[_k] = _h1[_k]
+                refreshed += ['h1_trend_alignment', 'h1_structure_shift', 'h1_displacement', 'h1_liquidity_sweep']
+            if 'htf_alignment' in zone:
+                zone['htf_alignment'] = self._check_d1_alignment(direction, df_d1)
+                refreshed.append('htf_alignment')
+
+            prob = float(self._ml_score_htf_zone(
+                zone, df_tf, tf, htf_context=None, zone_override=zone,
+                df_4h=df_tf, df_1h=df_1h, df_5m=df_5m, df_d1=df_d1))
+            out.update({
+                'ok': True, 'prob': prob, 'prob_pct': round(prob * 100, 1),
+                'prob_at_proposal_pct': round(float(ctx.get('prob_at_proposal', float('nan'))) * 100, 1),
+                'refreshed': refreshed,
+                # _predict returns exactly 0.5 when feature building fails; flag it rather than trust it.
+                'suspect_default_prob': bool(abs(prob - 0.5) < 1e-12),
+            })
+            return out
+        except Exception as e:
+            out['reason'] = f'error: {e}'
+            logger.warning(f"rescore_at_arrival failed for {sig.get('symbol')}: {e}")
+            return out
 
     def apply_boost_ceiling(self, base: float, boost: float) -> float:
         return min(base, 0.95)
@@ -2458,7 +2927,7 @@ class ProductionForexPredictor:
         # hours old. Using it caused the bias gate and dist filter to run on a
         # frozen price. 15min bars have a 15-minute close which is always live.
         _df_15m = df_15m if df_15m is not None else self.fetch_bars(interval="15min", outputsize=700)
-        _df_5m  = df_5m  if df_5m  is not None else self.fetch_bars(interval="5min",  outputsize=60)
+        _df_5m  = df_5m  if df_5m  is not None else self.fetch_bars(interval="5min",  outputsize=300)
         _df_1h  = df_1h  if df_1h  is not None else self.fetch_bars(interval="1h",    outputsize=100)
         _df_d1  = df_d1  if df_d1  is not None else self.fetch_bars(interval="1day",  outputsize=90)
 
@@ -2542,6 +3011,17 @@ class ProductionForexPredictor:
         def _build_setup(zone_obj, zone_type_str, direction, entry, sl, tp_target,
                          risk, reward, rr, base_prob, conf_str, confirmations):
             final_prob = base_prob
+            z_top = round(zone_obj.get('top', zone_obj.get('price_high', entry)), 5)
+            z_bot = round(zone_obj.get('bottom', zone_obj.get('price_low', sl)), 5)
+
+            # Two-Stage Execution Architecture:
+            # If current price is already inside the zone, initialize as IN_ZONE; otherwise ARMED.
+            if direction == 'BUY':
+                is_in_zone = (current_price <= z_top and current_price >= z_bot - (2 * self.pip_size))
+            else:
+                is_in_zone = (current_price >= z_bot and current_price <= z_top + (2 * self.pip_size))
+            init_stage = ZoneState.IN_ZONE if is_in_zone else ZoneState.ARMED
+
             return {
                 'timestamp':    datetime.utcnow().isoformat(),
                 'symbol':       self.symbol,
@@ -2577,8 +3057,13 @@ class ProductionForexPredictor:
                 'htf_trend':    htf_context.get('h4_structure', {}).get('trend', 'unknown') if htf_context else 'unknown',
                 '1h_trend':     htf_context.get('h1_trend', 'unknown') if htf_context else 'unknown',
                 # Zone body boundaries — required by PriceZoneMonitor for Step 3 body check
-                'zone_top':     round(zone_obj.get('top', zone_obj.get('price_high', entry)), 5),
-                'zone_bottom':  round(zone_obj.get('bottom', zone_obj.get('price_low', sl)), 5),
+                'zone_top':     z_top,
+                'zone_bottom':  z_bot,
+                'zone_mid':     round((z_top + z_bot) / 2.0, 5),
+                'stage':        init_stage,
+                'status':       init_stage.lower(),
+                'sweep_extreme': round(current_price if is_in_zone else entry, 5),
+                'bars_in_zone': 1 if is_in_zone else 0,
             }
 
         # FVGs
@@ -2613,17 +3098,27 @@ class ProductionForexPredictor:
             # — the zone's actual invalidation point — plus a small ATR buffer
             # so an ordinary wick past the edge doesn't stop the trade out.
             _gap      = abs(fvg['top'] - fvg['bottom'])
-            _atr_buf  = df['atr'].iloc[-1] * 0.35 if 'atr' in df.columns else 0.0003
+            _atr_val  = df['atr'].iloc[-1] if 'atr' in df.columns else (self.pip_size * 10)
             is_gold   = ('XAU' in self.symbol.upper() or 'GOLD' in self.symbol.upper())
+            is_jpy    = ('JPY' in self.symbol.upper())
             if is_gold:
-                _atr_buf = min(2.50, _atr_buf)
+                _atr_buf = max(3.50, _atr_val * 0.35)
                 if direction == 'BUY':
                     entry = fvg['bottom'] + 0.85 * _gap   # 85% toward near edge for Gold BUY (shallow pullback)
                     sl    = fvg['bottom'] - _atr_buf
                 else:
                     entry = fvg['top'] - 0.85 * _gap
                     sl    = fvg['top'] + _atr_buf
+            elif is_jpy:
+                _atr_buf = max(4.0 * self.pip_size, _atr_val * 0.35)
+                if direction == 'BUY':
+                    entry = fvg['bottom'] + 0.75 * _gap
+                    sl    = fvg['bottom'] - _atr_buf
+                else:
+                    entry = fvg['top'] - 0.75 * _gap
+                    sl    = fvg['top'] + _atr_buf
             else:
+                _atr_buf = max(3.0 * self.pip_size, _atr_val * 0.35)
                 if direction == 'BUY':
                     entry = fvg['bottom'] + 0.75 * _gap   # 3/4 toward near edge (top)
                     sl    = fvg['bottom'] - _atr_buf      # past the real far edge, wick-buffered
@@ -2634,25 +3129,28 @@ class ProductionForexPredictor:
             # ── D1/4H HARD BIAS AGREEMENT BLOCK (HTF FVG) ─────────────────────
             # BUY requires non-bearish D1 (EMA & structure) and 4H.
             # SELL requires non-bullish D1 (EMA & structure) and 4H.
-            if direction == 'SELL' and (_d1_trend == 'bullish' or _d1_trend_structure == 'bullish' or h4_trend == 'bullish'):
+            # Gated behind require_htf_bias_gate (default False) -- see
+            # ProductionForexPredictor.__init__ for why: no training-side
+            # counterpart, confirmed by direct search of the training files.
+            if self.require_htf_bias_gate and direction == 'SELL' and (_d1_trend == 'bullish' or _d1_trend_structure == 'bullish' or h4_trend == 'bullish'):
                 htf_fvg_rejected['direction'] += 1
                 if self.debug:
                     print(f"     ⛔ HTF FVG HARD BLOCK: SELL blocked — D1/4H bias conflict (d1_ema={_d1_trend} d1_struct={_d1_trend_structure} h4={h4_trend})")
                 continue
-            if direction == 'BUY' and (_d1_trend == 'bearish' or _d1_trend_structure == 'bearish' or h4_trend == 'bearish'):
+            if self.require_htf_bias_gate and direction == 'BUY' and (_d1_trend == 'bearish' or _d1_trend_structure == 'bearish' or h4_trend == 'bearish'):
                 htf_fvg_rejected['direction'] += 1
                 if self.debug:
                     print(f"     ⛔ HTF FVG HARD BLOCK: BUY blocked — D1/4H bias conflict (d1_ema={_d1_trend} d1_struct={_d1_trend_structure} h4={h4_trend})")
                 continue
 
             # ── D1 Premium / Discount Gate (HTF FVG) ───────────────────────────
-            if _d1_pd == 1 and direction == 'BUY':
+            if self.require_htf_bias_gate and _d1_pd == 1 and direction == 'BUY':
                 if h4_trend != 'bullish':
                     htf_fvg_rejected['d1_pd'] += 1
                     if self.debug:
                         print(f"     ⛔ HTF FVG D1 PREMIUM BLOCK: BUY blocked — price in D1 premium and 4H={h4_trend}")
                     continue
-            if _d1_pd == -1 and direction == 'SELL':
+            if self.require_htf_bias_gate and _d1_pd == -1 and direction == 'SELL':
                 if h4_trend == 'bullish':
                     htf_fvg_rejected['d1_pd'] += 1
                     if self.debug:
@@ -2759,15 +3257,20 @@ class ProductionForexPredictor:
 
             if base_prob < _ml_gate:
                 if self.debug:
-                    print(f"    ❌ FVG prob={base_prob:.3f} < gate={_ml_gate:.2f}"
+                    # STRAT-TAG DEBUG FIX
+                    _stag = "CONT" if self.is_continuation_strategy else "REV "
+                    print(f"    ❌ [{self.symbol}|{_stag}] FVG prob={base_prob:.3f} < gate={_ml_gate:.2f}"
                           f"  dir={direction}"
                           f"  strength={fvg.get('strength', 0):.2f}"
                           f"  idx={fvg.get('index', '?')}")
                 htf_fvg_rejected['prob'] += 1; continue
 
-            htf_setups.append(_build_setup(fvg, 'FVG', direction, entry, sl, tp_target,
-                                           risk, reward, rr, base_prob,
-                                           f"FVG-{fvg['strength']:.2f}", confs))
+            _fvg_setup = _build_setup(fvg, 'FVG', direction, entry, sl, tp_target,
+                                      risk, reward, rr, base_prob,
+                                      f"FVG-{fvg['strength']:.2f}", confs)
+            _fvg_setup['rescore_ctx'] = self._make_rescore_ctx(
+                'FVG', tf, fvg_zone_for_model, df, fvg.get('index', len(df) - 1), base_prob)
+            htf_setups.append(_fvg_setup)
 
         # Order Blocks
         for ob in obs:
@@ -2788,34 +3291,41 @@ class ProductionForexPredictor:
             # ── D1/4H HARD BIAS AGREEMENT BLOCK (HTF OB) ──────────────────────
             # BUY requires non-bearish D1 (EMA & structure) and 4H.
             # SELL requires non-bullish D1 (EMA & structure) and 4H.
-            if direction == 'SELL' and (_d1_trend == 'bullish' or _d1_trend_structure == 'bullish' or h4_trend == 'bullish'):
+            # Gated behind require_htf_bias_gate -- see __init__.
+            if self.require_htf_bias_gate and direction == 'SELL' and (_d1_trend == 'bullish' or _d1_trend_structure == 'bullish' or h4_trend == 'bullish'):
                 htf_ob_rejected['direction'] += 1
                 if self.debug:
                     print(f"     ⛔ HTF OB HARD BLOCK: SELL blocked — D1/4H bias conflict (d1_ema={_d1_trend} d1_struct={_d1_trend_structure} h4={h4_trend})")
                 continue
-            if direction == 'BUY' and (_d1_trend == 'bearish' or _d1_trend_structure == 'bearish' or h4_trend == 'bearish'):
+            if self.require_htf_bias_gate and direction == 'BUY' and (_d1_trend == 'bearish' or _d1_trend_structure == 'bearish' or h4_trend == 'bearish'):
                 htf_ob_rejected['direction'] += 1
                 if self.debug:
                     print(f"     ⛔ HTF OB HARD BLOCK: BUY blocked — D1/4H bias conflict (d1_ema={_d1_trend} d1_struct={_d1_trend_structure} h4={h4_trend})")
                 continue
 
             # ── D1 Premium / Discount Gate (HTF OB) ────────────────────────────
-            if _d1_pd == 1 and direction == 'BUY':
+            if self.require_htf_bias_gate and _d1_pd == 1 and direction == 'BUY':
                 if h4_trend != 'bullish':
                     htf_ob_rejected['d1_pd'] += 1
                     if self.debug:
                         print(f"     ⛔ HTF OB D1 PREMIUM BLOCK: BUY blocked — price in D1 premium and 4H={h4_trend}")
                     continue
-            if _d1_pd == -1 and direction == 'SELL':
+            if self.require_htf_bias_gate and _d1_pd == -1 and direction == 'SELL':
                 if h4_trend == 'bullish':
                     htf_ob_rejected['d1_pd'] += 1
                     if self.debug:
                         print(f"     ⛔ HTF OB D1 DISCOUNT BLOCK: SELL blocked — price in D1 discount and 4H is bullish")
                     continue
 
-            _atr_buf = df['atr'].iloc[-1] * 0.35 if 'atr' in df.columns else 0.0003
-            if 'XAU' in self.symbol.upper() or 'GOLD' in self.symbol.upper():
-                _atr_buf = min(2.50, _atr_buf)
+            _atr_val  = df['atr'].iloc[-1] if 'atr' in df.columns else (self.pip_size * 10)
+            is_gold   = ('XAU' in self.symbol.upper() or 'GOLD' in self.symbol.upper())
+            is_jpy    = ('JPY' in self.symbol.upper())
+            if is_gold:
+                _atr_buf = max(3.50, _atr_val * 0.35)
+            elif is_jpy:
+                _atr_buf = max(4.0 * self.pip_size, _atr_val * 0.35)
+            else:
+                _atr_buf = max(3.0 * self.pip_size, _atr_val * 0.35)
             if direction == 'BUY':
                 entry = ob['top']               # proximal body edge for demand
                 sl    = ob['bottom'] - _atr_buf # distal wick + minimal ATR buffer
@@ -2960,7 +3470,7 @@ class ProductionForexPredictor:
             # past their training boundary, which is why they disagree wildly
             # here specifically (see disagreement_std spikes on touch=21-25
             # zones in the live logs).
-            _MAX_TOUCH_COUNT = 20
+            _MAX_TOUCH_COUNT = 1000000   # touch filter DISABLED (was 20) - keep equal to label_generator
             if full_ob_zone['touch_count'] > _MAX_TOUCH_COUNT:
                 htf_ob_rejected['strength'] += 1  # reuse existing counter bucket
                 if self.debug:
@@ -2979,7 +3489,9 @@ class ProductionForexPredictor:
 
             if base_prob < _ml_gate:
                 if self.debug:
-                    print(f"    ❌ OB  prob={base_prob:.3f} < gate={_ml_gate:.2f}"
+                    # STRAT-TAG DEBUG FIX
+                    _stag = "CONT" if self.is_continuation_strategy else "REV "
+                    print(f"    ❌ [{self.symbol}|{_stag}] OB  prob={base_prob:.3f} < gate={_ml_gate:.2f}"
                           f"  dir={direction}"
                           f"  strength={ob.get('strength', 0):.2f}"
                           f"  idx={ob.get('index', '?')}"
@@ -2989,14 +3501,18 @@ class ProductionForexPredictor:
             conf_label = (f"OB-{ob['strength']:.2f} "
                           f"1H={'✅' if h1_conf['confirmed'] else '❌'} "
                           f"5m={'✅' if m5_conf['m5_micro_bos'] else '⏳'}")
-            htf_setups.append(_build_setup(ob, 'OB', direction, entry, sl, tp_target,
-                                           risk, reward, rr, base_prob,
-                                           conf_label, confs))
+            _ob_setup = _build_setup(ob, 'OB', direction, entry, sl, tp_target,
+                                     risk, reward, rr, base_prob,
+                                     conf_label, confs)
+            _ob_setup['rescore_ctx'] = self._make_rescore_ctx(
+                'OB', tf, full_ob_zone, df, ob.get('index', len(df) - 1), base_prob)
+            htf_setups.append(_ob_setup)
 
         if self.debug:
-            print(f"         FVG rejects → {htf_fvg_rejected}")
-            print(f"         OB  rejects → {htf_ob_rejected}")
-            print(f"         HTF passing before bias filter: {len(htf_setups)}")
+            _stag = "CONT" if self.is_continuation_strategy else "REV "
+            print(f"         [{self.symbol}|{_stag}] FVG rejects → {htf_fvg_rejected}")
+            print(f"         [{self.symbol}|{_stag}] OB  rejects → {htf_ob_rejected}")
+            print(f"         [{self.symbol}|{_stag}] HTF passing before bias filter: {len(htf_setups)}")
 
         if htf_context:
             h1 = htf_context.get('h1_trend', 'neutral')
@@ -3023,7 +3539,7 @@ class ProductionForexPredictor:
             '1h/100':    self.fetch_bars(interval="1h",    outputsize=100),
             '4h/200':    self.fetch_bars(interval="4h",    outputsize=200),
             '4h/100':    self.fetch_bars(interval="4h",    outputsize=100),
-            '5min/60':   self.fetch_bars(interval="5min",  outputsize=60),
+            '5min/60':   self.fetch_bars(interval="5min",  outputsize=300),
             '1day/90':   self.fetch_bars(interval="1day",  outputsize=90),
         }
 
@@ -3213,25 +3729,26 @@ class ProductionForexPredictor:
 
         all_zones = zones + continuation_zones
 
-        # ── ARCHITECTURE GATE: 15min fresh zones are never emitted as signals ──
+        # ── ARCHITECTURE GATE: raw fresh 15min zones are never emitted as signals ──
         # training_labels_clean.parquet: tf_source = 4h_1h_confluence=90%, 4h=10%, 15min=0%
         # Model was never trained on raw 15min zones — live WR confirmed ~7%.
-        # Only HTF_SMC signals (4H OBs/FVGs confirmed by 1H) are valid outputs.
+        # Only HTF_SMC signals (4H OBs/FVGs confirmed by 1H) and CONTINUATION
+        # zones (15min zones that flipped — a different, scored setup, not a
+        # raw fresh zone) are valid 15min-path outputs.
+        #
+        # NOTE: this used to be an unconditional early `return` here that fired
+        # on every call (whether htf_signals was empty or not), which meant the
+        # entire gate/scoring block below — and therefore every continuation
+        # signal — was unreachable dead code. Fixed so we only take the early
+        # exit when there is truly nothing left to score.
+        all_zones = [z for z in all_zones if z.get('is_continuation', False)]
 
-        if not htf_signals:
-            print(f"     ⚠️  No HTF signals this cycle — returning empty")
+        if not htf_signals and not all_zones:
+            print(f"     ⚠️  No HTF signals and no continuation zones this cycle — returning empty")
             return {'15min_signals': [], 'htf_signals': [], 'stats': {
                 'duplicates': 0, 'rejected': 0,
                 'expired': expired_count, 'active_zones': self.zone_tracker.get_active_count()
             }}
-        # Return only HTF signals — skip all 15min zone scoring below
-        return {'15min_signals': [], 'htf_signals': htf_signals, 'stats': {
-            'duplicates': self.stats['total_duplicates'],
-            'rejected':   self.stats['total_rejected'],
-            'expired':    expired_count,
-            'active_zones': self.zone_tracker.get_active_count()
-        }}
-
 
         if self.use_htf_analysis and all_zones:
             all_fvgs = (htf_context.get('h1_fvgs', []) +
@@ -3404,7 +3921,8 @@ class ProductionForexPredictor:
             # ── Apply D1/4H bias agreement gate — HARD BLOCK ──────────────────
             # BUY requires non-bearish D1 (EMA & structure) and 4H.
             # SELL requires non-bullish D1 (EMA & structure) and 4H.
-            if zone['type'] == 'supply' and (_d1_trend == 'bullish' or _d1_trend_structure == 'bullish' or h4_trend == 'bullish'):
+            # Gated behind require_htf_bias_gate -- see __init__.
+            if self.require_htf_bias_gate and zone['type'] == 'supply' and (_d1_trend == 'bullish' or _d1_trend_structure == 'bullish' or h4_trend == 'bullish'):
                 rejected_cnt += 1
                 reject_reasons['d1_premium_discount'] += 1
                 observation_signals.append(_make_obs_signal(zone, 'd1_4h_bias_conflict_blocks_sell'))
@@ -3413,7 +3931,7 @@ class ProductionForexPredictor:
                 if self.debug:
                     print(msg)
                 continue
-            elif zone['type'] == 'demand' and (_d1_trend == 'bearish' or _d1_trend_structure == 'bearish' or h4_trend == 'bearish'):
+            elif self.require_htf_bias_gate and zone['type'] == 'demand' and (_d1_trend == 'bearish' or _d1_trend_structure == 'bearish' or h4_trend == 'bearish'):
                 rejected_cnt += 1
                 reject_reasons['d1_premium_discount'] += 1
                 observation_signals.append(_make_obs_signal(zone, 'd1_4h_bias_conflict_blocks_buy'))
@@ -3424,7 +3942,7 @@ class ProductionForexPredictor:
                 continue
             _h4_counter_trend_penalty = 0.0
 
-            if _d1_pd == 1 and zone['type'] == 'demand':
+            if self.require_htf_bias_gate and _d1_pd == 1 and zone['type'] == 'demand':
                 # Price in D1 premium — block demand unless 4H is also bullish
                 # (if 4H bearish, demand here is doubly counter-trend → block)
                 if h4_trend != 'bullish':
@@ -3436,7 +3954,7 @@ class ProductionForexPredictor:
                     if self.debug:
                         print(msg)
                     continue
-            if _d1_pd == -1 and zone['type'] == 'supply':
+            if self.require_htf_bias_gate and _d1_pd == -1 and zone['type'] == 'supply':
                 # Price in D1 discount — only block supply when 4H is also bullish
                 # (counter-trend sell). If 4H is bearish, supply in D1 discount
                 # is a valid continuation sell — do NOT block it.
@@ -3651,7 +4169,7 @@ class ProductionForexPredictor:
                 # HTF FVG/OB path, so both paths compute this consistently
                 # and match what the model was actually trained on.
                 'touch_count':     self._calculate_touch_count(zone, df),
-                'session':         _canonical_get_session(datetime.utcnow().hour),
+                'session':         _canonical_get_session(self._current_time().hour),
             }
             if is_cont and flip_info:
                 signal['continuation_details'] = {
@@ -3798,9 +4316,13 @@ class PriceZoneMonitor:
         self.signals_file      = Path(signals_file)
         self.alert_callback    = alert_callback or self._default_alert
         self.alerted_signals   = set()
+        self.zone_cfg          = ZoneArrivalConfig()
         # Signals we've already logged an "approaching" (pre-touch) sample for,
         # so we don't spam the log every 15min cycle while price hovers nearby.
         self._approach_logged  = set()
+        # sig_id -> time of the last CLOSED 15m bar already run through the arrival engine,
+        # so a zone is evaluated exactly once per closed bar (bars_in_zone counts bars, not cycles).
+        self._last_eval_bar    = {}
         self.approach_log_file = Path(approach_log_file)
         self.approach_log_file.parent.mkdir(parents=True, exist_ok=True)
         # Dual-tracking log: every trigger writes BOTH the original proposed
@@ -3852,8 +4374,8 @@ class PriceZoneMonitor:
             "pre_touch_bar_size_atr":        2.0,
             "approach_velocity_30m_atr":     3.5,
         }
-        self.exhaustion_mid_threshold  = 0.58   # score >= this -> adjust_mid (recompute entry/sl/tp)
-        self.exhaustion_high_threshold = 0.75   # score >= this -> adjust_high (recompute harder)
+        self.exhaustion_mid_threshold  = 0.70   # raised from 0.58 -- backtested +34.50R vs +27.89R (2026-09-10)
+        self.exhaustion_high_threshold = 0.85   # raised from 0.75
         self.accel_bar_size_atr_min  = 2.0   # 5min bar range / atr_5min above this = "knife"
         self.accel_body_ratio_min    = 0.70  # and a solid (low-wick) body
         self.accel_score_bonus       = 0.30  # score bump when the 5min knife check fires
@@ -3913,9 +4435,18 @@ class PriceZoneMonitor:
         emoji = "🟢" if signal['direction'] == 'BUY' else "🔴"
         tag   = f" (ADJUSTED — {signal.get('tier')})" if signal.get('adjusted') else ""
         fill_note = " [LIMIT — awaiting fill]" if signal.get('pending_fill') else ""
+        adv = signal.get('advisor', {})
+        if adv:
+            tier_str = adv.get('tier', 'primary' if adv.get('qualified') else 'skip').upper()
+            if adv.get('qualified'):
+                adv_tag = f" | 📢 ADVICE: TAKE [{tier_str}] [met: {', '.join(adv.get('conditions_met', []))}]"
+            else:
+                adv_tag = " | 📢 ADVICE: SKIP (Low conviction / Toxic filter)"
+        else:
+            adv_tag = ""
         print(f"\n🚨 ZONE HIT{tag} → {emoji} {signal['symbol']} {signal['direction']}{fill_note} "
               f"| Entry: {signal['entry']} | SL: {signal['sl']} | TP: {signal['tp']} "
-              f"| Prob: {signal['probability']}%")
+              f"| Prob: {signal['probability']}%{adv_tag}")
         if signal.get('adjusted'):
             print(f"    ↳ original was Entry: {signal.get('original_entry')} | "
                   f"SL: {signal.get('original_sl')} | TP: {signal.get('original_tp')} "
@@ -4001,6 +4532,209 @@ class PriceZoneMonitor:
                 f.write(json.dumps(record) + "\n")
         except Exception as e:
             logger.warning(f"PriceMonitor: failed to write approach log — {e}")
+
+    def _two_stage_step(self, sig, sig_id, df, pred, direction, zone_top, zone_bot, all_sigs, now):
+        """Mirror of backtest_replay --two-stage. Steps zone_arrival_engine.evaluate_zone_step()
+        once per NEW closed 15m bar (30-bar window, like the replay). A trade only exists when a
+        closed candle confirms rejection; the advisor then scores it ONCE using the replay's
+        inputs: touch time = first bar in zone, wick = confirming candle's wick, R:R = the
+        recomputed geometry's R:R."""
+        if sig.get('stage') in ('VIOLATED', 'EXPIRED', 'CONFIRMED'):
+            return
+        cfg = getattr(self, '_arrival_cfg', None)
+        if cfg is None:
+            cfg = self._arrival_cfg = ZoneArrivalConfig(
+                min_rejection_wick_atr=float(os.getenv("MIN_REJECTION_WICK_ATR", "0.40")),
+                max_bars_in_zone=int(os.getenv("MAX_BARS_IN_ZONE", "16")),
+            )
+        symbol = sig.get('symbol')
+        stage0 = sig.get('stage') if sig.get('stage') in (ZoneState.ARMED, ZoneState.IN_ZONE) else ZoneState.ARMED
+        zone = dict(sig.get('_zone') or {})
+        zone.update({
+            "symbol": symbol, "direction": direction,
+            "zone_top": zone_top, "zone_bottom": zone_bot,
+            "zone_mid": sig.get('zone_mid', (zone_top + zone_bot) / 2.0),
+            "tp": sig.get('tp'),
+        })
+        zone.setdefault("state", stage0)
+        zone = {k: v for k, v in zone.items() if v is not None}
+
+        times = df['time']
+        last = sig.get('_last_step_time')
+        first_sight = not last
+        try:
+            if last:
+                new_bars = df[times > pd.to_datetime(last)]
+            else:
+                # First time we see this signal: replay the engine from its PROPOSAL time (like the
+                # backtest) so touch time / sweep extreme / bars-in-zone are rebuilt from real bars,
+                # even for zones that were already in the zone when the predictor (re)started.
+                _ts = pd.to_datetime(sig.get('timestamp'))
+                if getattr(_ts, 'tzinfo', None) is not None:
+                    _ts = _ts.tz_localize(None)
+                start = _ts + pd.Timedelta(hours=getattr(pred, 'broker_offset', 0) or 0)
+                new_bars = df[times > start]
+                if new_bars.empty:
+                    new_bars = df.iloc[-1:]
+        except Exception:
+            new_bars = df.iloc[-1:]
+        if new_bars.empty:
+            return                      # no new closed bar since last step (e.g. 5-min light cycle)
+        # In live step, do not artificially cap to 16 bars when catching up;
+        # process all bars since last step up to the fetched buffer (up to 200 bars = 50h),
+        # so overnight touches and confirmations are accurately detected.
+        if len(new_bars) > 200:
+            new_bars = new_bars.tail(200)
+
+        final_action = None
+        for _, bar in new_bars.iterrows():
+            pos = int(times.searchsorted(bar['time'], side='right'))
+            recent = df.iloc[max(0, pos - 30):pos]
+            res = evaluate_zone_step(zone, bar, recent, pred.pip_size, cfg)
+            sig['_last_step_time'] = str(bar['time'])
+            sig['_zone'] = {k: zone[k] for k in ('state', 'touch_time', 'touch_price', 'sweep_extreme', 'bars_in_zone') if k in zone}
+            sig['stage'] = zone.get('state')
+            act = res.get('action')
+            if act == 'confirm':
+                final_action = ('confirm', res, bar); break
+            if act in ('violated', 'expired'):
+                final_action = (act, res, bar); break
+
+        def _persist(tag):
+            try:
+                with open(self.signals_file, 'w') as f:
+                    json.dump(all_sigs, f, indent=2, default=str)
+            except Exception as e:
+                logger.warning(f"PriceMonitor: failed to persist {tag} {sig_id} - {e}")
+
+        if final_action is None:
+            _persist("two-stage step")
+            return
+
+        act, res, bar = final_action
+        if act in ('violated', 'expired'):
+            sig['status'] = 'violated' if act == 'violated' else 'expired_untriggered'
+            logger.info(f"[{symbol}] TWO-STAGE {act.upper()}: {res.get('reason')} (no trade taken)")
+            _persist(act)
+            return
+
+        # ---- CONFIRMED: apply recomputed geometry, then score ONCE like the replay ----
+        ts = res['trade_signal']
+        for k in ('entry', 'sl', 'tp'):
+            if ts.get(k) is not None:
+                sig.setdefault('original_' + k, sig.get(k))
+                sig[k] = ts[k]
+        for k in ('risk_pips', 'reward_pips', 'risk_reward', 'rr'):
+            if ts.get(k) is not None:
+                sig[k] = ts[k]
+        sig['stage'] = 'CONFIRMED'
+        sig['adjusted'] = True
+        sig['confirmation_rule'] = ts.get('confirmation_rule')
+        sig['confirmed_at'] = ts.get('confirmed_at') or now.isoformat()
+        sig['sweep_extreme'] = ts.get('sweep_extreme')
+        sig['_ts_wick'] = ts.get('rejection_wick_atr')
+        sig['_ts_touch_time'] = ts.get('touch_time') or str(bar['time'])
+        sig.setdefault('proposed_at', sig.get('timestamp'))
+
+        if os.getenv("RESCORE_AT_ARRIVAL", "1") != "0":
+            try:
+                want_cont = (sig.get('strategy') == 'CONTINUATION')
+                rp = next((p for p in self.predictors if p.symbol == symbol and
+                           bool(getattr(p, 'is_continuation_strategy', False)) == want_cont), pred)
+                rs = rp.rescore_at_arrival(sig, bar['time'] + pd.Timedelta(minutes=15))
+                sig['rescore'] = {k: rs.get(k) for k in ('ok', 'prob_pct', 'prob_at_proposal_pct', 'reason', 'suspect_default_prob')}
+                logger.info(f"[{symbol}] arrival re-score (log-only): {sig['rescore']}")
+            except Exception as _e:
+                sig['rescore'] = {'ok': False, 'reason': str(_e)}
+
+        if _advisor_advise is not None:
+            try:
+                df5 = pred.fetch_bars("5min", outputsize=500)
+                df4h = pred.fetch_bars("4h", outputsize=150)
+                sig['advisor'] = _advisor_advise(
+                    direction, df, df5, df4h, pd.to_datetime(sig['_ts_touch_time']), sig['_ts_wick'],
+                    risk_reward=sig.get('risk_reward'),
+                    # replay passes the count measured at the CONFIRMING bar (its approach_metrics are
+                    # taken at trigger_time), so use the engine's value for that same bar
+                    consecutive_bars=(ts.get('features') or {}).get('consecutive_directional_bars'))
+                sig['advisor_qualified'] = sig['advisor'].get('qualified', False)
+                sig['advisor_tier'] = sig['advisor'].get('tier', 'skip')
+                sig['advisor_advice'] = sig['advisor'].get('advice', '')
+                logger.info(f"[{symbol}] Advisor: {sig['advisor']['advice']} [{sig['advisor_tier'].upper()}] | "
+                            f"{sig['advisor']['values']} | met={sig['advisor']['conditions_met']}")
+            except Exception as _e:
+                sig['advisor'] = {'error': str(_e), 'qualified': False, 'tier': 'skip', 'advice': 'SKIP (error)'}
+                sig['advisor_qualified'] = False
+                sig['advisor_tier'] = 'skip'
+                sig['advisor_advice'] = 'SKIP (error)'
+
+        # Gating: determine if this trade is blocked by Advisor Gate for live execution
+        is_blocked = bool(ADVISOR_GATE and not sig.get('advisor_qualified', False))
+        sig['advisor_blocked'] = is_blocked
+        is_late_confirmation = (bar['time'] != df['time'].iloc[-1])
+        sig['late_confirmation'] = is_late_confirmation
+
+        if is_blocked:
+            logger.info(f"[{symbol}] ADVISOR GATE: confirmed trade blocked for live execution ({sig.get('advisor_advice')}) - tracking outcome in shadow")
+        elif is_late_confirmation:
+            logger.info(f"[{symbol}] TWO-STAGE: confirmation at {bar['time']} already passed (predictor catching up) - running replay catch-up")
+        else:
+            # Current, live-qualified confirmation on newest closed bar
+            sig['status'] = 'pending'
+            new_id = f"{sig.get('symbol')}_{sig.get('strategy', 'REVERSION')}_{sig.get('entry')}_{sig.get('sl')}"
+            self.alerted_signals.update({sig_id, new_id})
+            sig['_last_alerted_qualified'] = sig.get('advisor_qualified', False)
+            self.alert_callback(sig)
+
+        # ── REPLAY CATCH-UP: Walk subsequent bars from confirmation to current time ──
+        conf_time = bar['time']
+        subsequent_bars = df[times > conf_time].copy()
+
+        c_entry = float(sig['entry'])
+        c_sl    = float(sig['sl'])
+        c_tp    = float(sig['tp'])
+
+        if subsequent_bars.empty:
+            sig['status'] = 'pending'
+            _persist("confirmed")
+            return
+
+        # Mini replay forward walk across bars since confirmation
+        trade_status = 'triggered'
+        resolved_bar = None
+        bars_to_exit = 0
+
+        for _, s_bar in subsequent_bars.iterrows():
+            bars_to_exit += 1
+
+            hit_sl = (s_bar['low'] <= c_sl) if direction == 'BUY' else (s_bar['high'] >= c_sl)
+            hit_tp = (s_bar['high'] >= c_tp) if direction == 'BUY' else (s_bar['low'] <= c_tp)
+            if hit_sl and hit_tp:
+                trade_status = 'hit_sl'
+                resolved_bar = s_bar
+                break
+            elif hit_sl:
+                trade_status = 'hit_sl'
+                resolved_bar = s_bar
+                break
+            elif hit_tp:
+                trade_status = 'hit_tp'
+                resolved_bar = s_bar
+                break
+
+        sig['status'] = trade_status
+        sig['triggered'] = True
+        sig['bars_to_entry'] = 0
+
+        if trade_status in ('hit_tp', 'hit_sl'):
+            sig['bars_to_exit'] = bars_to_exit
+            sig['resolved_at'] = str(resolved_bar['time'])
+            logger.info(f"[{symbol}] TWO-STAGE REPLAY CATCH-UP: {direction} confirmed at {conf_time} -> {trade_status.upper()} at {resolved_bar['time']} ({bars_to_exit} bars)")
+        else:
+            sig['bars_to_exit'] = None
+            logger.info(f"[{symbol}] TWO-STAGE REPLAY CATCH-UP: {direction} confirmed at {conf_time} -> currently TRIGGERED ({bars_to_exit} bars in flight)")
+
+        _persist(f"catchup_{trade_status}")
 
     def _recompute_final_signal(self, sig: Dict, sig_id: str, features: Dict,
                                  zone_top: float, zone_bottom: float,
@@ -4203,16 +4937,29 @@ class PriceZoneMonitor:
         except Exception as e:
             logger.warning(f"PriceMonitor: could not load signals — {e}"); return
 
-        # Only watch zones still awaiting entry — resolved/expired signals are skipped.
-        plan = [s for s in all_sigs if s.get('status') == 'pending']
+        # Watch zones awaiting entry or confirmation in the Two-Stage Architecture,
+        # plus confirmed SKIP signals that are still live (pending or triggered) to allow developing wick upgrades
+        plan = [s for s in all_sigs if (
+            s.get('status') in ('pending', 'armed', 'in_zone') or
+            s.get('stage') in (ZoneState.ARMED, ZoneState.IN_ZONE) or
+            (s.get('stage') == 'CONFIRMED' and not s.get('advisor_qualified') and s.get('status') in ('pending', 'triggered'))
+        )]
 
         # Group predictors by symbol for current-price lookup
         pred_map = {p.symbol: p for p in self.predictors}
         now      = datetime.utcnow()
 
         for sig in plan:
-            sig_id = f"{sig.get('symbol')}_{sig.get('entry')}_{sig.get('sl')}"
-            if sig_id in self.alerted_signals:
+            sig_id = f"{sig.get('symbol')}_{sig.get('strategy', 'REVERSION')}_{sig.get('entry')}_{sig.get('sl')}"
+            # If already alerted AND qualified (TAKE), do not re-alert or re-process.
+            # If previously evaluated as SKIP but still in zone, allow re-checking on new
+            # candles so a developing rejection wick (>= 1.5 ATR) can upgrade it to TAKE.
+            # Restart-safe: alerted_signals is in-memory only, so after a restart it is empty.
+            # A TAKE is persisted in the signal itself (advisor_qualified + _last_alerted_qualified),
+            # so it must stay final across restarts and never be re-scored into a SKIP.
+            if sig.get('advisor_qualified') and (
+                    sig_id in self.alerted_signals or sig.get('_last_alerted_qualified')):
+                self.alerted_signals.add(sig_id)
                 continue
 
             # Check validity window
@@ -4228,10 +4975,10 @@ class PriceZoneMonitor:
             if pred is None:
                 continue
 
-            # outputsize=30 (not 5) so ATR(14) and the consecutive-directional-bar
-            # lookback (up to 6 bars back) have enough history, matching the
-            # backtest replay's window.
-            df = pred.fetch_bars(interval="15min", outputsize=30)
+            # outputsize=500 so ATR(14), consecutive-directional-bar lookback,
+            # and signal_advisor's h4_slope (which requires completed 15m bars)
+            # have sufficient history, matching the backtest replay's window.
+            df = pred.fetch_bars(interval="15min", outputsize=500)
             if df is None or len(df) == 0:
                 continue
 
@@ -4240,11 +4987,14 @@ class PriceZoneMonitor:
             bar_high      = df['high'].iloc[-1]
             direction     = sig.get('direction', 'BUY')
 
-            # ── Step 3: Price must be INSIDE the zone body ───────────────────
-            # Use zone_top/zone_bottom stored in the signal (added in _build_setup).
-            # Fall back to entry ± 1 pip if zone boundaries are missing (legacy signals).
+            # Zone boundaries stored in the signal (added in _build_setup)
             zone_top = float(sig.get('zone_top',  sig.get('entry', 0) + pred.pip_size))
             zone_bot = float(sig.get('zone_bottom', sig.get('entry', 0) - pred.pip_size))
+
+            if TWO_STAGE_LIVE:
+                # Backtest-identical execution: confirmation candle -> geometry -> advisor once.
+                self._two_stage_step(sig, sig_id, df, pred, direction, zone_top, zone_bot, all_sigs, now)
+                continue
 
             if direction == 'BUY':
                 in_zone = (bar_low  <= zone_top and
@@ -4256,31 +5006,124 @@ class PriceZoneMonitor:
             if in_zone:
                 features = self._compute_pre_entry_features(df, direction, pred.pip_size)
                 atr_15m  = features.get("atr_15m", pred.pip_size * 10)
+                touch_wick_atr = features.get("touch_rejection_wick_atr", 0.0)
+
+                # Freeze touch-stage time at the FIRST bar seen in the zone. The advisor's
+                # touch-stage features (h4_slope, m5_consec_against, consecutive bars) must be
+                # measured at the original touch, exactly like the replay. Only the wick
+                # (confirmation stage) is allowed to update on later bars.
+                _last_bar_t = df['time'].iloc[-1]
+                if not sig.get('_first_touch_time'):
+                    sig['_first_touch_time'] = str(_last_bar_t)
+                try:
+                    touch_time = pd.to_datetime(sig['_first_touch_time'])
+                except Exception:
+                    touch_time = _last_bar_t
+                bars_since_touch = max(0, int(round((_last_bar_t - touch_time).total_seconds() / 900)))
+
+                # ── UNIFIED ADVISOR: evaluate at zone touch (Primary OR-71 + Promoted SKIP) ──
+                if _advisor_advise is not None:
+                    try:
+                        df5 = pred.fetch_bars("5min", outputsize=250)
+                        df4h = pred.fetch_bars("4h", outputsize=150)
+                        planned_rr = sig.get('risk_reward') or sig.get('rr')
+                        # None -> advisor computes it at the FROZEN touch time (same as replay),
+                        # not relative to the newest bar, which drifts on re-checks.
+                        consec_bars = None
+                        _prev_adv = sig.get('advisor')
+                        _prev_q = bool(sig.get('advisor_qualified'))
+                        sig['advisor'] = _advisor_advise(
+                            direction, df, df5, df4h, touch_time, touch_wick_atr,
+                            risk_reward=planned_rr, consecutive_bars=consec_bars
+                        )
+                        # A TAKE never downgrades: keep the earlier qualified verdict.
+                        if _prev_q and _prev_adv and not sig['advisor'].get('qualified', False):
+                            logger.info(f"🔒 [{symbol}] Keeping earlier {_prev_adv.get('advice')} (no downgrade to SKIP)")
+                            sig['advisor'] = _prev_adv
+                        adv_tier = sig['advisor'].get('tier', 'skip')
+                        sig['advisor_qualified'] = sig['advisor'].get('qualified', False)
+                        sig['advisor_tier'] = adv_tier
+                        sig['advisor_advice'] = sig['advisor'].get('advice', '')
+                        logger.info(
+                            f"📢 [{symbol}] Advisor: {sig['advisor']['advice']} [{adv_tier.upper()}] | "
+                            f"{sig['advisor']['values']} | met={sig['advisor']['conditions_met']}"
+                        )
+                    except Exception as _adv_err:
+                        sig['advisor'] = {'error': str(_adv_err), 'qualified': False, 'tier': 'skip', 'advice': 'SKIP (error)'}
+                        sig['advisor_qualified'] = False
+                        sig['advisor_tier'] = 'skip'
+                        sig['advisor_advice'] = 'SKIP (error)'
+
                 logger.info(
                     f"🎯 [{symbol}] ZONE TOUCH DYNAMICS (30m pre-entry): "
                     f"vel_30m={features.get('approach_velocity_30m_atr')}x ATR | "
                     f"pre_bar={features.get('pre_touch_bar_size_atr')}x ATR "
                     f"(body={features.get('pre_touch_body_ratio')}) | "
-                    f"rejection_wick={features.get('touch_rejection_wick_atr')}x ATR | "
+                    f"rejection_wick={touch_wick_atr}x ATR | "
                     f"consec={features.get('consecutive_directional_bars')} bars"
                 )
-                self._append_approach_log("touch", sig, features,
-                                           extra={"trigger_price": bar_low if direction == 'BUY' else bar_high})
+                self._append_approach_log(
+                    "touch", sig, features,
+                    extra={"trigger_price": bar_low if direction == 'BUY' else bar_high}
+                )
+
+                # ── Optional Active Gating: ADVISOR_GATE ──────────────────────
+                if ADVISOR_GATE and not sig.get('advisor_qualified', False):
+                    if bars_since_touch < ADVISOR_RECHECK_BARS:
+                        logger.info(
+                            f"⏳ [{symbol}] ADVISOR GATE: holding, not qualified yet "
+                            f"({bars_since_touch}/{ADVISOR_RECHECK_BARS} bars since touch) - re-check next closed bar"
+                        )
+                        try:
+                            with open(self.signals_file, 'w') as f:
+                                json.dump(all_sigs, f, indent=2, default=str)
+                        except Exception as e:
+                            logger.warning(f"PriceMonitor: failed to persist held signal {sig_id} — {e}")
+                        continue
+                    logger.info(
+                        f"🚫 [{symbol}] ADVISOR GATE: Trade blocked/skipped (conviction too low: {sig.get('advisor_advice')}). "
+                        f"Conditions missing: {sig.get('advisor', {}).get('missing_inputs', [])}"
+                    )
+                    sig['status'] = 'skip_low_conviction'
+                    sig['advisor_blocked'] = True
+                    try:
+                        with open(self.signals_file, 'w') as f:
+                            json.dump(all_sigs, f, indent=2, default=str)
+                    except Exception as e:
+                        logger.warning(f"PriceMonitor: failed to persist blocked signal {sig_id} — {e}")
+                    continue
 
                 # ── Stage 3: trigger-time recompute ──────────────────────────
                 decision = self._recompute_final_signal(sig, sig_id, features, zone_top, zone_bot, pred)
+                decision["advisor"] = sig.get("advisor")
                 self._append_dual_signal_log(sig_id, sig, decision, features)
 
+                was_already_alerted = sig_id in self.alerted_signals
+                was_already_qualified = sig.get('_last_alerted_qualified', False)
                 self.alerted_signals.add(sig_id)
 
                 if decision["action"] == "unchanged":
-                    self.alert_callback(sig)
+                    try:
+                        with open(self.signals_file, 'w') as f:
+                            json.dump(all_sigs, f, indent=2, default=str)
+                    except Exception as e:
+                        logger.warning(f"PriceMonitor: failed to persist unchanged signal {sig_id} — {e}")
+                    # Alert on first zone hit, or upgrade alert when qualified TAKE forms
+                    if not was_already_alerted or (sig.get('advisor_qualified') and not was_already_qualified):
+                        sig['_last_alerted_qualified'] = sig.get('advisor_qualified', False)
+                        self.alert_callback(sig)
                     continue
 
                 final_sig = decision["final_signal"]
                 if final_sig is None:
-                    # degenerate-risk fallback inside _recompute_final_signal
-                    self.alert_callback(sig)
+                    try:
+                        with open(self.signals_file, 'w') as f:
+                            json.dump(all_sigs, f, indent=2, default=str)
+                    except Exception as e:
+                        logger.warning(f"PriceMonitor: failed to persist signal {sig_id} — {e}")
+                    if not was_already_alerted or (sig.get('advisor_qualified') and not was_already_qualified):
+                        sig['_last_alerted_qualified'] = sig.get('advisor_qualified', False)
+                        self.alert_callback(sig)
                     continue
 
                 logger.info(
@@ -4291,16 +5134,6 @@ class PriceZoneMonitor:
                     f"(risk {sig.get('risk_pips')}p -> {final_sig.get('risk_pips')}p)"
                 )
 
-                # PERSIST the recomputed entry/sl/tp back into signals_file so
-                # downstream outcome tracking (SignalOutcomeTrackerV2, in
-                # outcome_tracker.py) watches the levels you're actually
-                # placing at the broker, not the original proposal. Without
-                # this, the alert shows the right numbers but the tracker
-                # would silently keep monitoring the stale original entry/
-                # sl/tp — same class of bug the "re-anchor timestamp" fix
-                # elsewhere in this file (save_signals_to_single_file) exists
-                # to prevent, applied here at the trigger-time recompute
-                # point instead of the re-detection point.
                 sig['entry']       = final_sig['entry']
                 sig['sl']          = final_sig['sl']
                 sig['tp']          = final_sig['tp']
@@ -4316,9 +5149,6 @@ class PriceZoneMonitor:
                 sig['original_tp']      = final_sig.get('original_tp')
                 sig['pending_fill']     = True
                 sig['fill_deadline']    = final_sig.get('fill_deadline')
-                # Status stays 'pending' — the new entry is a limit order not
-                # yet filled. Re-anchor timestamp so outcome tracking doesn't
-                # replay bars from before this exact (adjusted) zone existed.
                 sig['timestamp'] = now.isoformat()
 
                 try:
@@ -4327,30 +5157,26 @@ class PriceZoneMonitor:
                 except Exception as e:
                     logger.warning(f"PriceMonitor: failed to persist adjusted signal {sig_id} — {e}")
 
-                self.alert_callback(sig)
+                if not was_already_alerted or (sig.get('advisor_qualified') and not was_already_qualified):
+                    sig['_last_alerted_qualified'] = sig.get('advisor_qualified', False)
+                    self.alert_callback(sig)
                 continue
 
             # ── Pre-touch "approaching" sample ───────────────────────────────
-            # Price hasn't reached the zone yet, but is close (within 0.5x ATR
-            # of the proximal edge). Log exactly one sample per signal here so
-            # we can later compare approach dynamics *before* touch against
-            # what actually happens at/after touch (the hypothesis being
-            # tested: does high pre-touch momentum predict sweeps/overflows?).
             if sig_id not in self._approach_logged:
                 try:
+                    proximal_edge = zone_top if direction == 'BUY' else zone_bot
                     hi, lo, cl = df['high'], df['low'], df['close']
                     tr = pd.concat([hi - lo, (hi - cl.shift(1)).abs(), (lo - cl.shift(1)).abs()], axis=1).max(axis=1)
                     atr_now = float(tr.rolling(14).mean().iloc[-1])
                     if not np.isfinite(atr_now) or atr_now <= 0:
                         atr_now = pred.pip_size * 10
-
-                    proximal_edge = zone_top if direction == 'BUY' else zone_bot
                     distance_atr  = abs(current_price - proximal_edge) / atr_now
 
                     if distance_atr <= 0.5:
-                        features = self._compute_pre_entry_features(df, direction, pred.pip_size)
+                        app_feats = self._compute_pre_entry_features(df, direction, pred.pip_size)
                         self._append_approach_log(
-                            "approaching", sig, features,
+                            "approaching", sig, app_feats,
                             extra={"distance_to_zone_atr": round(distance_atr, 3),
                                    "current_price": float(current_price)},
                         )
@@ -4584,13 +5410,14 @@ def run_dual_strategy(symbols: Optional[List[str]] = None):
             encoders_path="models/encoders_v6_reversion.pkl",
             stats_path="models/training_stats_v6_reversion.pkl",
             symbol=sym,
-            prob_threshold=0.60,
+            prob_threshold=0.40,
             max_rr=8.0, min_risk_atr=2.5, max_distance_pips=p['max_distance_pips_rev'],  # min_risk_atr: 1.5→2.5
             min_strength_atr=0.50, use_5min_refinement=True,
             refine_max_dist_multiplier=2.0, enable_continuation=False,
             use_htf_analysis=True, min_confluence_score=1,
+            require_htf_bias_gate=HTF_BIAS_GATE,
             zone_ttl_hours=48.0, zone_distance_threshold=p['zone_distance_threshold'],
-            htf_fvg_min_gap_atr=0.5, htf_ob_min_reaction_atr=2.5,
+            htf_fvg_min_gap_atr=0.3, htf_ob_min_reaction_atr=1.0,
             is_continuation_strategy=False, require_zone_close=True, debug=True
         )
         cont = ProductionForexPredictor(
@@ -4600,13 +5427,14 @@ def run_dual_strategy(symbols: Optional[List[str]] = None):
             encoders_path="models/encoders_v6_continuation.pkl",
             stats_path="models/training_stats_v6_continuation.pkl",
             symbol=sym,
-            prob_threshold=0.60,
+            prob_threshold=0.55,  # wired to match backtest_replay.py's validated cont threshold (was 0.60)
             max_rr=10.0, min_risk_atr=2.5, max_distance_pips=p['max_distance_pips_cont'],  # min_risk_atr: 1.5→2.5
             min_strength_atr=0.50, use_5min_refinement=True,
             refine_max_dist_multiplier=2.0, enable_continuation=True,
             use_htf_analysis=True, min_confluence_score=1,
+            require_htf_bias_gate=HTF_BIAS_GATE,
             zone_ttl_hours=48.0, zone_distance_threshold=p['zone_distance_threshold'],
-            htf_fvg_min_gap_atr=0.5, htf_ob_min_reaction_atr=2.5,
+            htf_fvg_min_gap_atr=0.3, htf_ob_min_reaction_atr=1.0,
             is_continuation_strategy=True, debug=True
         )
         all_predictors.extend([rev, cont])
@@ -4622,9 +5450,10 @@ def run_dual_strategy(symbols: Optional[List[str]] = None):
     if datetime.utcnow().weekday() == 6:
         weekly_scheduler.generate()
 
-    print(f"\n🕐 15-min price monitor active | Ctrl-C to stop\n")
+    print(f"\n🕐 Price monitor active (5-min cycles, 15-min full scan) | Ctrl-C to stop\n")
 
     iteration = 0
+    last_scan_t = 0.0
     rev_predictor  = all_predictors[0]   # first symbol reversion — used for outcome tracking
     cont_predictor = all_predictors[1] if len(all_predictors) > 1 else rev_predictor
 
@@ -4647,7 +5476,19 @@ def run_dual_strategy(symbols: Optional[List[str]] = None):
             # Still run full signal generation every cycle for live signals
             # (the sole source of truth — saves to all_signals.json, which
             # PriceZoneMonitor also reads to watch pending zones)
-            for i in range(0, len(all_predictors), 2):
+            # Full signal generation only when a new 15m bar can exist; the 5-min cycles
+            # just run the price monitor + outcome tracking (cached bars, few API calls).
+            # Full scan right after a 15m bar closes (cycle runs ~40s past the 5m boundary, so on
+            # the :00/:15/:30/:45 cycle time % 900 < 300), plus once at startup.
+            scan_due = (iteration == 1) or (
+                (time.time() % _SCAN_EVERY_SECS) < _CYCLE_SECS
+                and (time.monotonic() - last_scan_t) > (_SCAN_EVERY_SECS - _CYCLE_SECS - 60))
+            if scan_due:
+                last_scan_t = time.monotonic()
+            else:
+                print(f"  ⏭️  Light cycle (price monitor only) — next full scan in "
+                      f"~{int(_SCAN_EVERY_SECS - (time.time() % _SCAN_EVERY_SECS) + _CYCLE_OFFSET_SECS)}s")
+            for i in (range(0, len(all_predictors), 2) if scan_due else []):
                 rev_p  = all_predictors[i]
                 cont_p = all_predictors[i + 1] if i + 1 < len(all_predictors) else None
 
@@ -4701,8 +5542,11 @@ def run_dual_strategy(symbols: Optional[List[str]] = None):
                               f"{sig['probability']:>4.1f}% │ {sig.get('confluence_score',0)}/10 {refined} {ct_warn} │")
                     print("└" + "─"*107 + "┘")
 
+                for sig in rev_htf:  sig.setdefault('strategy', 'REVERSION')
+                for sig in cont_htf: sig.setdefault('strategy', 'CONTINUATION')
+
                 all_htf = list({
-                    (s['timeframe'], s['direction'], s['entry'], s['sl']): s
+                    (s.get('strategy', 'REVERSION'), s['timeframe'], s['direction'], s['entry'], s['sl']): s
                     for s in rev_htf + cont_htf
                 }.values())
 
@@ -4746,10 +5590,14 @@ def run_dual_strategy(symbols: Optional[List[str]] = None):
             # (Telegram push integration point — add your send function here)
 
             print(f"\n{'─'*100}")
-            print(f"⏰ Next cycle: {(cycle_time + timedelta(minutes=15)).strftime('%H:%M:%S UTC')}")
+            _wake = datetime.utcfromtimestamp((int(time.time() // _CYCLE_SECS) + 1) * _CYCLE_SECS + _CYCLE_OFFSET_SECS)
+            print(f"⏰ Next cycle: {_wake.strftime('%H:%M:%S UTC')}")
             print(f"{'─'*100}\n")
-            elapsed = time.monotonic() - cycle_start
-            time.sleep(max(0, 900 - elapsed))
+            # Sleep to the next wall-clock boundary (+ offset) so every cycle fetches just after
+            # a 5m/15m bar has closed and the boundary-aware cache is hit as intended.
+            _now = time.time()
+            _next = (int(_now // _CYCLE_SECS) + 1) * _CYCLE_SECS + _CYCLE_OFFSET_SECS
+            time.sleep(max(1.0, _next - _now))
 
     except KeyboardInterrupt:
         print("\n\n╔════════════════════════════════════════════════════════════════╗")

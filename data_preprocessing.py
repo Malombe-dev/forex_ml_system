@@ -57,7 +57,7 @@ logger = logging.getLogger(__name__)
 RISK_PIPS_MIN   = 0.5
 RISK_PIPS_MAX   = 500.0   # 4H XAUUSD zones can have 200-500 pip SL; old 30.0 clipped everything
 PERCENTILE_CLIP = 99          # clip zone_strength and distance_from_ema20 here
-MAX_TOUCH_COUNT = 20           # drop zones visited more than this many times
+MAX_TOUCH_COUNT = 1000000  # DISABLED (was 20);           # drop zones visited more than this many times
 # Train boundary — must match model_trainer.py TRAIN_END_DATE
 # Import it directly so the two files always agree
 try:

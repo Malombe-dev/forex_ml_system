@@ -183,7 +183,7 @@ else:
 # ─────────────────────────────────────────────────────────────────────────────
 hdr("4. FEATURE VALUE RANGES — TRAINING STATS vs PREDICTOR LOGIC")
 
-stats_path = MODELS_DIR / "training_stats_v5_reversion.pkl"
+stats_path = MODELS_DIR / "training_stats_v6_reversion.pkl"
 if stats_path.exists():
     with open(stats_path, "rb") as f:
         stats = pickle.load(f)
@@ -244,7 +244,7 @@ if stats_path.exists():
             warn("ranges", f"⚠️  {feat}: {CONCERN_FEATURES[feat]}")
 
 else:
-    warn("ranges", "training_stats_v5_reversion.pkl not found — skipping range check")
+    warn("ranges", "training_stats_v6_reversion.pkl not found — skipping range check")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. CRITICAL KEY NAME MISMATCHES
@@ -288,7 +288,7 @@ hdr("6. ENSEMBLE WEIGHTS — TRAINING vs PREDICTOR")
 
 TRAINING_WEIGHTS = {'xgb': 0.50, 'rf': 0.35, 'ridge': 0.15}
 
-meta_path = MODELS_DIR / "metadata_v5_reversion.json"
+meta_path = MODELS_DIR / "metadata_v6_reversion.json"
 if meta_path.exists():
     with open(meta_path) as f:
         meta = json.load(f)
@@ -322,9 +322,9 @@ if meta_path.exists():
 hdr("7. SCALER — REVERSION SCALER SHARED WITH CONTINUATION")
 
 try:
-    with open(MODELS_DIR / "scaler_v5_reversion.pkl", "rb") as f:
+    with open(MODELS_DIR / "scaler_v6_reversion.pkl", "rb") as f:
         s_rev = pickle.load(f)
-    with open(MODELS_DIR / "scaler_v5_continuation.pkl", "rb") as f:
+    with open(MODELS_DIR / "scaler_v6_continuation.pkl", "rb") as f:
         s_con = pickle.load(f)
 
     if np.allclose(s_rev.mean_, s_con.mean_, atol=1e-8):
@@ -393,11 +393,11 @@ try:
     }
 
     entry = 1.0840; sl = 1.0810
-    with open(MODELS_DIR / "encoders_v5_reversion.pkl", "rb") as f:
+    with open(MODELS_DIR / "encoders_v6_reversion.pkl", "rb") as f:
         enc = pickle.load(f)
-    with open(MODELS_DIR / "scaler_v5_reversion.pkl", "rb") as f:
+    with open(MODELS_DIR / "scaler_v6_reversion.pkl", "rb") as f:
         scaler = pickle.load(f)
-    with open(MODELS_DIR / "model_v5_reversion.pkl", "rb") as f:
+    with open(MODELS_DIR / "model_v6_reversion.pkl", "rb") as f:
         xgb_m = pickle.load(f)
 
     row_train = build_feature_row(zone_training,  df_syn, entry, sl, enc, 0.0001)

@@ -121,17 +121,37 @@ def check_risk_pips(df: pd.DataFrame) -> None:
 
 
 def check_label_distribution(df: pd.DataFrame) -> None:
-    """HARD: reversion win rate in [LABEL_WIN_RATE_MIN, LABEL_WIN_RATE_MAX]."""
-    win_rate = (df["label"] == 1.0).mean()
+    """HARD: reversion win rate in [LABEL_WIN_RATE_MIN, LABEL_WIN_RATE_MAX].
+
+    FIX: previously computed as (label == 1.0).mean() over the WHOLE
+    population, which matched the OLD training code that truncated every
+    soft/timeout score (0.2, 0.35, 0.5, 0.6, 0.75) down to class 0 via
+    `.astype(int)`. model_trainer.py's prepare_features() no longer does
+    that -- it now drops ambiguous (non-decisive) rows entirely rather than
+    mislabeling them as losses, so the win rate that actually matters is the
+    rate AMONG DECISIVE (label in {0.0, 1.0}) rows, since that's what the
+    classifier is actually trained on. Computing over the whole population
+    here was checking a number the training pipeline no longer produces.
+    """
+    decisive = df[np.isclose(df["label"], 0.0) | np.isclose(df["label"], 1.0)]
+    timeout_frac = 1.0 - len(decisive) / len(df) if len(df) else 0.0
+    win_rate = (decisive["label"] == 1.0).mean() if len(decisive) else float("nan")
+
     if not (LABEL_WIN_RATE_MIN <= win_rate <= LABEL_WIN_RATE_MAX):
         raise ValueError(
-            f"[LABEL_DIST] Reversion win rate {win_rate:.1%} is outside "
-            f"[{LABEL_WIN_RATE_MIN:.0%}, {LABEL_WIN_RATE_MAX:.0%}].\n"
+            f"[LABEL_DIST] Reversion win rate {win_rate:.1%} (of {len(decisive):,} "
+            f"decisive rows; {timeout_frac:.1%} of all rows are non-decisive "
+            f"timeouts) is outside [{LABEL_WIN_RATE_MIN:.0%}, {LABEL_WIN_RATE_MAX:.0%}].\n"
             f"  Label value counts:\n{df['label'].value_counts().to_string()}\n"
             "If win rate is too high, the any() labelling bug has returned. "
             "If too low, check the SL/TP geometry in label_generator."
         )
-    logger.info(f"  ✅ Reversion label OK — win rate {win_rate:.1%}")
+    logger.info(
+        f"  ✅ Reversion label OK — win rate {win_rate:.1%} among {len(decisive):,} "
+        f"decisive rows (raw label==1.0 rate over all rows: "
+        f"{(df['label']==1.0).mean():.1%}; {timeout_frac:.1%} of rows are timeouts "
+        f"and will be dropped from classifier training, not counted as losses)"
+    )
 
 
 def check_minimum_rows(df: pd.DataFrame) -> None:
@@ -174,17 +194,25 @@ def check_date_freshness(df: pd.DataFrame) -> None:
 
 
 def check_continuation_win_rate(df: pd.DataFrame) -> None:
-    """WARNING: continuation win rate should be 15–35%."""
-    win_rate = (df["label_cont"] >= 0.9).mean()
+    """WARNING: continuation win rate should be 15–35%.
+
+    FIX: same reasoning as check_label_distribution -- compute over decisive
+    (label_cont in {0.0, 1.0}) rows only, matching what prepare_features()
+    actually trains the continuation classifier on.
+    """
+    decisive = df[np.isclose(df["label_cont"], 0.0) | np.isclose(df["label_cont"], 1.0)]
+    win_rate = (decisive["label_cont"] == 1.0).mean() if len(decisive) else float("nan")
     if not (CONT_WIN_RATE_MIN <= win_rate <= CONT_WIN_RATE_MAX):
         logger.warning(
-            f"  ⚠️  [CONT_LABEL] Continuation win rate {win_rate:.1%} is outside "
+            f"  ⚠️  [CONT_LABEL] Continuation win rate {win_rate:.1%} (of "
+            f"{len(decisive):,} decisive rows) is outside "
             f"[{CONT_WIN_RATE_MIN:.0%}, {CONT_WIN_RATE_MAX:.0%}]. "
             "Expected ~20-25%. If inflated, check check_continuation_outcome() "
             "entry-first validation in label_generator.py."
         )
     else:
-        logger.info(f"  ✅ Continuation label OK — win rate {win_rate:.1%}")
+        logger.info(f"  ✅ Continuation label OK — win rate {win_rate:.1%} "
+                     f"among {len(decisive):,} decisive rows")
 
 
 def check_feature_correlations(df: pd.DataFrame) -> None:

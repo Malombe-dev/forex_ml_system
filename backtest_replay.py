@@ -55,8 +55,17 @@ HONEST LIMITATIONS — read before trusting the output
    filter to "what live would actually have taken" after the fact without
    losing signal volume for stats.
 
-5. This only replays the REVERSION strategy (per your request) — the
-   Continuation model and the 15-min signal pipeline are not exercised.
+5. Both the REVERSION and CONTINUATION HTF strategies are replayed, each
+   with its own model/scaler/encoders and its own min-probability gate
+   (--prob-threshold for reversion, --cont-prob-threshold for continuation,
+   default 0.55 for both) — mirroring run_dual_strategy()'s rev/cont pair
+   in production_predictor.py. Each strategy gets its own open-trade guard
+   and zone dedup, so a triggered reversion trade never blocks a
+   continuation proposal on the same symbol, and vice versa. Every result
+   row is tagged "strategy": "REVERSION"/"CONTINUATION" in the JSON/CSV
+   report. Pass --no-continuation to replay reversion only (old behavior).
+   The 15-min signal pipeline is still not exercised — only the HTF
+   (4h/1h) detection path is replayed for both strategies.
 
 Run this, then sanity-check a handful of individual trades against the
 chart by hand before trusting the aggregate win rate.
@@ -75,6 +84,8 @@ Optional:
     --finnhub-key YOUR_KEY      (or set FINNHUB_API_KEY env var)
     --no-news                   (skip news filtering entirely)
     --out-dir backtest_results  (where to save the report)
+    --no-continuation           (replay REVERSION only, skip CONTINUATION)
+    --cont-prob-threshold 0.55  (min ML probability for continuation signals)
 """
 
 import os
@@ -89,7 +100,8 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional
 
-from milestone_tracking import evaluate_milestone, log_milestone_event, summarize_milestones
+from milestone_tracking import evaluate_milestone, log_milestone_event, summarize_milestones, evaluate_tp_progress
+from reentry_logic import evaluate_reentry, ReentryConfig
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -170,6 +182,10 @@ _load_dotenv()
 # Import the live predictor code directly so we reuse its exact logic.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from production_predictor import ProductionForexPredictor  # noqa: E402
+try:
+    from signal_advisor import advise as _advise   # shadow-mode entry advisor
+except Exception:
+    _advise = None
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -400,6 +416,18 @@ class ReplayClock:
     """Mutable 'current simulated time' shared across all patched predictors."""
     def __init__(self):
         self.now: datetime = datetime.utcnow()
+
+
+def _bind_replay_time(pred, clock):
+    """Point every wall-clock read that feeds session/time-of-day logic at the
+    replay clock (same idea as the fetch_bars patch). Covers the predictor
+    (SL spread padding, logged 'session') and its HTFInstitutionalAnalyzer
+    (confluence 'session_lq'). Without this they read datetime.utcnow(),
+    i.e. the moment 'run' was clicked."""
+    pred._current_time = lambda: clock.now
+    _htf = getattr(pred, "htf_analyzer", None)
+    if _htf is not None:
+        _htf._current_time = lambda: clock.now
 
 
 def make_replay_fetch_bars(symbol: str, historical: dict, clock: ReplayClock, pred: ProductionForexPredictor):
@@ -667,11 +695,14 @@ def trace_post_tp_price_action(df15: pd.DataFrame, exit_time: datetime, directio
 # Validated against only 3 signals -- rerun and check the win-rate-by-tier
 # breakdown in the Stage-3 summary before trusting this beyond that sample.
 EXHAUSTION_WEIGHTS = {
-    "touch_rejection_wick_atr":      0.35,
-    "consecutive_directional_bars":  0.25,
-    "approach_velocity_30m_atr":     0.20,
-    "touch_bar_size_atr":            0.10,
+    # Synced to production_predictor.py's live weights (2026-09-10) -- these
+    # had drifted apart, meaning backtests were validating different logic
+    # than what live traded. Keep these two in sync going forward.
+    "touch_rejection_wick_atr":      0.45,
+    "consecutive_directional_bars":  0.15,
+    "touch_bar_size_atr":            0.20,
     "pre_touch_bar_size_atr":        0.10,
+    "approach_velocity_30m_atr":     0.10,
 }
 EXHAUSTION_CAPS = {
     "touch_rejection_wick_atr":      1.4,
@@ -680,8 +711,8 @@ EXHAUSTION_CAPS = {
     "pre_touch_bar_size_atr":        2.0,
     "approach_velocity_30m_atr":     3.5,
 }
-EXHAUSTION_MID_THRESHOLD  = 0.58
-EXHAUSTION_HIGH_THRESHOLD = 0.75
+EXHAUSTION_MID_THRESHOLD  = 0.70   # raised from 0.58 -- backtested +34.50R vs +27.89R on 2026-09-01 replay
+EXHAUSTION_HIGH_THRESHOLD = 0.85   # raised from 0.75
 ACCEL_SCORE_BONUS  = 0.30   # 5min knife-bar bump, folds the old accel check into the score
 SL_PAD_BASE_ATR    = 0.40   # flat cushion added regardless of wick size
 SL_PAD_WICK_ATR    = 0.60   # extra cushion proportional to the observed rejection wick
@@ -803,8 +834,24 @@ def compute_trigger_decision(sig: dict, direction: str, approach_metrics: dict,
         baseline_sl_pad = 3.0 * pip_size
 
     if score < exhaustion_mid_threshold:
-        return {"action": "unchanged", "reason": f"score={score:.2f} -- clean touch",
-                "score": score, "final_signal": None}
+        # Protect unchanged clean-touch trades from shallow wick sweeps (0.3p - 3.5p)
+        new_sl = orig_sl + sign * baseline_sl_pad
+        new_risk = abs(orig_entry - new_sl)
+        final_sig = dict(sig)
+        final_sig.update({
+            "entry": round(orig_entry, 5),
+            "sl": round(new_sl, 5),
+            "tp": round(orig_tp, 5),
+            "risk_pips": round(new_risk / pip_size, 1),
+            "reward_pips": round(orig_reward / pip_size, 1),
+            "risk_reward": f"1:{orig_reward / new_risk:.1f}" if new_risk > 0 else sig.get("risk_reward", "1:2.0"),
+            "rr": f"1:{orig_reward / new_risk:.1f}" if new_risk > 0 else sig.get("rr", "1:2.0"),
+            "adjusted": False,
+            "tier": "unchanged",
+            "buffered_baseline": True,
+        })
+        return {"action": "unchanged", "reason": f"score={score:.2f} -- clean touch (baseline buffered)",
+                "score": score, "final_signal": final_sig}
 
     tier = "mid" if score < exhaustion_high_threshold else "high"
     scale = TIER_SCALE[tier]
@@ -868,11 +915,78 @@ def compute_trigger_decision(sig: dict, direction: str, approach_metrics: dict,
     }
 
 
+def _resolve_pushed_entry_fill(final_signal: dict, original_sig: dict, direction: str,
+                                trigger_time: datetime, df15: pd.DataFrame, symbol: str,
+                                pip_size: float, approach_metrics: dict,
+                                action: str, decision_reason: str) -> dict:
+    """Legacy behaviour, preserved for raw_limit_fills_at_touch=False: treat
+    the adjusted entry as a fresh resting limit order that only starts being
+    watched AFTER the touch bar closes, filled the first time price reaches
+    ANY point in [raw_entry, pushed_entry], at whatever price is offered.
+
+    This double-counts causality (see the caller's comment) but is kept
+    available since it was validated against real bars for the retracement
+    case it was built for, and may match a live execution model where a
+    human/system actually waits for the touch bar to close before deciding
+    whether to place the order at all.
+    """
+    entry = final_signal["entry"]
+    sl    = final_signal["sl"]
+    tp    = final_signal["tp"]
+    raw_entry = original_sig.get("entry", entry)
+
+    window_hours = get_fill_window_hours(symbol)
+    fill_cutoff = trigger_time + timedelta(hours=window_hours)
+    fill_window = df15[(df15["time"] > trigger_time) & (df15["time"] <= fill_cutoff)]
+    fill_time = None
+    filled_entry = None
+    for _, fbar in fill_window.iterrows():
+        if direction == "SELL":
+            reached = fbar["high"] >= raw_entry
+            price_offered = min(fbar["high"], entry)
+        else:
+            reached = fbar["low"] <= raw_entry
+            price_offered = max(fbar["low"], entry)
+        if reached:
+            fill_time = fbar["time"]
+            filled_entry = price_offered
+            break
+
+    if fill_time is None:
+        last_available_time = df15["time"].max()
+        if fill_cutoff > last_available_time:
+            return {"_resolved": False, "outcome_dict": {
+                "outcome": "still_pending", "trigger_time": trigger_time,
+                "action": action, "adjusted": True, "tier": final_signal.get("tier"),
+                "adjustment_reason": decision_reason,
+                "fill_window_hours": window_hours, "fill_cutoff": fill_cutoff,
+                "last_available_time": last_available_time,
+                "hours_of_fill_window_remaining": (fill_cutoff - last_available_time).total_seconds() / 3600,
+            }}
+        return {"_resolved": False, "outcome_dict": {
+            "outcome": "adjusted_never_filled", "trigger_time": trigger_time,
+            "action": action, "adjusted": True, "tier": final_signal.get("tier"),
+            "adjustment_reason": decision_reason,
+            "entry": entry, "sl": sl, "tp": tp, **approach_metrics,
+        }}
+
+    entry_decay_frac = (abs(entry - filled_entry) / abs(entry - raw_entry)
+                         if entry != raw_entry else 0.0)  # 0 = filled at full push, 1 = filled at raw entry
+    sl_shift = sl - entry
+    tp_shift = tp - entry
+    entry = filled_entry
+    sl = entry + sl_shift
+    tp = entry + tp_shift
+    return {"_resolved": True, "entry": entry, "sl": sl, "tp": tp,
+            "hold_start_time": fill_time, "entry_decay_frac": entry_decay_frac}
+
+
 def simulate_trigger_and_outcome(sig: dict, symbol: str, proposed_at: datetime,
                                   historical: dict, zone_ttl_hours: float, pip_size: float,
                                   max_hold_days: int = 15, sl_trace_days: float = 3.0,
                                   apply_trigger_decision: bool = True,
-                                  final_log_path: Optional[Path] = None,
+                                  raw_limit_fills_at_touch: bool = True,
+                                  enable_reentry: bool = False,
                                   skip_consec_threshold: int = 2,
                                   accel_bar_size_atr_min: float = 2.0,
                                   accel_body_ratio_min: float = 0.70,
@@ -880,7 +994,8 @@ def simulate_trigger_and_outcome(sig: dict, symbol: str, proposed_at: datetime,
                                   sl_pad_wick_atr: float = SL_PAD_WICK_ATR,
                                   exhaustion_mid_threshold: float = EXHAUSTION_MID_THRESHOLD,
                                   exhaustion_high_threshold: float = EXHAUSTION_HIGH_THRESHOLD,
-                                  accel_score_bonus: float = ACCEL_SCORE_BONUS):
+                                  accel_score_bonus: float = ACCEL_SCORE_BONUS,
+                                  final_log_path=None):
     """
     Walks forward through historical 15-min bars to determine:
     1. Whether/when the zone got touched (trigger)
@@ -1063,96 +1178,56 @@ def simulate_trigger_and_outcome(sig: dict, symbol: str, proposed_at: datetime,
             })
 
         if action in ("adjust_mid", "adjust_high") and final_signal is not None:
-            # New entry is a LIMIT order at a price not yet reached (pushed
-            # further in the direction price was already running when it
-            # touched the zone) -- have to wait for price to actually get
-            # there before the SL/TP hold loop can start.
-            #
-            # Originally this held the pushed price fixed for the whole
-            # fill window: either price fully retraced to the aggressive
-            # level, or the signal expired with zero risk taken. Checked
-            # against real EUR/USD & USD/JPY bars (2026-08-25): in the
-            # persistent no-fill cases, price retraced PART way back --
-            # sometimes most of the way -- but never the full pushed
-            # distance, even over a 24h lookahead. That's a real tradeable
-            # retracement being thrown away as a non-signal.
-            #
-            # First attempt was a linear time-decay (relax the required
-            # price from pushed toward raw as the window elapses) -- but
-            # checked against real bars, this DIDN'T work: the actual peak
-            # retracement on the EUR/USD case happened ~1.25h after
-            # trigger, while the decay schedule was still too strict at
-            # that point; by the time decay loosened enough (~4.7h in),
-            # price had already reversed and moved on. Time-decay assumes
-            # the best opportunity comes late; in practice it came early.
-            #
-            # Fixed version: treat it as a resting limit order across the
-            # whole [raw_entry, pushed_entry] range, filled the FIRST time
-            # price reaches ANY point in that range, at whatever price is
-            # actually offered on that bar (capped at the ideal pushed
-            # price -- you never pay worse than what triggered the
-            # adjustment, and never demand better than what actually
-            # happened). Verified against real bars: this fills the
-            # EUR/USD 07-02 case in 15 min at 1.14557 (real, decent price).
-            # It does NOT eliminate genuine losses -- if price never comes
-            # back to the raw entry either (confirmed still true for the
-            # USD/JPY 08-08 case even with this fix), it still correctly
-            # expires with zero risk taken.
-            entry = final_signal["entry"]
-            sl    = final_signal["sl"]
-            tp    = final_signal["tp"]
-            raw_entry = original_sig.get("entry", entry)
-
-            window_hours = get_fill_window_hours(symbol)
-            fill_cutoff = trigger_time + timedelta(hours=window_hours)
-            fill_window = df15[(df15["time"] > trigger_time) & (df15["time"] <= fill_cutoff)]
-            fill_time = None
-            filled_entry = None
-            for _, fbar in fill_window.iterrows():
-                if direction == "SELL":
-                    reached = fbar["high"] >= raw_entry
-                    price_offered = min(fbar["high"], entry)   # entry here is still the pushed price
+            if raw_limit_fills_at_touch:
+                # RESTING-ORDER SEMANTICS (2026-09-17 fix, default ON):
+                # The raw limit order was placed at raw_entry BEFORE the
+                # touch bar closed -- that's what a resting limit order is.
+                # trigger_time/trigger_price already show price reached it
+                # (that's how trigger_time got set, a few dozen lines up).
+                # compute_trigger_decision() only runs AFTER the touch bar
+                # closes (it needs touch_bar_size_atr etc.), so it cannot
+                # retroactively un-fill an order that already executed.
+                #
+                # Previously this branch instead required a SECOND touch of
+                # the pushed (adjusted) entry price within a fill window
+                # starting strictly after trigger_time, and expired the
+                # trade with zero risk taken ("adjusted_never_filled") if
+                # price never came back. That double-counts causality: it
+                # uses the touch-bar close to compute an adjustment, then
+                # applies that adjustment retroactively to whether the
+                # touch-bar fill happened at all. Confirmed against the
+                # 2026-09-17 replay: EUR/USD signal #1 reached 1.15261
+                # against a raw entry of 1.15264 (0.3 pips away) and was
+                # still logged "adjusted_never_filled" -- live, that fills.
+                #
+                # Fixed behaviour: the fill is the raw touch. The
+                # adjustment only re-centers SL/TP around that real fill
+                # price, preserving the same risk cushion and R:R the
+                # adjustment intended -- entry itself is never moved.
+                entry = trigger_price
+                sl_shift = final_signal["sl"] - final_signal["entry"]
+                tp_shift = final_signal["tp"] - final_signal["entry"]
+                sl = entry + sl_shift
+                tp = entry + tp_shift
+                action = f"{action}_sltp_only"
+                hold_start_time = trigger_time
+                # Old scale: 0 = filled at full push, 1 = filled at raw entry.
+                # Under this branch entry is ALWAYS the raw touch price, so
+                # this is always 1.0 -- kept for output-schema compatibility
+                # with the legacy helper's output, not because anything here
+                # is actually being measured on a spectrum anymore.
+                entry_decay_frac = 1.0
+            else:
+                _adj_result = _resolve_pushed_entry_fill(
+                    final_signal, original_sig, direction, trigger_time, df15,
+                    symbol, pip_size, approach_metrics, action, decision_reason,
+                )
+                if _adj_result.get("_resolved"):
+                    entry, sl, tp = _adj_result["entry"], _adj_result["sl"], _adj_result["tp"]
+                    hold_start_time = _adj_result["hold_start_time"]
+                    entry_decay_frac = _adj_result["entry_decay_frac"]
                 else:
-                    reached = fbar["low"] <= raw_entry
-                    price_offered = max(fbar["low"], entry)
-                if reached:
-                    fill_time = fbar["time"]
-                    filled_entry = price_offered
-                    break
-
-            if fill_time is None:
-                last_available_time = df15["time"].max()
-                if fill_cutoff > last_available_time:
-                    return {
-                        "outcome": "still_pending", "trigger_time": trigger_time,
-                        "trigger_price": trigger_price, "entry_slippage_pips": entry_slippage_pips,
-                        "action": action, "adjusted": True, "tier": final_signal.get("tier"),
-                        "adjustment_reason": decision_reason,
-                        "fill_window_hours": window_hours,
-                        "fill_cutoff": fill_cutoff,
-                        "last_available_time": last_available_time,
-                        "hours_of_fill_window_remaining": (fill_cutoff - last_available_time).total_seconds() / 3600,
-                    }
-                return {
-                    "outcome": "adjusted_never_filled", "trigger_time": trigger_time,
-                    "trigger_price": trigger_price, "entry_slippage_pips": entry_slippage_pips,
-                    "action": action, "adjusted": True, "tier": final_signal.get("tier"),
-                    "adjustment_reason": decision_reason,
-                    "entry": entry, "sl": sl, "tp": tp,
-                    **approach_metrics,
-                }
-            # Re-center SL/TP on the price we actually got filled at, keeping
-            # the same risk/reward distances the adjustment intended (same
-            # SL cushion, same target R:R) rather than reusing the bracket
-            # computed for the fully-pushed entry that never happened.
-            entry_decay_frac = (abs(entry - filled_entry) / abs(entry - raw_entry)
-                                 if entry != raw_entry else 0.0)  # 0 = filled at full push, 1 = filled at raw entry
-            sl_shift = sl - entry
-            tp_shift = tp - entry
-            entry = filled_entry
-            sl = entry + sl_shift
-            tp = entry + tp_shift
-            hold_start_time = fill_time
+                    return _adj_result["outcome_dict"]
         elif final_signal is not None:
             # Baseline buffer or non-pushed adjustment: update entry, sl, tp directly
             entry = final_signal["entry"]
@@ -1163,6 +1238,9 @@ def simulate_trigger_and_outcome(sig: dict, symbol: str, proposed_at: datetime,
     max_cutoff = hold_start_time + timedelta(days=max_hold_days)
     hold = df15[(df15["time"] > hold_start_time) & (df15["time"] <= max_cutoff)]
 
+    peak_fav = 0.0
+    peak_time = hold_start_time
+
     for _, bar in hold.iterrows():
         hit_sl = (bar["low"] <= sl) if direction == "BUY" else (bar["high"] >= sl)
         hit_tp = (bar["high"] >= tp) if direction == "BUY" else (bar["low"] <= tp)
@@ -1172,6 +1250,69 @@ def simulate_trigger_and_outcome(sig: dict, symbol: str, proposed_at: datetime,
             post_sl = trace_post_sl_price_action(
                 df15, bar["time"], direction, entry, sl, tp, pip_size, trace_days=sl_trace_days
             )
+
+            # ── POST-SL RE-ENTRY (Method 2) ────────────────────────────────
+            # Pure post-hoc enrichment on top of the already-classified
+            # hit_sl outcome -- never changes "outcome" itself, only adds
+            # a nested "reentry" verdict for a separate would-be position.
+            # df15 already carries history before bar["time"], which is
+            # exactly what evaluate_reentry needs for its ATR lookback.
+            #
+            # GATED (2026-09-17): confirmed net-negative on real data --
+            # 10 re-entry attempts, 3 wins, hit_sl bucket went from -16.00R
+            # as traded to -19.50R with re-entry layered on. Default OFF
+            # via enable_reentry=False lets a plain run measure the core
+            # core system without this compounding losses on top of setups
+            # that already failed once. Kept available (not deleted) so it
+            # can still be A/B'd on its own rather than lost entirely.
+            if enable_reentry:
+                try:
+                    reentry_result = evaluate_reentry(
+                        symbol=symbol, direction=direction,
+                        orig_entry=entry, orig_sl=sl, orig_tp=tp,
+                        sl_hit_time=bar["time"], bars_after_sl=df15,
+                    )
+                except Exception as e:
+                    reentry_result = {"reentered": False, "reason": f"error: {e}"}
+            else:
+                reentry_result = {"reentered": False, "reason": "disabled (enable_reentry=False)"}
+
+            # evaluate_reentry() only decides whether a re-entry fires --
+            # it never says whether that new position went on to win or
+            # lose. Resolve that here, the same conservative way the
+            # original trade is resolved (SL wins same-bar ties), so the
+            # replay report can carry a real R for the re-entry sub-trade
+            # rather than just the trigger decision.
+            if reentry_result.get("reentered"):
+                _rt  = reentry_result["reentry_time"]
+                _ne  = reentry_result["new_entry"]
+                _nsl = reentry_result["new_sl"]
+                _tp2 = reentry_result["tp"]
+                _fwd = df15[df15["time"] > _rt]
+                _outcome2, _exit2 = "unresolved", None
+                for _, b2 in _fwd.iterrows():
+                    _sl2_hit = (b2["low"] <= _nsl) if direction == "BUY" else (b2["high"] >= _nsl)
+                    _tp2_hit = (b2["high"] >= _tp2) if direction == "BUY" else (b2["low"] <= _tp2)
+                    if _sl2_hit:
+                        _outcome2, _exit2 = "hit_sl", b2["time"]
+                        break
+                    if _tp2_hit:
+                        _outcome2, _exit2 = "hit_tp", b2["time"]
+                        break
+                reentry_result["resolved_outcome"] = _outcome2
+                reentry_result["resolved_exit_time"] = _exit2
+                if _outcome2 == "hit_tp":
+                    reentry_result["resolved_r"] = reentry_result.get("reentry_rr")
+                elif _outcome2 == "hit_sl":
+                    reentry_result["resolved_r"] = -1.0
+                else:
+                    # Ran past the end of the available bar cache before
+                    # resolving either way. Treated as -1R here (same
+                    # conservative convention used for the aggregate
+                    # totals), but resolved_outcome=="unresolved" flags
+                    # that this specific number isn't a verified result.
+                    reentry_result["resolved_r"] = -1.0
+
             return {
                 "outcome": "hit_sl", "trigger_time": trigger_time, "exit_time": bar["time"],
                 "trigger_price": trigger_price, "entry_slippage_pips": entry_slippage_pips,
@@ -1181,6 +1322,7 @@ def simulate_trigger_and_outcome(sig: dict, symbol: str, proposed_at: datetime,
                 "entry": entry, "sl": sl, "tp": tp,
                 **approach_metrics,
                 **post_sl,
+                "reentry": reentry_result,
             }
         if hit_tp:
             # ── POST-TP TRACE: how far did price continue after hitting TP? ──
@@ -1216,6 +1358,30 @@ def simulate_trigger_and_outcome(sig: dict, symbol: str, proposed_at: datetime,
                 "milestone": milestone,
             }
 
+        # ── Dynamic TP progress / exhaustion advisory ──
+        fav = (bar["high"] - entry) if direction == "BUY" else (entry - bar["low"])
+        if fav > peak_fav:
+            peak_fav = fav
+            peak_time = bar["time"]
+        hours_near_peak = (bar["time"] - peak_time).total_seconds() / 3600.0 if peak_time else 0.0
+        eval_res = evaluate_tp_progress(
+            bar, direction, entry, sl, tp,
+            pip_size=pip_size, symbol=symbol,
+            atr=atr_15m, hours_near_peak=hours_near_peak,
+        )
+        if eval_res.get("action") == "ADVISE_EXIT":
+            return {
+                "outcome": "hit_tp", "trigger_time": trigger_time, "exit_time": bar["time"],
+                "trigger_price": trigger_price, "entry_slippage_pips": entry_slippage_pips,
+                "action": action, "adjusted": bool(final_signal is not None and final_signal.get("adjusted", False)),
+                "tier": (final_signal or {}).get("tier"), "entry_decay_frac": entry_decay_frac,
+                "entry": entry, "sl": sl, "tp": round(float(bar["close"]), 5),
+                "r_multiple": eval_res.get("current_r"),
+                "advisory_exit": True,
+                "advisory_reason": eval_res.get("reason"),
+                **approach_metrics,
+            }
+
     return {"outcome": "timeout", "trigger_time": trigger_time,
             "trigger_price": trigger_price, "entry_slippage_pips": entry_slippage_pips,
             "action": action, "adjusted": bool(final_signal is not None and final_signal.get("adjusted", False)),
@@ -1229,16 +1395,16 @@ def simulate_trigger_and_outcome(sig: dict, symbol: str, proposed_at: datetime,
 # ═══════════════════════════════════════════════════════════════════════
 
 SYMBOL_PARAMS = {
-    "EUR/USD": dict(max_distance_pips_rev=25.0, zone_distance_threshold=50.0,  min_strength_atr=0.35),
-    "GBP/USD": dict(max_distance_pips_rev=25.0, zone_distance_threshold=50.0,  min_strength_atr=0.35),
-    "USD/JPY": dict(max_distance_pips_rev=25.0, zone_distance_threshold=50.0,  min_strength_atr=0.35),
-    "XAU/USD": dict(max_distance_pips_rev=80.0, zone_distance_threshold=150.0, min_strength_atr=0.40),
+    "EUR/USD": dict(max_distance_pips_rev=25.0, max_distance_pips_cont=15.0, zone_distance_threshold=50.0,  min_strength_atr=0.35),
+    "GBP/USD": dict(max_distance_pips_rev=25.0, max_distance_pips_cont=15.0, zone_distance_threshold=50.0,  min_strength_atr=0.35),
+    "USD/JPY": dict(max_distance_pips_rev=25.0, max_distance_pips_cont=15.0, zone_distance_threshold=50.0,  min_strength_atr=0.35),
+    "XAU/USD": dict(max_distance_pips_rev=80.0, max_distance_pips_cont=50.0, zone_distance_threshold=150.0, min_strength_atr=0.40),
 }
 
 
 def build_reversion_predictor(symbol: str, api_key: str, debug: bool = True,
                                zone_ttl_hours: float = 48.0,
-                               prob_threshold: float = 0.60) -> ProductionForexPredictor:
+                               prob_threshold: float = 0.40) -> ProductionForexPredictor:
     """Same construction params as run_dual_strategy()'s `rev` predictor, live.
 
     zone_ttl_hours default (48.0) matches the 4H institutional FVG/OB zone
@@ -1258,9 +1424,54 @@ def build_reversion_predictor(symbol: str, api_key: str, debug: bool = True,
         min_strength_atr=0.50, use_5min_refinement=True,
         refine_max_dist_multiplier=2.0, enable_continuation=False,
         use_htf_analysis=True, min_confluence_score=1,
+        require_htf_bias_gate=False,
         zone_ttl_hours=zone_ttl_hours, zone_distance_threshold=p["zone_distance_threshold"],
-        htf_fvg_min_gap_atr=0.5, htf_ob_min_reaction_atr=2.5,
+        # PARITY FIX (2026-09-17): was 0.5 / 2.5 here while live
+        # run_dual_strategy() (production_predictor.py:4627) uses 0.3 / 1.0.
+        # The replay was STRICTER than live, so every backtest measured a
+        # different, smaller signal set than the one actually traded.
+        htf_fvg_min_gap_atr=0.3, htf_ob_min_reaction_atr=1.0,
         is_continuation_strategy=False, require_zone_close=True, debug=debug,
+    )
+
+
+def build_continuation_predictor(symbol: str, api_key: str, debug: bool = True,
+                                  zone_ttl_hours: float = 48.0,
+                                  prob_threshold: float = 0.55) -> ProductionForexPredictor:
+    """Same construction params as run_dual_strategy()'s `cont` predictor, live
+    (production_predictor.py:4788-4804) -- separate model/scaler/encoders from
+    reversion, is_continuation_strategy=True, enable_continuation=True.
+
+    prob_threshold default (0.55) matches the live continuation predictor as
+    of 2026-09 (was 0.60 in both places -- see production_predictor.py's
+    run_dual_strategy() `cont = ProductionForexPredictor(...)` call).
+
+    Unlike build_reversion_predictor(), require_zone_close is NOT passed here
+    -- it defaults to False, exactly matching the live `cont` instantiation
+    (only the `rev` predictor sets require_zone_close=True live). Don't add
+    it here without also changing production_predictor.py, or replay and
+    live will silently diverge again.
+    """
+    p = SYMBOL_PARAMS[symbol]
+    return ProductionForexPredictor(
+        api_key=api_key,
+        model_path="models/model_v6_continuation.pkl",
+        scaler_path="models/scaler_v6_continuation.pkl",
+        encoders_path="models/encoders_v6_continuation.pkl",
+        stats_path="models/training_stats_v6_continuation.pkl",
+        symbol=symbol,
+        prob_threshold=prob_threshold,   # matches live run_dual_strategy() CONT predictor
+        max_rr=10.0, min_risk_atr=2.5, max_distance_pips=p["max_distance_pips_cont"],
+        min_strength_atr=0.50, use_5min_refinement=True,
+        refine_max_dist_multiplier=2.0, enable_continuation=True,
+        use_htf_analysis=True, min_confluence_score=1,
+        require_htf_bias_gate=False,
+        zone_ttl_hours=zone_ttl_hours, zone_distance_threshold=p["zone_distance_threshold"],
+        # PARITY (matches build_reversion_predictor() above): replay uses the
+        # same htf_fvg/ob parity-fixed values as live run_dual_strategy() for
+        # both strategies.
+        htf_fvg_min_gap_atr=0.3, htf_ob_min_reaction_atr=1.0,
+        is_continuation_strategy=True, debug=debug,
     )
 
 
@@ -1361,7 +1572,9 @@ def generate_signal_charts(symbol: str, all_results: list, df15: pd.DataFrame, c
     for n, r in enumerate(sym_results, 1):
         tag = outcome_tag.get(r["outcome"], r["outcome"])
         date_str = str(pd.to_datetime(r["proposed_at"]).date())
-        fname = f"{n:02d}_{safe_symbol}_{date_str}_{tag}.png"
+        strat_tag = r.get("strategy", "")
+        strat_part = f"_{strat_tag}" if strat_tag else ""
+        fname = f"{n:02d}_{safe_symbol}{strat_part}_{date_str}_{tag}.png"
         try:
             plot_signal_chart(r, df15, charts_dir / fname)
         except Exception as e:
@@ -1373,8 +1586,13 @@ def run_replay(pairs: list, days_back: int, finnhub_key: str, use_news: bool, ou
                 debug: bool = True, sl_trace_days: float = 3.0, zone_ttl_hours: float = 48.0,
                 zone_dedup_days: float = 3.0, make_charts: bool = True,
                 zone_ttl_overrides: dict = None, apply_trigger_decision: bool = True,
-                skip_consec_threshold: int = 2, accel_bar_size_atr_min: float = 2.0,
-                accel_body_ratio_min: float = 0.70, prob_threshold: float = 0.60,
+                raw_limit_fills_at_touch: bool = True,
+                enable_reentry: bool = False,
+                skip_consec_threshold: int = 2,
+                accel_bar_size_atr_min: float = 2.0,
+                accel_body_ratio_min: float = 0.70, prob_threshold: float = 0.40,
+                enable_continuation_replay: bool = True,
+                cont_prob_threshold: float = 0.55,
                 timeframe: str = "4h",
                 sl_pad_base_atr: float = SL_PAD_BASE_ATR,
                 sl_pad_wick_atr: float = SL_PAD_WICK_ATR,
@@ -1427,6 +1645,7 @@ def run_replay(pairs: list, days_back: int, finnhub_key: str, use_news: bool, ou
               f"same behavior as before this feature existed.")
     print(f"Run params: pairs={pairs} timeframes={tf_list} days_back={days_back} use_news={use_news} debug={debug} "
           f"prob_threshold={prob_threshold} "
+          f"enable_continuation_replay={enable_continuation_replay} cont_prob_threshold={cont_prob_threshold} "
           f"zone_ttl_hours={zone_ttl_hours} zone_ttl_overrides={zone_ttl_overrides} "
           f"zone_dedup_days={zone_dedup_days} sl_trace_days={sl_trace_days}")
 
@@ -1456,10 +1675,27 @@ def run_replay(pairs: list, days_back: int, finnhub_key: str, use_news: bool, ou
                                          prob_threshold=prob_threshold)
         clock = ReplayClock()
         pred.fetch_bars = make_replay_fetch_bars(symbol, historical, clock, pred)
+        _bind_replay_time(pred, clock)
         pip_size = pred.pip_size
         print(f"  📏 [{symbol}] pip_size resolved to {pip_size} "
               f"(0.0001=standard FX, 0.01=JPY pair, 1.0=XAU/gold — confirms this pair "
               f"isn't silently using the wrong scale)")
+
+        # Continuation predictor — same symbol/clock/historical bars, separate
+        # model + own min-probability gate (default 0.55, see
+        # build_continuation_predictor()). Shares `clock` with `pred` since
+        # both read the same historical bar cache for this symbol; each gets
+        # its own fetch_bars binding so _calculate_indicators() is called on
+        # the right instance.
+        pred_cont = None
+        if enable_continuation_replay:
+            pred_cont = build_continuation_predictor(symbol, api_key, debug=debug,
+                                                       zone_ttl_hours=symbol_ttl_hours,
+                                                       prob_threshold=cont_prob_threshold)
+            pred_cont.fetch_bars = make_replay_fetch_bars(symbol, historical, clock, pred_cont)
+            _bind_replay_time(pred_cont, clock)
+            print(f"  📏 [{symbol}] CONTINUATION predictor loaded | min_prob={cont_prob_threshold*100:.0f}% | "
+                  f"max_distance_pips={SYMBOL_PARAMS[symbol]['max_distance_pips_cont']}")
 
         walk_tf = "1h" if "1h" in tf_list else "4h"
         walk_bars = historical[(symbol, walk_tf)]
@@ -1478,11 +1714,29 @@ def run_replay(pairs: list, days_back: int, finnhub_key: str, use_news: bool, ou
         # independently. Tracked as a list of (trigger_time, exit_time)
         # windows for trades that actually got filled; a walk-point t is
         # guarded only if it falls inside one of these.
-        open_trade_windows = []  # list[(trigger_time, exit_time)]
+        # Keyed by strategy name ("REVERSION"/"CONTINUATION") -- rev and cont
+        # are independent models/zone trackers live (separate ProductionForexPredictor
+        # instances), so a triggered reversion trade must NOT block a continuation
+        # proposal on the same symbol at the same time, and vice versa.
+        open_trade_windows = {"REVERSION": []}  # strategy -> list[(trigger_time, exit_time)]
         currencies = [c.upper() for c in symbol.replace("/", "_").split("_")]
 
-        last_zone_key  = None
-        last_zone_time = None
+        # DEDUP FIX (2026-09-17): this used to be a single (key, time) pair,
+        # so it only ever remembered the MOST RECENT zone. Interleaving broke
+        # it: propose zone A, then zone B, then zone A again -> A was treated
+        # as brand new because last_zone_key had already been overwritten by
+        # B. Confirmed on EUR/USD in replay_2026-09-17: signal #7 re-proposed
+        # the exact zone from signal #4 only 1.67 days later (inside the 3-day
+        # dedup window) and was logged as a new signal anyway.
+        # Now keyed per zone so every zone carries its own cooldown clock.
+        # Also keyed by strategy, for the same reason open_trade_windows is.
+        zone_last_seen = {"REVERSION": {}}  # strategy -> {zone_key: last_seen_time}
+
+        strategy_preds = [("REVERSION", pred)]
+        if pred_cont is not None:
+            open_trade_windows["CONTINUATION"] = []
+            zone_last_seen["CONTINUATION"] = {}
+            strategy_preds.append(("CONTINUATION", pred_cont))
 
         for i, t in enumerate(walk_points, 1):
             if i == 1 or i % 20 == 0 or i == n_points:
@@ -1495,198 +1749,268 @@ def run_replay(pairs: list, days_back: int, finnhub_key: str, use_news: bool, ou
 
             clock.now = t
 
-            # Only skip detection while a REAL open trade (already triggered)
-            # is running for this symbol — watched-but-untriggered zones no
-            # longer block anything.
-            if any(w0 <= t < w1 for (w0, w1) in open_trade_windows):
-                continue
+            for strat_name, active_pred in strategy_preds:
 
-            if use_news and news_events:
-                active, ev = is_news_active_at(t, currencies, news_events)
-                if active:
+                # Only skip detection while a REAL open trade (already triggered)
+                # is running for this symbol UNDER THIS STRATEGY — watched-but-
+                # untriggered zones no longer block anything, and the other
+                # strategy's open trade never blocks this one (see comment on
+                # open_trade_windows above).
+                if any(w0 <= t < w1 for (w0, w1) in open_trade_windows[strat_name]):
                     continue
 
-            # Scan timeframes (e.g. 4h, 1h)
-            for scan_tf in tf_list:
-                if scan_tf == "4h" and "1h" in tf_list and t not in four_h_times:
-                    continue
+                if use_news and news_events:
+                    active, ev = is_news_active_at(t, currencies, news_events)
+                    if active:
+                        continue
 
-                try:
-                    htf_context = pred.get_htf_context()
-                    raw = pred.htf_trade_detect(scan_tf, htf_context=htf_context)
-                except Exception as e:
-                    print(f"  ⚠️  {symbol} [{scan_tf}] @ {t}: detection error — {e}")
-                    continue
+                # Scan timeframes (e.g. 4h, 1h)
+                for scan_tf in tf_list:
+                    if scan_tf == "4h" and "1h" in tf_list and t not in four_h_times:
+                        continue
 
-                signals = raw.get("htf_signals", raw) if isinstance(raw, dict) else raw
-                if not signals:
-                    continue
+                    # CONTINUATION signals (15-min zones that flip) only ever get
+                    # built inside generate_signals() — htf_trade_detect() has no
+                    # continuation logic in it at all (confirmed: it never
+                    # references tracked_zones_15min / detect_zone_flip /
+                    # continuation_zones anywhere in its body). Calling
+                    # htf_trade_detect() for the CONTINUATION strategy, as this
+                    # loop used to do unconditionally, meant the flip-based
+                    # continuation path could never fire in replay even though
+                    # it fires live (live's run_dual_strategy() calls
+                    # cont_p.generate_signals(), never cont_p.htf_trade_detect()
+                    # directly). generate_signals() hardcodes its own internal
+                    # HTF scan to "4h" (see production_predictor.py ~line 3271),
+                    # so only call it once per walk-point, on the 4h pass, to
+                    # match when it would actually see fresh 4H data — calling
+                    # it again on a "1h" pass would just redundantly re-run the
+                    # same 4h-only scan.
+                    if strat_name == "CONTINUATION":
+                        if scan_tf != "4h":
+                            continue
+                        try:
+                            raw = active_pred.generate_signals()
+                        except Exception as e:
+                            print(f"  ⚠️  {symbol} [{strat_name}|{scan_tf}] @ {t}: detection error — {e}")
+                            continue
 
-                sig = signals[0]  # highest-probability signal, mirrors live's top pick
-                effective_ttl_hours = getattr(pred.zone_tracker, 'ttl_seconds',
-                                               symbol_ttl_hours * 3600) / 3600.0
+                        signals = (raw.get("15min_signals", []) if isinstance(raw, dict) else []) \
+                                  + (raw.get("htf_signals", [])   if isinstance(raw, dict) else [])
+                        if not signals:
+                            continue
+                    else:
+                        try:
+                            htf_context = active_pred.get_htf_context()
+                            raw = active_pred.htf_trade_detect(scan_tf, htf_context=htf_context)
+                        except Exception as e:
+                            print(f"  ⚠️  {symbol} [{strat_name}|{scan_tf}] @ {t}: detection error — {e}")
+                            continue
 
-                # ── Dedup check: same (direction, exact zone bounds) as last proposal? ──
-                _entry = sig.get('entry')
-                _zt = sig.get('zone_top')
-                _zb = sig.get('zone_bottom')
-                if pip_size:
-                    quantize = pip_size * 0.1  # sub-0.1-pip differences = float noise, not a new zone
-                    _q = lambda v: round(v / quantize) if v is not None else None
-                    zone_key = (sig.get('direction'),
-                                _q(_zt) if _zt is not None else _q(_entry),
-                                _q(_zb) if _zb is not None else _q(_entry))
-                else:
-                    zone_key = (sig.get('direction'), _entry, _entry)
-                if (last_zone_key is not None and zone_key == last_zone_key
-                        and last_zone_time is not None
-                        and (t - last_zone_time) <= timedelta(days=zone_dedup_days)):
-                    if debug:
-                        hrs_since = (t - last_zone_time).total_seconds() / 3600.0
-                        print(f"  🔁 [{symbol}] Exact same zone re-detected {hrs_since:.1f}h after last "
-                              f"proposal ({sig.get('direction')} {_zb}-{_zt}) — treating as a "
-                              f"continuation, NOT logging as a new signal.")
+                        signals = raw.get("htf_signals", raw) if isinstance(raw, dict) else raw
+                        if not signals:
+                            continue
+
+                    sig = signals[0]  # highest-probability signal, mirrors live's top pick
+                    effective_ttl_hours = getattr(active_pred.zone_tracker, 'ttl_seconds',
+                                                   symbol_ttl_hours * 3600) / 3600.0
+
+                    # ── Dedup check: same (direction, exact zone bounds) as last proposal? ──
+                    _entry = sig.get('entry')
+                    _zt = sig.get('zone_top')
+                    _zb = sig.get('zone_bottom')
+                    if pip_size:
+                        quantize = pip_size * 0.1  # sub-0.1-pip differences = float noise, not a new zone
+                        _q = lambda v: round(v / quantize) if v is not None else None
+                        zone_key = (sig.get('direction'),
+                                    _q(_zt) if _zt is not None else _q(_entry),
+                                    _q(_zb) if _zb is not None else _q(_entry))
+                    else:
+                        zone_key = (sig.get('direction'), _entry, _entry)
+                    prev_seen = zone_last_seen[strat_name].get(zone_key)
+                    if (prev_seen is not None
+                            and (t - prev_seen) <= timedelta(days=zone_dedup_days)):
+                        if debug:
+                            hrs_since = (t - prev_seen).total_seconds() / 3600.0
+                            print(f"  🔁 [{symbol}|{strat_name}] Exact same zone re-detected {hrs_since:.1f}h after last "
+                                  f"proposal ({sig.get('direction')} {_zb}-{_zt}) — treating as same "
+                                  f"active zone (cooldown), NOT logging as a new signal.")
+                        break
+
+                    zone_last_seen[strat_name][zone_key] = t
+
+                    print(f"  📌 [{symbol}|{strat_name}|{scan_tf.upper()}] Signal proposed @ {t}: {sig.get('direction')} "
+                          f"entry={sig.get('entry')} sl={sig.get('sl')} tp={sig.get('tp')} "
+                          f"prob={sig.get('probability')}")
+                    print(f"     ↳ full signal fields: {json.dumps(sig, default=str)}")
+
+                    result = simulate_trigger_and_outcome(sig, symbol, t, historical,
+                                                           zone_ttl_hours=effective_ttl_hours, pip_size=pip_size,
+                                                           sl_trace_days=sl_trace_days,
+                                                           apply_trigger_decision=apply_trigger_decision,
+                                                           raw_limit_fills_at_touch=raw_limit_fills_at_touch,
+                                                           enable_reentry=enable_reentry,
+                                                           final_log_path=final_log_path,
+                                                           skip_consec_threshold=skip_consec_threshold,
+                                                           accel_bar_size_atr_min=accel_bar_size_atr_min,
+                                                           accel_body_ratio_min=accel_body_ratio_min,
+                                                           sl_pad_base_atr=sl_pad_base_atr,
+                                                           sl_pad_wick_atr=sl_pad_wick_atr,
+                                                           exhaustion_mid_threshold=exhaustion_mid_threshold,
+                                                           exhaustion_high_threshold=exhaustion_high_threshold,
+                                                           accel_score_bonus=accel_score_bonus)
+
+                    entry = result.get("entry", sig.get("entry"))
+                    sl    = result.get("sl", sig.get("sl"))
+                    tp    = result.get("tp", sig.get("tp"))
+                    risk_pips = reward_pips = r_multiple = None
+                    if entry is not None and sl is not None and tp is not None and pip_size:
+                        risk_pips   = abs(entry - sl) / pip_size
+                        reward_pips = abs(tp - entry) / pip_size
+                        if result["outcome"] == "hit_tp":
+                            r_multiple = reward_pips / risk_pips if risk_pips else None
+                        elif result["outcome"] == "hit_sl":
+                            r_multiple = -1.0
+
+                    result.update({
+                        "symbol": symbol, "strategy": strat_name, "proposed_at": t, "direction": sig.get("direction"),
+                        "entry": entry, "sl": sl, "tp": tp,
+                        "probability": sig.get("probability"),
+                        "risk_reward": f"1:{(reward_pips / risk_pips):.1f}" if risk_pips else sig.get("risk_reward"),
+                        "confluence_score": sig.get("confluence_score", sig.get("confluence")),
+                        "risk_pips": risk_pips, "reward_pips": reward_pips, "r_multiple": r_multiple,
+                        "zone_top": sig.get("zone_top"), "zone_bottom": sig.get("zone_bottom"),
+                        "timeframe": sig.get("timeframe", scan_tf), "pip_size": pip_size,
+                        # Matches the join key added to the feature_logs/features_*.jsonl
+                        # entries in production_predictor.py -- (symbol, zone_top, zone_bottom)
+                        # rounded the same way, plus this signal's proposed_at as the time
+                        # component. Zones DO get revisited (see the near-duplicate
+                        # 2026-01-27/2026-01-30 XAU/USD signals sharing one zone) so the
+                        # timestamp is required, not just zone_top/zone_bottom alone.
+                        # strat_name included so a rev and a cont signal sharing the exact
+                        # same zone/time (different models, same price structure) never
+                        # collide on one signal_id.
+                        "signal_id": (f"{symbol}_{strat_name}_{round(sig.get('zone_top', 0) or 0, 5)}"
+                                      f"_{round(sig.get('zone_bottom', 0) or 0, 5)}_{t}"),
+                    })
+                    # -- SHADOW ADVISOR (Unified Live Book: Primary + Promoted SKIP) ---
+                    try:
+                        _tt = sig.get("_ts_touch_time") or result.get("trigger_time")
+                        _w = sig.get("_ts_wick")
+                        if _w is None:
+                            _w = result.get("touch_rejection_wick_atr")
+                        if _advise is not None and result.get("trigger_time") is not None and _tt is not None:
+                            _planned_rr = result.get("risk_reward") or sig.get("risk_reward")
+                            _consec_bars = result.get("consecutive_directional_bars")
+                            _adv = _advise(sig.get("direction"), historical[(symbol, "15min")],
+                                           historical[(symbol, "5min")], historical[(symbol, "4h")],
+                                           _tt, _w, risk_reward=_planned_rr, consecutive_bars=_consec_bars)
+                            result.update({"advisor_qualified": _adv["qualified"],
+                                           "advisor_tier": _adv.get("tier"),
+                                           "advisor_advice": _adv["advice"],
+                                           "advisor_h4_slope": _adv["values"]["h4_slope"],
+                                           "advisor_m5_consec_against": _adv["values"]["m5_consec_against"],
+                                           "advisor_wick": _adv["values"]["wick"],
+                                           "advisor_planned_rr": _adv["values"]["risk_reward"],
+                                           "advisor_consec_bars": _adv["values"]["consecutive_directional_bars"],
+                                           "advisor_conditions": "; ".join(_adv["conditions_met"])})
+                    except Exception as _adv_err:
+                        result["advisor_error"] = str(_adv_err)
+                    all_results.append(result)
+                    log_signal_jsonl(jsonl_path, {**result, "raw_signal": sig})
+
+                    outcome = result["outcome"]
+
+                    # ── Open-trade collision check ──────────────────────────
+                    # Only "hit_tp"/"hit_sl"/"timeout" represent a REAL trigger
+                    # (real capital risked). If this trigger_time lands inside a
+                    # window another already-proposed signal for THIS STRATEGY on
+                    # this symbol is still open in, live would have blocked it —
+                    # flag it rather than dropping it, so you keep every signal
+                    # for validation but can still filter down to "what live
+                    # would actually have taken" after the fact. Non-colliding
+                    # real trades register their own window so later proposals
+                    # can be checked against them too.
+                    would_be_blocked = False
+                    if outcome in ("hit_tp", "hit_sl", "timeout"):
+                        trig_t = result.get("trigger_time")
+                        exit_t = result.get("exit_time", trig_t + timedelta(days=15) if trig_t else None)
+                        if trig_t is not None:
+                            would_be_blocked = any(w0 <= trig_t < w1 for (w0, w1) in open_trade_windows[strat_name])
+                            if not would_be_blocked:
+                                open_trade_windows[strat_name].append((trig_t, exit_t))
+                    result["would_be_blocked_by_open_trade"] = would_be_blocked
+                    if would_be_blocked:
+                        print(f"     🔒 NOTE: this trigger overlaps another open {strat_name} trade on {symbol} — "
+                              f"live would have blocked it (flagged, not dropped, in this replay).")
+
+                    if outcome == "expired_untriggered":
+                        print(f"     ⌛ Never triggered — zone expired after {effective_ttl_hours:.1f}h watch window.")
+                        # No lock: an untriggered zone never risked capital.
+                    elif outcome == "still_pending":
+                        remaining = result.get("hours_of_ttl_remaining", result.get("hours_of_fill_window_remaining"))
+                        print(f"     ⏳ STILL PENDING — replay ended before this signal's watch/fill "
+                              f"window closed (~{remaining:.1f}h of window left unobserved). "
+                              f"Excluded from win-rate/R stats, not counted as expired.")
+                    elif outcome == "adjusted_never_filled":
+                        print(f"     🚫 ADJUSTED but never filled — {result.get('adjustment_reason')}")
+                        print(f"        (pushed entry {result.get('entry')} never reached within "
+                              f"{get_fill_window_hours(symbol):.0f}h; zero risk taken, not counted as win/loss)")
+                        # Same as above — never filled means no capital at risk.
+                    elif outcome == "timeout":
+                        print(f"     ⏱️  Triggered {result.get('trigger_time')} → ran past max hold "
+                              f"without hitting TP/SL (timeout).")
+                    elif outcome in ("hit_tp", "hit_sl"):
+                        emoji = "✅" if outcome == "hit_tp" else "❌"
+                        print(f"     {emoji} Triggered {result.get('trigger_time')} → {outcome.upper()} "
+                              f"at {result.get('exit_time')}  (R={r_multiple})")
+
+                        if outcome == "hit_tp":
+                            ext_pips = result.get("post_tp_max_extension_pips", 0)
+                            continued = result.get("post_tp_continued", False)
+                            if ext_pips > 0:
+                                print(f"        ↳ POST-TP EXTENSION: price continued {ext_pips:.1f} pips past TP "
+                                      f"({continued and '⬆️ meaningful' or '⬇️ minimal'})")
+                                if ext_pips > 10:
+                                    print(f"           ⚠️  You're exiting TOO EARLY — consider wider TP or trailing stop!")
+
+                        if result.get("adjusted"):
+                            print(f"        ↳ 🔧 ADJUSTED at trigger ({result.get('tier')}): "
+                                  f"entry {sig.get('entry')} → {entry}, sl {sig.get('sl')} → {sl}, "
+                                  f"tp {sig.get('tp')} → {tp} ({result.get('action')})")
+                        if "approach_velocity_30m_atr" in result:
+                            print(f"        ↳ APPROACH DYNAMICS (30m pre-entry): vel_30m={result.get('approach_velocity_30m_atr')}x ATR | "
+                                  f"pre_bar={result.get('pre_touch_bar_size_atr')}x ATR (body={result.get('pre_touch_body_ratio')}) | "
+                                  f"touch_wick={result.get('touch_rejection_wick_atr')}x ATR | "
+                                  f"consec={result.get('consecutive_directional_bars')} bars | "
+                                  f"time_to_touch={result.get('time_to_trigger_hours')}h")
+                        if outcome == "hit_sl":
+                            overflow = result.get("sl_overflow_pips")
+                            tie      = result.get("same_bar_tie")
+                            slip     = result.get("entry_slippage_pips")
+                            tie_note = "⚠️ SAME-BAR TIE (also touched TP — ambiguous, SL assumed by pessimistic tie-break)" if tie else "clean SL (TP not touched same bar)"
+                            print(f"        ↳ LOSS DIAGNOSTIC: sl_overflow={overflow:.1f} pips past SL | "
+                                  f"entry_slippage={slip:.1f} pips from proposed entry | {tie_note}")
+
+                            reached_tp   = result.get("post_sl_reached_tp")
+                            time_to_tp   = result.get("post_sl_time_to_tp_hours")
+                            reclaimed    = result.get("post_sl_reclaimed_entry")
+                            max_fav      = result.get("post_sl_max_favorable_pips")
+                            bars_checked = result.get("post_sl_bars_checked")
+                            if bars_checked == 0:
+                                print(f"        ↳ POST-SL TRACE: no bars available after exit — truncated, can't tell.")
+                            elif reached_tp:
+                                sweep_note = "reclaimed entry first — looks like a LIQUIDITY SWEEP, not a real reversal" if reclaimed else "did NOT reclaim entry before running to TP — check chart, unusual"
+                                print(f"        ↳ POST-SL TRACE: price reached the original TP {time_to_tp:.1f}h later ({sweep_note})")
+                            elif reclaimed:
+                                print(f"        ↳ POST-SL TRACE: price reclaimed entry but never reached TP within "
+                                      f"{sl_trace_days:.0f}d (best recovery: {max_fav:.1f} pips past SL) — partial bounce, not a clean sweep")
+                            else:
+                                print(f"        ↳ POST-SL TRACE: price never recovered ({max_fav:.1f} pips max bounce, "
+                                      f"never touched original entry or TP) — CLEAN LOSS, genuine move against trade.")
+
                     break
-
-                last_zone_key, last_zone_time = zone_key, t
-
-                print(f"  📌 [{symbol}|{scan_tf.upper()}] Signal proposed @ {t}: {sig.get('direction')} "
-                      f"entry={sig.get('entry')} sl={sig.get('sl')} tp={sig.get('tp')} "
-                      f"prob={sig.get('probability')}")
-                print(f"     ↳ full signal fields: {json.dumps(sig, default=str)}")
-
-                result = simulate_trigger_and_outcome(sig, symbol, t, historical,
-                                                       zone_ttl_hours=effective_ttl_hours, pip_size=pip_size,
-                                                       sl_trace_days=sl_trace_days,
-                                                       apply_trigger_decision=apply_trigger_decision,
-                                                       final_log_path=final_log_path,
-                                                       skip_consec_threshold=skip_consec_threshold,
-                                                       accel_bar_size_atr_min=accel_bar_size_atr_min,
-                                                       accel_body_ratio_min=accel_body_ratio_min,
-                                                       sl_pad_base_atr=sl_pad_base_atr,
-                                                       sl_pad_wick_atr=sl_pad_wick_atr,
-                                                       exhaustion_mid_threshold=exhaustion_mid_threshold,
-                                                       exhaustion_high_threshold=exhaustion_high_threshold,
-                                                       accel_score_bonus=accel_score_bonus)
-
-                entry = result.get("entry", sig.get("entry"))
-                sl    = result.get("sl", sig.get("sl"))
-                tp    = result.get("tp", sig.get("tp"))
-                risk_pips = reward_pips = r_multiple = None
-                if entry is not None and sl is not None and tp is not None and pip_size:
-                    risk_pips   = abs(entry - sl) / pip_size
-                    reward_pips = abs(tp - entry) / pip_size
-                    if result["outcome"] == "hit_tp":
-                        r_multiple = reward_pips / risk_pips if risk_pips else None
-                    elif result["outcome"] == "hit_sl":
-                        r_multiple = -1.0
-
-                result.update({
-                    "symbol": symbol, "proposed_at": t, "direction": sig.get("direction"),
-                    "entry": entry, "sl": sl, "tp": tp,
-                    "probability": sig.get("probability"),
-                    "risk_reward": f"1:{(reward_pips / risk_pips):.1f}" if risk_pips else sig.get("risk_reward"),
-                    "confluence_score": sig.get("confluence_score", sig.get("confluence")),
-                    "risk_pips": risk_pips, "reward_pips": reward_pips, "r_multiple": r_multiple,
-                    "zone_top": sig.get("zone_top"), "zone_bottom": sig.get("zone_bottom"),
-                    "timeframe": sig.get("timeframe", scan_tf), "pip_size": pip_size,
-                })
-                all_results.append(result)
-                log_signal_jsonl(jsonl_path, {**result, "raw_signal": sig})
-
-                outcome = result["outcome"]
-
-                # ── Open-trade collision check ──────────────────────────
-                # Only "hit_tp"/"hit_sl"/"timeout" represent a REAL trigger
-                # (real capital risked). If this trigger_time lands inside a
-                # window another already-proposed signal for this symbol is
-                # still open in, live would have blocked it — flag it
-                # rather than dropping it, so you keep every signal for
-                # validation but can still filter down to "what live would
-                # actually have taken" after the fact. Non-colliding real
-                # trades register their own window so later proposals can
-                # be checked against them too.
-                would_be_blocked = False
-                if outcome in ("hit_tp", "hit_sl", "timeout"):
-                    trig_t = result.get("trigger_time")
-                    exit_t = result.get("exit_time", trig_t + timedelta(days=15) if trig_t else None)
-                    if trig_t is not None:
-                        would_be_blocked = any(w0 <= trig_t < w1 for (w0, w1) in open_trade_windows)
-                        if not would_be_blocked:
-                            open_trade_windows.append((trig_t, exit_t))
-                result["would_be_blocked_by_open_trade"] = would_be_blocked
-                if would_be_blocked:
-                    print(f"     🔒 NOTE: this trigger overlaps another open trade on {symbol} — "
-                          f"live would have blocked it (flagged, not dropped, in this replay).")
-
-                if outcome == "expired_untriggered":
-                    print(f"     ⌛ Never triggered — zone expired after {effective_ttl_hours:.1f}h watch window.")
-                    # No lock: an untriggered zone never risked capital.
-                elif outcome == "still_pending":
-                    remaining = result.get("hours_of_ttl_remaining", result.get("hours_of_fill_window_remaining"))
-                    print(f"     ⏳ STILL PENDING — replay ended before this signal's watch/fill "
-                          f"window closed (~{remaining:.1f}h of window left unobserved). "
-                          f"Excluded from win-rate/R stats, not counted as expired.")
-                elif outcome == "adjusted_never_filled":
-                    print(f"     🚫 ADJUSTED but never filled — {result.get('adjustment_reason')}")
-                    print(f"        (pushed entry {result.get('entry')} never reached within "
-                          f"{get_fill_window_hours(symbol):.0f}h; zero risk taken, not counted as win/loss)")
-                    # Same as above — never filled means no capital at risk.
-                elif outcome == "timeout":
-                    print(f"     ⏱️  Triggered {result.get('trigger_time')} → ran past max hold "
-                          f"without hitting TP/SL (timeout).")
-                elif outcome in ("hit_tp", "hit_sl"):
-                    emoji = "✅" if outcome == "hit_tp" else "❌"
-                    print(f"     {emoji} Triggered {result.get('trigger_time')} → {outcome.upper()} "
-                          f"at {result.get('exit_time')}  (R={r_multiple})")
-                    
-                    if outcome == "hit_tp":
-                        ext_pips = result.get("post_tp_max_extension_pips", 0)
-                        continued = result.get("post_tp_continued", False)
-                        if ext_pips > 0:
-                            print(f"        ↳ POST-TP EXTENSION: price continued {ext_pips:.1f} pips past TP "
-                                  f"({continued and '⬆️ meaningful' or '⬇️ minimal'})")
-                            if ext_pips > 10:
-                                print(f"           ⚠️  You're exiting TOO EARLY — consider wider TP or trailing stop!")
-                    
-                    if result.get("adjusted"):
-                        print(f"        ↳ 🔧 ADJUSTED at trigger ({result.get('tier')}): "
-                              f"entry {sig.get('entry')} → {entry}, sl {sig.get('sl')} → {sl}, "
-                              f"tp {sig.get('tp')} → {tp} ({result.get('action')})")
-                    if "approach_velocity_30m_atr" in result:
-                        print(f"        ↳ APPROACH DYNAMICS (30m pre-entry): vel_30m={result.get('approach_velocity_30m_atr')}x ATR | "
-                              f"pre_bar={result.get('pre_touch_bar_size_atr')}x ATR (body={result.get('pre_touch_body_ratio')}) | "
-                              f"touch_wick={result.get('touch_rejection_wick_atr')}x ATR | "
-                              f"consec={result.get('consecutive_directional_bars')} bars | "
-                              f"time_to_touch={result.get('time_to_trigger_hours')}h")
-                    if outcome == "hit_sl":
-                        overflow = result.get("sl_overflow_pips")
-                        tie      = result.get("same_bar_tie")
-                        slip     = result.get("entry_slippage_pips")
-                        tie_note = "⚠️ SAME-BAR TIE (also touched TP — ambiguous, SL assumed by pessimistic tie-break)" if tie else "clean SL (TP not touched same bar)"
-                        print(f"        ↳ LOSS DIAGNOSTIC: sl_overflow={overflow:.1f} pips past SL | "
-                              f"entry_slippage={slip:.1f} pips from proposed entry | {tie_note}")
-
-                        reached_tp   = result.get("post_sl_reached_tp")
-                        time_to_tp   = result.get("post_sl_time_to_tp_hours")
-                        reclaimed    = result.get("post_sl_reclaimed_entry")
-                        max_fav      = result.get("post_sl_max_favorable_pips")
-                        bars_checked = result.get("post_sl_bars_checked")
-                        if bars_checked == 0:
-                            print(f"        ↳ POST-SL TRACE: no bars available after exit — truncated, can't tell.")
-                        elif reached_tp:
-                            sweep_note = "reclaimed entry first — looks like a LIQUIDITY SWEEP, not a real reversal" if reclaimed else "did NOT reclaim entry before running to TP — check chart, unusual"
-                            print(f"        ↳ POST-SL TRACE: price reached the original TP {time_to_tp:.1f}h later ({sweep_note})")
-                        elif reclaimed:
-                            print(f"        ↳ POST-SL TRACE: price reclaimed entry but never reached TP within "
-                                  f"{sl_trace_days:.0f}d (best recovery: {max_fav:.1f} pips past SL) — partial bounce, not a clean sweep")
-                        else:
-                            print(f"        ↳ POST-SL TRACE: price never recovered ({max_fav:.1f} pips max bounce, "
-                                  f"never touched original entry or TP) — CLEAN LOSS, genuine move against trade.")
-
-                break
-            else:
-                pass
+                else:
+                    pass
 
         if make_charts:
             print(f"  🖼️  Generating signal charts for {symbol}...")
@@ -1743,6 +2067,37 @@ def run_replay(pairs: list, days_back: int, finnhub_key: str, use_news: bool, ou
         print(f"Win rate:                 {len(wins) / len(resolved) * 100:.1f}%")
         print(f"Expectancy (avg R):       {overall_expectancy:+.2f} per resolved trade")
 
+    adv_trades = [r for r in resolved if "advisor_qualified" in r]
+    if adv_trades:
+        primary_trades  = [r for r in adv_trades if r.get("advisor_tier") == "primary"]
+        promoted_trades = [r for r in adv_trades if r.get("advisor_tier") == "promoted"]
+        combined_trades = [r for r in adv_trades if r.get("advisor_qualified") is True]
+        skip_trades     = [r for r in adv_trades if r.get("advisor_qualified") is False]
+
+        def _stats(trades):
+            if not trades:
+                return 0, 0, 0, 0, 0.0, 0.0, 0.0
+            tp = sum(1 for r in trades if r["outcome"] == "hit_tp")
+            sl = sum(1 for r in trades if r["outcome"] == "hit_sl")
+            to = sum(1 for r in trades if r["outcome"] == "timeout")
+            tot_r = sum(r["r_multiple"] for r in trades if r.get("r_multiple") is not None)
+            wr = (tp / (tp + sl) * 100) if (tp + sl) > 0 else 0.0
+            avg_r = tot_r / len(trades) if trades else 0.0
+            return len(trades), tp, sl, to, wr, tot_r, avg_r
+
+        p_n, p_tp, p_sl, p_to, p_wr, p_tot_r, p_avg_r = _stats(primary_trades)
+        pr_n, pr_tp, pr_sl, pr_to, pr_wr, pr_tot_r, pr_avg_r = _stats(promoted_trades)
+        c_n, c_tp, c_sl, c_to, c_wr, c_tot_r, c_avg_r = _stats(combined_trades)
+        s_n, s_tp, s_sl, s_to, s_wr, s_tot_r, s_avg_r = _stats(skip_trades)
+
+        print(f"\n{'═'*92}\n🎯 UNIFIED LIVE BOOK ADVISOR SUMMARY (Primary OR-71 + Promoted Quality SKIPs)\n{'═'*92}")
+        print(f"  🟢 Primary Advisor (TAKE)  → n={p_n:<3} | TP={p_tp:2} SL={p_sl:2} TO={p_to:2} | Win Rate: {p_wr:>5.1f}% | Total R: {p_tot_r:>+6.2f} R | Avg R: {p_avg_r:>+5.2f} R")
+        print(f"  🟢 Promoted Quality SKIPs  → n={pr_n:<3} | TP={pr_tp:2} SL={pr_sl:2} TO={pr_to:2} | Win Rate: {pr_wr:>5.1f}% | Total R: {pr_tot_r:>+6.2f} R | Avg R: {pr_avg_r:>+5.2f} R")
+        print(f"  {'─'*90}")
+        print(f"  🎯 NEW COMBINED LIVE BOOK  → n={c_n:<3} | TP={c_tp:2} SL={c_sl:2} TO={c_to:2} | Win Rate: {c_wr:>5.1f}% | Total R: {c_tot_r:>+6.2f} R | Avg R: {c_avg_r:>+5.2f} R")
+        print(f"  ⚪ Filtered Toxic Trades   → n={s_n:<3} | TP={s_tp:2} SL={s_sl:2} TO={s_to:2} | Win Rate: {s_wr:>5.1f}% | Total R: {s_tot_r:>+6.2f} R | Avg R: {s_avg_r:>+5.2f} R")
+        print(f"{'═'*92}")
+
     print(f"\nBy symbol:")
     for symbol in pairs:
         sym_resolved = [r for r in resolved if r["symbol"] == symbol]
@@ -1752,6 +2107,9 @@ def run_replay(pairs: list, days_back: int, finnhub_key: str, use_news: bool, ou
               f"resolved={len(sym_resolved):<4} win_rate={wr:.1f}%")
 
     if resolved:
+        print(f"\nBy strategy:")
+        _bucket_stats(resolved, lambda r: r.get("strategy"))
+
         print(f"\nBy direction:")
         _bucket_stats(resolved, lambda r: r.get("direction"))
 
@@ -1811,6 +2169,32 @@ def run_replay(pairs: list, days_back: int, finnhub_key: str, use_news: bool, ou
             avg_of = sum(sym_overflows) / len(sym_overflows) if sym_overflows else 0.0
             print(f"    {symbol:<10} losses={len(sym_losses):<3} avg_sl_overflow={avg_of:>5.1f}p  "
                   f"same_bar_ties={len(sym_ties)}/{len(sym_losses)}  pip_size={sym_losses[0].get('pip_size')}")
+
+        # ── Post-SL Re-entry (Method 2) ─────────────────────────────────
+        reentries = [r for r in losses if r.get("reentry", {}).get("reentered")]
+        if reentries:
+            base_total_r = sum(r["r_multiple"] for r in losses if r.get("r_multiple") is not None)
+            reentry_r_sum = sum(r["reentry"].get("resolved_r", 0.0) or 0.0 for r in reentries)
+            unresolved = [r for r in reentries if r["reentry"].get("resolved_outcome") == "unresolved"]
+            reentry_wins = [r for r in reentries if r["reentry"].get("resolved_outcome") == "hit_tp"]
+            print(f"\n  Post-SL re-entry (Method 2): {len(reentries)}/{len(losses)} losses triggered a "
+                  f"re-entry attempt, {len(reentry_wins)} won.")
+            print(f"    → hit_sl bucket R as originally traded: {base_total_r:+.2f}")
+            print(f"    → hit_sl bucket R with re-entry layered on top: {base_total_r + reentry_r_sum:+.2f}")
+            if unresolved:
+                print(f"    ⚠️  {len(unresolved)}/{len(reentries)} re-entries never resolved (ran past the "
+                      f"end of the available bar cache) — counted as -1R above; not a verified result.")
+            print(f"\n    By symbol:")
+            for symbol in pairs:
+                sym_re = [r for r in reentries if r["symbol"] == symbol]
+                if not sym_re:
+                    continue
+                sym_losses_n = len([r for r in losses if r["symbol"] == symbol])
+                sym_base_r = sum(r["r_multiple"] for r in losses if r["symbol"] == symbol and r.get("r_multiple") is not None)
+                sym_re_r = sum(r["reentry"].get("resolved_r", 0.0) or 0.0 for r in sym_re)
+                sym_wins = len([r for r in sym_re if r["reentry"].get("resolved_outcome") == "hit_tp"])
+                print(f"    {symbol:<10} reentered={len(sym_re)}/{sym_losses_n:<3} won={sym_wins:<3} "
+                      f"R: {sym_base_r:+.2f} → {sym_base_r + sym_re_r:+.2f}")
 
     # ── Approach & Entry Dynamics Summary ──────────────────────────────
     if resolved:
@@ -1959,7 +2343,7 @@ def run_replay(pairs: list, days_back: int, finnhub_key: str, use_news: bool, ou
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Walk-forward replay of the live Reversion predictor.")
+    parser = argparse.ArgumentParser(description="Walk-forward replay of the live Reversion + Continuation predictors.")
     parser.add_argument("--pairs", type=str, default="EUR/USD,GBP/USD,USD/JPY,XAU/USD")
     parser.add_argument("--days", type=int, default=60)
     parser.add_argument("--finnhub-key", type=str, default=os.getenv("FINNHUB_API_KEY", ""))
@@ -1998,6 +2382,17 @@ if __name__ == "__main__":
                               "entry/SL/TP recompute + 5min acceleration bonus). On by default. "
                               "Use this to get the old raw-signal-only behavior for an "
                               "apples-to-apples comparison.")
+    parser.add_argument("--pushed-entry-requires-refill", action="store_true",
+                         help="For adjust_mid/adjust_high signals, treat the adjustment's pushed "
+                              "entry as a fresh resting order that only starts being watched AFTER "
+                              "the touch bar closes, requiring price to return to it (legacy "
+                              "behavior -- can end in 'adjusted_never_filled' even though the raw "
+                              "limit at the original entry was reached on the touch bar itself). "
+                              "Default OFF: the raw limit fills at the touch price actually seen; "
+                              "the adjustment only re-centers SL/TP around that real fill, matching "
+                              "how a resting limit order actually behaves. Use this flag only if "
+                              "your live execution genuinely waits for the touch bar to close "
+                              "before deciding whether to place the order at all.")
     parser.add_argument("--skip-consec-threshold", type=int, default=2,
                          help="DEPRECATED / no longer used to hard-skip — kept only for CLI "
                               "compatibility. consecutive_directional_bars now feeds the composite "
@@ -2010,13 +2405,25 @@ if __name__ == "__main__":
     parser.add_argument("--accel-body-ratio-min", type=float, default=0.70,
                          help="5-min 'knife' detection: bar body / bar range must be >= this "
                               "(solid, low-wick candle) to count as an acceleration bar. Default 0.70.")
-    parser.add_argument("--prob-threshold", type=float, default=0.55,
-                         help="Minimum ML probability threshold for proposing zones (default 0.55, was "
-                              "0.60, before that 0.70). 2026-08-25 replay of the 60% gate showed no "
-                              "monotonic relationship between probability bucket and win rate "
-                              "(85-100% bucket won at the same rate as 0-65%), so this is a volume "
-                              "lever, not yet a validated quality lever -- track the 55-60% cohort's "
-                              "win rate separately once you have enough of them to judge.")
+    parser.add_argument("--enable-reentry", action="store_true",
+                         help="Enable the post-SL re-entry sub-strategy (Method 2): after a hit_sl, "
+                              "evaluate_reentry() checks whether conditions justify a second attempt "
+                              "and tracks its own resolved R. Default OFF: confirmed net-negative on "
+                              "real data (2026-09-17) -- 10 re-entry attempts, 3 wins, the hit_sl "
+                              "bucket went from -16.00R as traded to -19.50R with re-entry layered on "
+                              "top. Kept available behind this flag rather than deleted so it can "
+                              "still be A/B'd deliberately -- e.g. after evaluate_reentry()'s own "
+                              "trigger conditions are revisited -- instead of silently dragging down "
+                              "every run's aggregate numbers.")
+    parser.add_argument("--prob-threshold", type=float, default=0.40,
+                         help="Minimum ML probability threshold for proposing REVERSION zones "
+                              "(default 0.40, was 0.55, before that 0.60, before that 0.70). "
+                              "2026-08-25 replay of the 60%% gate showed no monotonic relationship "
+                              "between probability bucket and win rate (85-100%% bucket won at the "
+                              "same rate as 0-65%%), so this is a volume lever, not yet a validated "
+                              "quality lever -- track the new lower cohorts' win rate separately "
+                              "once you have enough of them to judge. Independent from "
+                              "--cont-prob-threshold, which only applies to continuation.")
     parser.add_argument("--sl-pad-base-atr", type=float, default=SL_PAD_BASE_ATR,
                          help=f"Flat SL-padding coefficient (x ATR) added on top of the observed "
                               f"rejection wick for adjust_mid/adjust_high trades. Default {SL_PAD_BASE_ATR}. "
@@ -2047,6 +2454,15 @@ if __name__ == "__main__":
                               f"as secondary and re-check the tier breakdown after any change.")
     parser.add_argument("--end-date", type=str, default=None,
                          help="End date for replay (e.g. '2026-08-31'). If not specified, defaults to current UTC time.")
+    parser.add_argument("--no-continuation", action="store_true",
+                         help="Replay the REVERSION strategy only, skipping CONTINUATION entirely "
+                              "(old single-strategy behavior). Continuation is replayed by default, "
+                              "matching live run_dual_strategy() which always runs both.")
+    parser.add_argument("--cont-prob-threshold", type=float, default=0.55,
+                         help="Minimum ML probability threshold for proposing CONTINUATION zones "
+                              "(default 0.55, matches the live continuation predictor in "
+                              "production_predictor.py's run_dual_strategy() as of 2026-09, was 0.60). "
+                              "Independent from --prob-threshold, which only applies to reversion.")
     args = parser.parse_args()
 
     zone_ttl_overrides = {}
@@ -2078,10 +2494,14 @@ if __name__ == "__main__":
         zone_dedup_days=args.zone_dedup_days,
         make_charts=not args.no_charts,
         apply_trigger_decision=not args.no_trigger_decision,
+        raw_limit_fills_at_touch=not args.pushed_entry_requires_refill,
+        enable_reentry=args.enable_reentry,
         skip_consec_threshold=args.skip_consec_threshold,
         accel_bar_size_atr_min=args.accel_bar_size_atr_min,
         accel_body_ratio_min=args.accel_body_ratio_min,
         prob_threshold=args.prob_threshold,
+        enable_continuation_replay=not args.no_continuation,
+        cont_prob_threshold=args.cont_prob_threshold,
         timeframe=args.timeframe,
         sl_pad_base_atr=args.sl_pad_base_atr,
         sl_pad_wick_atr=args.sl_pad_wick_atr,

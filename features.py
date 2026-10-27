@@ -78,7 +78,7 @@ NUMERIC_FEATURES: Tuple[str, ...] = (
     # NOTE: prev_zone_outcome REMOVED v8 — always 0.5 in live (no persistent
     #       zone history DB); XGB importance 11%, RF 14% → miscalibrates live scores
     # NOTE: time_since_last_touch REMOVED v8 — always 0.0 in live; XGB 6%, RF 2%
-    "h4_fvg_inside",
+    # NOTE: h4_fvg_inside REMOVED v10 — training artifact caused artificial +50% probability boost on FVGs
     "d1_ema_distance",
 
     # ── v7: 1H alignment features (replaces generic h1_confluence) ────────────
@@ -86,6 +86,7 @@ NUMERIC_FEATURES: Tuple[str, ...] = (
     "h1_structure_shift",       # -1=bearish MSS, 0=none, 1=bullish MSS
     "h1_displacement",          # impulse candle size / ATR on 1H (≥0)
     "h1_liquidity_sweep",       # 1=1H swept swing liquidity before reversal
+    "h1_fvg_nested",            # v9: 1=a 1H FVG's midpoint sits inside this 4H zone
 
     # ── v7: Premium / Discount features ──────────────────────────────────────
     "d1_premium_discount",      # -1=discount, 0=equilibrium, 1=premium  (D1 range)

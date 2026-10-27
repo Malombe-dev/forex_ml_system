@@ -40,7 +40,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Callable
 
-from milestone_tracking import evaluate_milestone, log_milestone_event, summarize_milestones
+from milestone_tracking import evaluate_milestone, log_milestone_event, summarize_milestones, evaluate_tp_progress
+from reentry_logic import evaluate_reentry, ReentryConfig
 
 logger = logging.getLogger(__name__)
 
@@ -51,8 +52,10 @@ class Status:
     TRIGGERED     = "triggered"      # entry touched, trade is live
     HIT_TP        = "hit_tp"         # TP reached after entry, SL never hit → WIN
     HIT_SL        = "hit_sl"         # SL reached after entry → LOSS
+    ADVISE_EXIT   = "advise_exit"    # Momentum exhaustion / stagnation at >=70% TP → PROFIT SECURED
     ENTRY_MISSED  = "entry_missed"   # price never reached entry zone → NOT counted
     EXPIRED       = "expired"        # older than TTL without entry → NOT counted
+    VIOLATED      = "violated"       # zone broken through on closed bar → NOT counted
 
 
 # ── Core bar-by-bar simulator ──────────────────────────────────────────────────
@@ -65,6 +68,9 @@ def simulate_signal_bar_by_bar(
     entry_tolerance_pips: float = 0.5,
     pip_size: float = 0.0001,
     closed_cutoff=None,
+    symbol: str = "",
+    enable_tp_advisory: bool = True,
+    already_triggered: bool = False,
 ) -> Dict:
     """
     Walk bars in chronological order and simulate exactly what would happen
@@ -76,6 +82,8 @@ def simulate_signal_bar_by_bar(
       3. SL has NOT been hit on any bar up to that point
 
     If SL and TP are hit on the same bar, SL takes priority (conservative/realistic).
+    If price reaches >=70% TP and exhibits momentum stagnation or strong opposing rejection,
+    ADVISE_EXIT is triggered to secure accrued profit.
 
     Returns
     -------
@@ -87,8 +95,20 @@ def simulate_signal_bar_by_bar(
         bars_to_exit  : int | None
     """
     tol         = entry_tolerance_pips * pip_size
-    triggered   = False
-    entry_bar_i = None
+    triggered   = bool(already_triggered)
+    entry_bar_i = 0 if already_triggered else None
+    peak_fav    = 0.0
+    peak_time   = None
+    prev_close  = None
+
+    # ── Real rolling ATR for the TP-advisory (previously not passed at all,
+    # so evaluate_tp_progress() silently fell back to a flat pip_size*15
+    # constant -- badly wrong for symbols like XAU/USD where real volatility
+    # varies a lot day to day). Computed once, up front, over the whole
+    # window; early bars use whatever history is available (min_periods=1).
+    _hi, _lo, _cl = bars_after_signal["high"], bars_after_signal["low"], bars_after_signal["close"]
+    _tr = pd.concat([_hi - _lo, (_hi - _cl.shift(1)).abs(), (_lo - _cl.shift(1)).abs()], axis=1).max(axis=1)
+    _atr_series = _tr.rolling(14, min_periods=1).mean().reset_index(drop=True)
 
     for i, (idx, bar) in enumerate(bars_after_signal.iterrows()):
         bar_high = bar["high"]
@@ -97,18 +117,7 @@ def simulate_signal_bar_by_bar(
         _bar_time = bar.get("time") if hasattr(bar, "get") else getattr(bar, "time", None)
         bar_is_closed = (closed_cutoff is None or _bar_time is None
                           or _bar_time <= closed_cutoff)
-
         if not triggered:
-            # ── FIX-6: Tightened entry trigger ───────────────────────────
-            # BUY:  price must dip INTO the demand zone from ABOVE.
-            #       bar_low  <= entry + tol  (low touches entry level)
-            #       bar_open >= entry        (was above entry → approaching from above)
-            #       Using >= entry (not entry - tol) prevents false fills when
-            #       price is already below the entry when the bar opens.
-            #
-            # SELL: price must rally INTO the supply zone from BELOW.
-            #       bar_high >= entry - tol  (high touches entry level)
-            #       bar_open <= entry        (was below entry → approaching from below)
             if direction == "BUY":
                 entry_touched = (bar_low <= entry + tol) and (bar_open >= entry)
             else:
@@ -117,6 +126,9 @@ def simulate_signal_bar_by_bar(
             if entry_touched:
                 triggered   = True
                 entry_bar_i = i
+                peak_time   = _bar_time
+                cur_fav     = max(0.0, (bar_high - entry) if direction == "BUY" else (entry - bar_low))
+                peak_fav    = cur_fav
 
                 # On the same bar that triggers entry, also check for
                 # immediate SL/TP hit (gap open / spike candle scenarios).
@@ -162,6 +174,11 @@ def simulate_signal_bar_by_bar(
             # ── Trade is live — check SL first, then TP ───────────────────
             # SL is evaluated before TP on every bar.
             # A trade is only a WIN if TP is hit on a bar where SL is NOT hit.
+            fav = (bar_high - entry) if direction == "BUY" else (entry - bar_low)
+            if fav > peak_fav:
+                peak_fav  = fav
+                peak_time = _bar_time
+
             if direction == "BUY":
                 sl_hit = bar_low  <= sl
                 tp_hit = bar_high >= tp
@@ -196,15 +213,61 @@ def simulate_signal_bar_by_bar(
                         "bars_to_exit":  i - entry_bar_i,
                     }
 
+                # ── In-Flight Dynamic TP & Momentum Exhaustion Advisory ──────
+                if enable_tp_advisory:
+                    hours_near_peak = 0.0
+                    if _bar_time is not None and peak_time is not None:
+                        try:
+                            hours_near_peak = max(0.0, (pd.to_datetime(_bar_time) - pd.to_datetime(peak_time)).total_seconds() / 3600.0)
+                        except Exception:
+                            hours_near_peak = 0.0
+
+                    eval_res = evaluate_tp_progress(
+                        bar, direction, entry, sl, tp,
+                        pip_size=pip_size, symbol=symbol,
+                        hours_near_peak=hours_near_peak,
+                        atr=float(_atr_series.iloc[i]) if i < len(_atr_series) else None,
+                    )
+                    if eval_res.get("action") == "ADVISE_EXIT":
+                        return {
+                            "status":        Status.ADVISE_EXIT,
+                            "triggered":     True,
+                            "resolved_bar":  bar,
+                            "bars_to_entry": entry_bar_i,
+                            "bars_to_exit":  i - entry_bar_i,
+                            "exit_price":    float(bar["close"]),
+                            "secured_r":     eval_res.get("current_r", 0.0),
+                            "advisory":      eval_res,
+                        }
+
+        prev_close = bar.get("close", bar_open) if hasattr(bar, "get") else getattr(bar, "close", bar_open)
+
     # ── Ran out of bars ────────────────────────────────────────────────────────
     if triggered:
         # Entry was hit but trade is still open (not enough bars yet)
+        latest_eval = None
+        if len(bars_after_signal) > 0:
+            latest_bar = bars_after_signal.iloc[-1]
+            _lt = latest_bar.get("time") if hasattr(latest_bar, "get") else getattr(latest_bar, "time", None)
+            h_near_peak = 0.0
+            if _lt is not None and peak_time is not None:
+                try:
+                    h_near_peak = max(0.0, (pd.to_datetime(_lt) - pd.to_datetime(peak_time)).total_seconds() / 3600.0)
+                except Exception:
+                    h_near_peak = 0.0
+            latest_eval = evaluate_tp_progress(
+                latest_bar, direction, entry, sl, tp,
+                pip_size=pip_size, symbol=symbol,
+                hours_near_peak=h_near_peak,
+                atr=float(_atr_series.iloc[-1]) if len(_atr_series) else None,
+            )
         return {
             "status":        Status.TRIGGERED,
             "triggered":     True,
             "resolved_bar":  None,
             "bars_to_entry": entry_bar_i,
             "bars_to_exit":  None,
+            "tp_progress":   latest_eval,
         }
     else:
         return {
@@ -317,11 +380,12 @@ class SignalOutcomeTrackerV2:
                 else:
                     continue
 
-            # Only process signals that are not yet resolved
-            if current_status not in (None, Status.PENDING, Status.TRIGGERED, "active"):
+            # Only process signals that are not yet resolved (and exclude zones still in ARMED/IN_ZONE stage)
+            if current_status in (Status.HIT_TP, Status.HIT_SL, Status.ADVISE_EXIT, Status.EXPIRED, Status.ENTRY_MISSED, Status.VIOLATED) or sig.get("stage") in ("ARMED", "IN_ZONE", "VIOLATED"):
                 continue
 
-            tf = sig.get("timeframe", "15min")
+            # Always simulate trade outcomes on 15min bars for high resolution, matching replay
+            tf = "15min"
             if tf not in df_cache:
                 df_cache[tf] = fetch_fn(tf, 500)   # fetch more bars for accuracy
 
@@ -330,7 +394,8 @@ class SignalOutcomeTrackerV2:
                 continue
 
             try:
-                ts        = pd.to_datetime(sig.get("timestamp"), utc=False)
+                ref_ts = sig.get("confirmed_at") or sig.get("timestamp")
+                ts        = pd.to_datetime(ref_ts, utc=False)
                 # Strip timezone so comparison with datetime64[ns] (tz-naive) works
                 ts        = ts.tz_localize(None) if ts.tzinfo is not None else ts
                 entry     = float(sig["entry"])
@@ -357,10 +422,14 @@ class SignalOutcomeTrackerV2:
                         else 1.0 if "XAU" in _sym or "XAG" in _sym
                         else self.pip_size)
 
+                is_two_stage_confirmed = (sig.get("stage") == "CONFIRMED" or sig.get("confirmation_rule") is not None)
                 result = simulate_signal_bar_by_bar(
                     bars_after, direction, entry, sl, tp,
                     entry_tolerance_pips=self.entry_tolerance_pips,
                     pip_size=_pip,
+                    symbol=sig.get("symbol", ""),
+                    enable_tp_advisory=True,
+                    already_triggered=is_two_stage_confirmed or sig.get("triggered", False),
                 )
 
                 new_status = result["status"]
@@ -449,6 +518,34 @@ class SignalOutcomeTrackerV2:
                         if _fill is not None:
                             sig["sl_overflow_pips"] = round(abs(float(_fill) - sl) / _pip, 2)
 
+                        # ── POST-SL RE-ENTRY (Method 2) ───────────────────────
+                        # Uses the full fetched `df` (not just bars_after) so
+                        # evaluate_reentry has history before the SL-hit bar
+                        # available for its ATR lookback. This is a pure
+                        # post-hoc check -- it never touches sig["status"],
+                        # which stays HIT_SL either way; the re-entry verdict
+                        # is attached separately under sig["reentry"].
+                        try:
+                            _sl_hit_time = _ts
+                            _reentry_bars = (df if time_col == "time"
+                                              else df.rename(columns={time_col: "time"}))
+                            reentry_result = evaluate_reentry(
+                                symbol=sig.get("symbol", ""), direction=direction,
+                                orig_entry=entry, orig_sl=sl, orig_tp=tp,
+                                sl_hit_time=_sl_hit_time, bars_after_sl=_reentry_bars,
+                            )
+                            if reentry_result.get("reentry_time") is not None:
+                                reentry_result["reentry_time"] = str(reentry_result["reentry_time"])
+                            sig["reentry"] = reentry_result
+                            if reentry_result.get("reentered"):
+                                logger.info(
+                                    f"🔁 [RE-ENTRY] {sig.get('symbol')} {direction}: "
+                                    f"reclaim @ {reentry_result.get('new_entry')} "
+                                    f"(new SL {reentry_result.get('new_sl')}, RR {reentry_result.get('reentry_rr')})"
+                                )
+                        except Exception as e:
+                            logger.warning(f"OutcomeTrackerV2: reentry evaluation failed — {e}")
+
                     # Entry slippage: ideal entry vs. the entry bar's touch price.
                     _be = result.get("bars_to_entry")
                     if _be is not None and _be < len(bars_after):
@@ -483,10 +580,18 @@ class SignalOutcomeTrackerV2:
                         except Exception as e:
                             logger.warning(f"OutcomeTrackerV2: milestone evaluation failed — {e}")
 
+                    if new_status == Status.ADVISE_EXIT:
+                        sig["exit_price"] = result.get("exit_price")
+                        sig["secured_r"]  = result.get("secured_r")
+                        sig["advisory"]   = result.get("advisory")
+                        logger.info(f"🔔 [TP ADVISORY EXIT] {sig.get('symbol')} {direction}: {result.get('advisory', {}).get('reason')}")
+
                     counts["updated"] += 1
 
                     if new_status == Status.HIT_TP:
                         counts["hit_tp"] += 1
+                    elif new_status == Status.ADVISE_EXIT:
+                        counts["advise_exit"] = counts.get("advise_exit", 0) + 1
                     elif new_status == Status.HIT_SL:
                         counts["hit_sl"] += 1
                     elif new_status == Status.ENTRY_MISSED:
@@ -496,6 +601,10 @@ class SignalOutcomeTrackerV2:
 
                 if new_status in (Status.PENDING, Status.TRIGGERED):
                     counts["still_pending"] += 1
+                    if new_status == Status.TRIGGERED and result.get("tp_progress"):
+                        sig["tp_progress"] = result["tp_progress"]
+                        if result["tp_progress"].get("action") in ("ADVISE_EXIT", "ADVISE_TIGHTEN_TP"):
+                            logger.info(f"🔔 [TP IN-FLIGHT ALERT] {sig.get('symbol')} {direction}: {result['tp_progress'].get('reason')}")
 
             except Exception as e:
                 logger.warning(f"OutcomeTrackerV2: error on signal — {e}")
@@ -511,12 +620,13 @@ class SignalOutcomeTrackerV2:
                 logger.warning(f"OutcomeTrackerV2: save failed — {e}")
 
         # Win rate computed only over resolved triggered trades (not entry_missed)
-        resolved = counts["hit_tp"] + counts["hit_sl"]
-        win_rate = round(counts["hit_tp"] / resolved * 100, 1) if resolved else 0.0
+        resolved = counts["hit_tp"] + counts["hit_sl"] + counts.get("advise_exit", 0)
+        wins = counts["hit_tp"] + counts.get("advise_exit", 0)
+        win_rate = round(wins / resolved * 100, 1) if resolved else 0.0
         counts["win_rate_pct"] = win_rate
 
         logger.info(
-            f"OutcomeTrackerV2: TP={counts['hit_tp']} SL={counts['hit_sl']} "
+            f"OutcomeTrackerV2: TP={counts['hit_tp']} AdviseExit={counts.get('advise_exit', 0)} SL={counts['hit_sl']} "
             f"EntryMissed={counts['entry_missed']} WinRate={win_rate}% "
             f"Pending={counts['still_pending']}"
         )
@@ -558,11 +668,13 @@ class SignalOutcomeTrackerV2:
         }
 
         for sig in signals:
-            if sig.get("status") not in (None, Status.PENDING, Status.TRIGGERED, "active"):
+            # Exclude resolved signals and zones still awaiting two-stage confirmation
+            if sig.get("status") in (Status.HIT_TP, Status.HIT_SL, Status.ADVISE_EXIT, Status.EXPIRED, Status.ENTRY_MISSED, Status.VIOLATED) or sig.get("stage") in ("ARMED", "IN_ZONE", "VIOLATED"):
                 continue
 
             sym = sig.get("symbol", "")
-            tf  = sig.get("timeframe", "15min")
+            # Always simulate trade outcomes on 15min bars for high resolution, matching replay
+            tf  = "15min"
             cache_key = f"{sym}_{tf}"
 
             if cache_key not in df_cache:
@@ -579,7 +691,9 @@ class SignalOutcomeTrackerV2:
                 continue
 
             try:
-                ts        = pd.to_datetime(sig.get("timestamp"), utc=False)
+                # In two-stage execution, track exposure from confirmation time, not original proposal
+                ref_ts = sig.get("confirmed_at") or sig.get("timestamp")
+                ts        = pd.to_datetime(ref_ts, utc=False)
                 ts        = ts.tz_localize(None) if ts.tzinfo is not None else ts
                 if sig.get("entry") is None or sig.get("sl") is None or sig.get("tp") is None:
                     continue
@@ -599,20 +713,22 @@ class SignalOutcomeTrackerV2:
                 if bars_after.empty:
                     continue
 
-                _tf_hours = {"4h": 4, "4hour": 4, "1h": 1, "1hour": 1,
-                             "15min": 0.25, "1d": 24, "daily": 24}.get(tf, 4)
-                _closed_cutoff = datetime.utcnow() - pd.Timedelta(hours=_tf_hours)
+                _closed_cutoff = datetime.utcnow() - pd.Timedelta(hours=0.25)
 
                 _sym = sym.upper()
                 _pip = (0.01 if "JPY" in _sym
                         else 1.0 if "XAU" in _sym or "XAG" in _sym
                         else self.pip_size)
 
+                is_two_stage_confirmed = (sig.get("stage") == "CONFIRMED" or sig.get("confirmation_rule") is not None)
                 result = simulate_signal_bar_by_bar(
                     bars_after, direction, entry, sl, tp,
                     entry_tolerance_pips=self.entry_tolerance_pips,
                     pip_size=_pip,
                     closed_cutoff=_closed_cutoff,
+                    symbol=sym,
+                    enable_tp_advisory=True,
+                    already_triggered=is_two_stage_confirmed or sig.get("triggered", False),
                 )
 
                 new_status = result["status"]
@@ -695,7 +811,7 @@ class SignalOutcomeTrackerV2:
                         try:
                             touch_time = _rb.get("time") or _rb.get("datetime")
                             bars_after_tp1 = bars_after[bars_after["time"] > touch_time] \
-                                if "time" in bars_after.columns else bars_after.iloc[0:0]
+                                 if "time" in bars_after.columns else bars_after.iloc[0:0]
                             prior_bars_tp1 = df[df[time_col] < touch_time].tail(10)
                             milestone = evaluate_milestone(
                                 touch_bar=_rb, bars_after=bars_after_tp1, direction=direction,
@@ -712,10 +828,45 @@ class SignalOutcomeTrackerV2:
                         except Exception as e:
                             logger.warning(f"OutcomeTrackerV2: milestone evaluation failed — {e}")
 
+                    if new_status == Status.ADVISE_EXIT:
+                        sig["exit_price"] = result.get("exit_price")
+                        sig["secured_r"]  = result.get("secured_r")
+                        sig["advisory"]   = result.get("advisory")
+                        logger.info(f"🔔 [TP ADVISORY EXIT] {sym} {direction}: {result.get('advisory', {}).get('reason')}")
+
+                    if new_status == Status.HIT_SL and _rb is not None:
+                        _fill = _rb.get("low") if direction == "BUY" else _rb.get("high")
+                        if _fill is not None:
+                            sig["sl_overflow_pips"] = round(abs(float(_fill) - sl) / _pip, 2)
+
+                        # ── POST-SL RE-ENTRY (Method 2) ───────────────────────
+                        try:
+                            _sl_hit_time = _ts
+                            _reentry_bars = (df if time_col == "time"
+                                              else df.rename(columns={time_col: "time"}))
+                            reentry_result = evaluate_reentry(
+                                symbol=sym, direction=direction,
+                                orig_entry=entry, orig_sl=sl, orig_tp=tp,
+                                sl_hit_time=_sl_hit_time, bars_after_sl=_reentry_bars,
+                            )
+                            if reentry_result.get("reentry_time") is not None:
+                                reentry_result["reentry_time"] = str(reentry_result["reentry_time"])
+                            sig["reentry"] = reentry_result
+                            if reentry_result.get("reentered"):
+                                logger.info(
+                                    f"🔁 [RE-ENTRY] {sym} {direction}: "
+                                    f"reclaim @ {reentry_result.get('new_entry')} "
+                                    f"(new SL {reentry_result.get('new_sl')}, RR {reentry_result.get('reentry_rr')})"
+                                )
+                        except Exception as e:
+                            logger.warning(f"OutcomeTrackerV2: reentry evaluation failed — {e}")
+
                     counts["updated"] += 1
 
                     if new_status == Status.HIT_TP:
                         counts["hit_tp"] += 1
+                    elif new_status == Status.ADVISE_EXIT:
+                        counts["advise_exit"] = counts.get("advise_exit", 0) + 1
                     elif new_status == Status.HIT_SL:
                         counts["hit_sl"] += 1
                     elif new_status == Status.ENTRY_MISSED:
@@ -725,6 +876,10 @@ class SignalOutcomeTrackerV2:
 
                 if new_status in (Status.PENDING, Status.TRIGGERED):
                     counts["still_pending"] += 1
+                    if new_status == Status.TRIGGERED and result.get("tp_progress"):
+                        sig["tp_progress"] = result["tp_progress"]
+                        if result["tp_progress"].get("action") in ("ADVISE_EXIT", "ADVISE_TIGHTEN_TP"):
+                            logger.info(f"🔔 [TP IN-FLIGHT ALERT] {sym} {direction}: {result['tp_progress'].get('reason')}")
 
             except Exception as e:
                 logger.warning(f"OutcomeTrackerV2: error on signal — {e}")
@@ -738,12 +893,13 @@ class SignalOutcomeTrackerV2:
             except Exception as e:
                 logger.warning(f"OutcomeTrackerV2: save failed — {e}")
 
-        resolved = counts["hit_tp"] + counts["hit_sl"]
-        win_rate = round(counts["hit_tp"] / resolved * 100, 1) if resolved else 0.0
+        resolved = counts["hit_tp"] + counts["hit_sl"] + counts.get("advise_exit", 0)
+        wins = counts["hit_tp"] + counts.get("advise_exit", 0)
+        win_rate = round(wins / resolved * 100, 1) if resolved else 0.0
         counts["win_rate_pct"] = win_rate
 
         logger.info(
-            f"OutcomeTrackerV2: TP={counts['hit_tp']} SL={counts['hit_sl']} "
+            f"OutcomeTrackerV2: TP={counts['hit_tp']} AdviseExit={counts.get('advise_exit', 0)} SL={counts['hit_sl']} "
             f"EntryMissed={counts['entry_missed']} WinRate={win_rate}% "
             f"Pending={counts['still_pending']}"
         )
@@ -875,4 +1031,15 @@ if __name__ == "__main__":
     print(f"Test 5 false trigger:  {result5['status']} (expect PENDING)")
     assert result5["status"] == Status.PENDING, f"Expected PENDING, got {result5['status']}"
 
-    print("\n✅ All 5 tests passed")
+    # ── Test 6: BUY — trade reaches >=90% TP and stagnates >6h → ADVISE_EXIT ──
+    times6 = pd.date_range("2026-04-24 08:00", periods=35, freq="15min")
+    opens6 = [1.1680] + [1.1675] + [1.1697] * 33
+    highs6 = [1.1682] + [1.1699] + [1.1699] * 33
+    lows6  = [1.1674] + [1.1673] + [1.1696] * 33
+    closes6= [1.1676] + [1.1698] + [1.1698] * 33
+    bars_adv = pd.DataFrame({"time": times6, "open": opens6, "high": highs6, "low": lows6, "close": closes6})
+    result6 = simulate_signal_bar_by_bar(bars_adv, "BUY", 1.16750, 1.16650, 1.17000, pip_size=0.0001, symbol="EUR/USD")
+    print(f"Test 6 ADVISE_EXIT:   {result6['status']} | secured_r={result6.get('secured_r')} (expect ADVISE_EXIT)")
+    assert result6["status"] == Status.ADVISE_EXIT, f"Expected ADVISE_EXIT, got {result6['status']}"
+
+    print("\n✅ All 6 tests passed")

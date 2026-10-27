@@ -84,7 +84,7 @@ logger = logging.getLogger(__name__)
 MAX_RISK_ATR_MULTIPLE = 3.0   # drop SLs wider than 3× mean ATR
 MAX_RISK_PIPS_FALLBACK = 50.0 # used only if ATR unavailable
 # Maximum zone touch count — zones tested more than this are considered exhausted
-MAX_TOUCH_COUNT = 20
+MAX_TOUCH_COUNT = 1000000   # touch filter DISABLED (was 20) - keep equal to predictor
 
 
 class DualLabelGenerator:
@@ -138,6 +138,24 @@ class DualLabelGenerator:
     # ─────────────────────────────────────────────────────────────────────────
     # Touch index
     # ─────────────────────────────────────────────────────────────────────────
+
+    # Zones are only KNOWABLE after the bars used to qualify them have closed:
+    #   order blocks: smc_detector.detect_order_blocks needs the NEXT 3 4H bars
+    #                 (strength/reaction) -> confirmed 16h after the OB bar opens
+    #   FVG only:     confirmed when the 3rd candle closes -> 4h after it opens
+    # Labelling from the zone's own bar lets the simulation run through the very
+    # impulse that qualified the zone (look-ahead) -> fake ~99% win rates.
+    def confirmed_start_index(self, zone: Dict, df: pd.DataFrame, zone_index: int) -> int:
+        sources = zone.get('sources', [zone.get('source', 'order_block')])
+        lag_hours = 16 if 'order_block' in sources else 4
+        zt = zone.get('time')
+        try:
+            if zt is not None and 'time' in df.columns:
+                cutoff = pd.Timestamp(zt) + pd.Timedelta(hours=lag_hours)
+                return max(zone_index, int(df['time'].searchsorted(cutoff)))
+        except Exception:
+            pass
+        return zone_index + lag_hours * 4      # fallback: 15min bars
 
     def find_first_touch_index(self,
                                zone: Dict,
@@ -305,6 +323,18 @@ class DualLabelGenerator:
         best_tp_progress = 0.0
         best_sl_progress = 0.0
 
+        # FILL FIX: only simulate once price actually trades at entry.
+        fill_index = None
+        for j in range(start_index, end_index):
+            _b = df.iloc[j]
+            if (direction == 'buy' and _b['low'] <= entry) or \
+               (direction == 'sell' and _b['high'] >= entry):
+                fill_index = j
+                break
+        if fill_index is None:
+            return 0.50, 'reversion_never_filled'
+        start_index = fill_index
+
         for i in range(start_index, end_index):
             bar = df.iloc[i]
 
@@ -376,8 +406,37 @@ class DualLabelGenerator:
         end_index        = min(start_index + self.horizon_bars, len(df))
         closest_approach = float('inf')
 
-        for i in range(start_index, end_index):
+        # CONTINUATION-ZONE-ENTRY FIX (v2): don't start evaluating until
+        # price has genuinely TRADED INSIDE the zone's real price range, not
+        # just within 1 ATR of an edge (which can be much wider than a
+        # narrow FVG and let a multi-bar sweep masquerade as "held").
+        _zone_lo = min(zone['price_low'], zone['price_high'])
+        _zone_hi = max(zone['price_low'], zone['price_high'])
+        _entry_scan_end = min(start_index + self.horizon_bars, len(df))
+        _entry_index = None
+        for _j in range(start_index, _entry_scan_end):
+            _eb = df.iloc[_j]
+            if _eb['low'] <= _zone_hi and _eb['high'] >= _zone_lo:
+                _entry_index = _j
+                break
+        if _entry_index is None:
+            return 0.5, 'continuation_never_entered_zone'
+        eval_start = _entry_index + 1
+
+        for i in range(eval_start, end_index):
             bar = df.iloc[i]
+
+            # If this single bar's range already crosses BOTH lines, the
+            # order of events within the bar is unknowable from OHLC alone -
+            # don't let close-alone silently decide it. Skip to next bar.
+            if break_direction == 'bearish':
+                _guard_hit = bar['high'] >= reversion_guard
+                _break_hit = bar['low']  <  break_level
+            else:
+                _guard_hit = bar['low']  <= reversion_guard
+                _break_hit = bar['high'] >  break_level
+            if _guard_hit and _break_hit:
+                continue
 
             if break_direction == 'bearish':
                 # Zone held (bounced up) — close confirms reversion BEFORE break
@@ -504,7 +563,17 @@ class DualLabelGenerator:
                 tp        = entry - (risk * self.risk_reward)
                 direction = 'sell'
 
-            touch_index = self.find_first_touch_index(zone, df, zone_index, atr)
+            _search_start = self.confirmed_start_index(zone, df, zone_index)
+            touch_index = self.find_first_touch_index(zone, df, _search_start, atr)
+
+            # FVG-BIAS FIX: FVGs only enter the candidate pool if smc_detector
+            # found them still UNFILLED for a window after formation (see
+            # merge_zones: `if fvg.get('filled', False): continue`). That is
+            # a look-ahead selection filter on reversion outcome itself -
+            # every surviving FVG zone is one price already didn't return to
+            # for a while. Reversion labels on these are not trustworthy.
+            # (is_fvg_only was already computed above but never used - this
+            # wires in the fix the comment already described.)
 
             # ── LEAKAGE FIX ───────────────────────────────────────────────────
             # Outcome simulation MUST start at touch_index, not zone_index.
@@ -528,6 +597,8 @@ class DualLabelGenerator:
                 continue
             touch_found += 1
 
+            skip_reversion_label = is_fvg_only
+
             # Use ATR at touch bar for outcome simulation (more accurate than
             # zone-formation ATR, which may be stale by many bars)
             touch_atr = atr.iloc[touch_index]
@@ -540,12 +611,25 @@ class DualLabelGenerator:
             )
 
             # Start both simulations from touch_index (entry bar), not zone_index
-            label_reversion, reason_reversion = self.check_reversion_outcome(
-                zone, df, touch_index, touch_atr
-            )
-            label_continuation, reason_continuation = self.check_continuation_outcome(
-                zone, df, touch_index, touch_atr
-            )
+            if skip_reversion_label:
+                label_reversion, reason_reversion = 0.5, 'reversion_skipped_fvg_source_bias'
+            else:
+                label_reversion, reason_reversion = self.check_reversion_outcome(
+                    zone, df, touch_index, touch_atr
+                )
+
+            # CONTINUATION-FVG-SKIP FIX: FVG-only zones reverse strongly and
+            # near-mutually-exclusively with breaking (verified via direct
+            # price trace: 0/1106 breaks, with large confirmed rallies past
+            # the guard level). Same skip treatment as reversion, same
+            # reason (entangled survivorship bias + structural exclusivity).
+            skip_continuation_label = is_fvg_only
+            if skip_continuation_label:
+                label_continuation, reason_continuation = 0.5, 'continuation_skipped_fvg_source_bias'
+            else:
+                label_continuation, reason_continuation = self.check_continuation_outcome(
+                    zone, df, touch_index, touch_atr
+                )
 
             if label_reversion == 1.0:
                 reversion_tp += 1
@@ -789,8 +873,17 @@ class DualLabelGenerator:
         df_4h_ctx          = labels_df.attrs.get("_df_4h", None)
         df_5m_ctx          = labels_df.attrs.get("_df_5m", None)
 
+        # SPEEDUP: convert time columns once (feature_builder calls
+        # pd.to_datetime on these for every zone -> very slow on 1.7M rows)
+        for _d in (df_d1_ctx, df_1h_ctx, df_4h_ctx, df_5m_ctx):
+            if _d is not None and "time" in _d.columns:
+                _d["time"] = pd.to_datetime(_d["time"])
+
         feature_cols = []
-        for _, row in labels_df.iterrows():
+        _n_rows = len(labels_df)
+        for _k, (_, row) in enumerate(labels_df.iterrows()):
+            if _k % 250 == 0:
+                logger.info(f"  context features: {_k}/{_n_rows}")
             zone = {
                 "index":         int(row.get("zone_index", 0)),
                 "type":          row.get("zone_type", "demand"),

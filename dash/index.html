@@ -3,1112 +3,480 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ML Signal Terminal — V9</title>
+<title>TrendM30 ML Live Terminal</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Syne:wght@400;600;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Syne:wght@700;800&display=swap" rel="stylesheet">
 <style>
-:root {
-  --bg:      #0f1117;
-  --bg1:     #ffffff;
-  --bg2:     #f4f6fa;
-  --bg3:     #e8ecf4;
-  --border:  #d0d7e3;
-  --border2: #b0bcd0;
-  --text:    #0d1117;
-  --muted:   #4a5568;
-  --dim:     #718096;
-  --green:   #00a854;
-  --green2:  #007a3d;
-  --red:     #e53e3e;
-  --red2:    #c53030;
-  --yellow:  #d69e2e;
-  --blue:    #2b6cb0;
-  --blue2:   #1a4f8c;
-  --purple:  #6b46c1;
-  --orange:  #c05621;
-  --teal:    #2c7a7b;
-  --accent:  #2b6cb0;
-  --mono:    'JetBrains Mono', monospace;
-  --sans:    'Syne', sans-serif;
+:root{
+  --bg:#090c10; --panel:#0f141c; --row:#121721; --row-hover:#171e2c; --line:#1f293d;
+  --green:#00e676; --red:#ff3366; --amber:#ffab00; --blue:#2979ff;
+  --text:#f0f6fc; --muted:#8b949e; --dim:#484f58;
+  --mono:'JetBrains Mono',ui-monospace,monospace; --sans:'Syne',system-ui,sans-serif;
 }
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg2);color:var(--text);font-family:var(--mono);font-size:13.5px;line-height:1.6;min-height:100vh}
-body::before{display:none}
+body{background:var(--bg);color:var(--text);font:13px/1.5 var(--mono);min-height:100vh;padding-bottom:40px}
+button,a{font:inherit}
+:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
 
-/* HEADER */
-.header{display:flex;align-items:center;justify-content:space-between;padding:0 24px;height:52px;background:var(--bg1);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100}
-.header-left{display:flex;align-items:center;gap:20px}
-.logo{font-family:var(--sans);font-size:15px;font-weight:800;letter-spacing:1px;color:var(--text)}
-.logo span{color:var(--accent)}
-.session-pill{display:flex;align-items:center;gap:6px;padding:3px 10px;border-radius:3px;border:1px solid var(--border2);background:var(--bg3);font-size:11px;color:var(--muted);letter-spacing:.5px}
-.session-dot{width:6px;height:6px;border-radius:50%;background:var(--green);animation:blink 1.8s ease-in-out infinite}
-@keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
-.header-right{display:flex;align-items:center;gap:16px}
-#clock{font-size:12px;color:var(--text);letter-spacing:1px;opacity:0.75}
-.btn{background:transparent;border:1px solid var(--border2);color:var(--text);cursor:pointer;font-family:var(--mono);font-size:11px;padding:5px 12px;border-radius:3px;letter-spacing:.5px;transition:all .15s;opacity:0.85}
-.btn:hover{border-color:var(--accent);color:var(--accent);opacity:1}
-.btn.active-filter{border-color:var(--accent);color:var(--accent);opacity:1;background:rgba(43,108,176,0.07)}
-#conn-status{font-size:11px;color:var(--muted);letter-spacing:.3px}
+/* top bar */
+.top{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;
+  padding:12px 24px;background:#0d1117;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:10}
+.brand{font:800 17px var(--sans);display:flex;align-items:center;gap:10px}
+.brand b{color:var(--green)}
+.live{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--muted)}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--green);animation:pulse 1.6s infinite}
+.live.stale .dot{background:var(--red);animation:none}
+@keyframes pulse{50%{opacity:.3}}
+@media (prefers-reduced-motion:reduce){.dot{animation:none}}
+.top-right{display:flex;align-items:center;gap:12px;color:var(--muted);font-size:12px}
+.top-right b{color:var(--text);font-weight:500}
+.btn{background:#161b22;border:1px solid var(--line);color:var(--text);padding:5px 12px;border-radius:5px;cursor:pointer;text-decoration:none;font-size:12px}
+.btn:hover{background:#21262d}
 
-/* TICKER */
-.ticker-bar{display:flex;gap:0;background:var(--bg1);border-bottom:1px solid var(--border);overflow-x:auto;scrollbar-width:none}
-.ticker-bar::-webkit-scrollbar{display:none}
-.ticker-item{display:flex;align-items:center;gap:10px;padding:8px 20px;border-right:1px solid var(--border);min-width:160px;cursor:default}
-.ticker-item:hover{background:var(--bg2)}
-.ticker-sym{font-family:var(--sans);font-size:12px;font-weight:600;color:var(--text);letter-spacing:.5px}
-.ticker-data{display:flex;flex-direction:column;gap:1px}
-.ticker-trend{font-size:10px;letter-spacing:.5px;font-weight:600}
-.ticker-atr{font-size:10px;color:var(--muted)}
-.trend-bull{color:var(--green)}
-.trend-bear{color:var(--red)}
-.trend-neut{color:var(--muted)}
+.wrap{max-width:1240px;margin:20px auto;padding:0 16px}
 
-/* D1 BAR */
-.d1-bar{display:flex;align-items:center;gap:24px;padding:8px 24px;background:var(--bg1);border-bottom:1px solid var(--border);flex-wrap:wrap}
-.d1-label{font-size:10px;color:var(--muted);letter-spacing:1px;text-transform:uppercase;font-weight:600}
-.d1-badge{padding:3px 12px;border-radius:2px;font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;font-family:var(--sans)}
-.d1-badge.premium{background:#fff5f5;color:var(--red);border:1px solid var(--red)}
-.d1-badge.discount{background:#f0fff4;color:var(--green);border:1px solid var(--green)}
-.d1-badge.equilibrium{background:#fffbeb;color:var(--yellow);border:1px solid var(--yellow)}
-.d1-badge.unknown{background:var(--bg3);color:var(--muted);border:1px solid var(--border2)}
-.d1-track{flex:1;max-width:260px;height:5px;background:var(--bg3);border-radius:2px;position:relative;border:1px solid var(--border2)}
-.d1-fill{height:100%;border-radius:2px;background:linear-gradient(90deg,var(--green),var(--yellow) 50%,var(--red));transition:width .6s ease}
-.d1-cursor{position:absolute;top:-4px;width:2px;height:13px;background:var(--blue);border-radius:1px;transform:translateX(-50%);transition:left .6s ease;box-shadow:0 0 8px var(--blue)}
-.d1-range-labels{display:flex;justify-content:space-between;font-size:9px;color:var(--muted);margin-top:3px;font-weight:500}
-.d1-pos-text{font-size:12px;color:var(--muted)}
-.d1-pos-text b{color:var(--text);font-weight:700}
+/* toolbar */
+.bar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px}
+.tabs{display:flex;gap:4px}
+.tab{background:none;border:1px solid transparent;color:var(--muted);padding:6px 12px;border-radius:6px;cursor:pointer}
+.tab:hover{color:var(--text)}
+.tab[aria-pressed="true"]{background:var(--panel);border-color:var(--line);color:var(--text)}
+.tab .n{margin-left:6px;padding:0 6px;border-radius:9px;background:#1c2330;font-size:11px;color:var(--muted)}
+.tab.ready .n{background:rgba(0,230,118,.15);color:var(--green)}
+.tab.wait .n{background:rgba(255,171,0,.15);color:var(--amber)}
+.meta{font-size:11px;color:var(--muted)}
+.gate{font-size:11px;color:var(--dim)}
 
-/* THRESHOLD INFO BAR */
-.threshold-bar{display:flex;align-items:center;gap:20px;padding:7px 24px;background:var(--bg1);border-bottom:1px solid var(--border);font-size:11px;color:var(--muted);flex-wrap:wrap}
-.thr-item{display:flex;align-items:center;gap:6px}
-.thr-pill{padding:2px 9px;border-radius:2px;font-size:10px;font-weight:700;letter-spacing:.5px}
-.thr-pill.rev{background:#e6fffa;color:var(--teal);border:1px solid var(--teal)}
-.thr-pill.cont{background:#f3f0ff;color:var(--purple);border:1px solid var(--purple)}
+/* view switch + signal log */
+.views{display:flex;gap:4px;margin-bottom:14px;border-bottom:1px solid var(--line)}
+.view-btn{background:none;border:0;border-bottom:2px solid transparent;color:var(--muted);padding:8px 14px;cursor:pointer;margin-bottom:-1px}
+.view-btn:hover{color:var(--text)}
+.view-btn[aria-pressed="true"]{color:var(--text);border-bottom-color:var(--green)}
+.ltab{background:none;border:1px solid transparent;color:var(--muted);padding:6px 12px;border-radius:6px;cursor:pointer}
+.ltab:hover{color:var(--text)}
+.ltab[aria-pressed="true"]{background:var(--panel);border-color:var(--line);color:var(--text)}
+.stats{font-size:12px;color:var(--muted)} .stats b{color:var(--text);font-weight:500}
+.scroll{overflow-x:auto}
+.lg-head,.lg-row{display:grid;grid-template-columns:1.25fr .9fr .8fr .6fr 1.3fr .8fr .8fr .8fr .8fr 1.1fr 1.1fr .8fr;gap:8px;align-items:center;padding:8px 14px;min-width:1180px}
+.lg-head{font-size:11px;color:var(--dim);border-bottom:1px solid var(--line);height:34px;padding-top:0;padding-bottom:0}
+.lg-row{border-bottom:1px solid var(--line);font-size:12px;border-left:3px solid transparent}
+.lg-row:last-child{border-bottom:0}
+.lg-row:hover{background:var(--row-hover)}
+.lg-row.win{border-left-color:var(--green)} .lg-row.loss{border-left-color:var(--red)}
+.lg-row.act{border-left-color:var(--blue)} .lg-row.exp{opacity:.55}
+.pill.open{color:var(--blue);border-color:rgba(41,121,255,.4);background:rgba(41,121,255,.1)}
+.pill.win{color:var(--green);border-color:rgba(0,230,118,.4);background:rgba(0,230,118,.1)}
+.pill.loss{color:var(--red);border-color:rgba(255,51,102,.4);background:rgba(255,51,102,.1)}
+.rpos{color:var(--green);font-weight:700} .rneg{color:var(--red);font-weight:700}
+.sub2{display:block;color:var(--muted);font-size:10.5px}
+/* table */
+.table{background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.head,.row{display:grid;grid-template-columns:1fr .8fr 1.2fr .9fr .9fr .9fr .9fr .6fr 1.5fr 24px;align-items:center;gap:8px;padding:0 14px}
+.head{height:34px;font-size:11px;color:var(--dim);border-bottom:1px solid var(--line)}
+.item{border-bottom:1px solid var(--line)}
+.item:last-child{border-bottom:0}
+.row{width:100%;min-height:46px;background:none;border:0;color:inherit;text-align:left;cursor:pointer;border-left:3px solid transparent}
+.row:hover{background:var(--row-hover)}
+.item.ready .row{border-left-color:var(--green)}
+.item.wait .row{border-left-color:var(--amber)}
+.item.idle .row{opacity:.55}
+.item.idle .row:hover{opacity:1}
+.pair{font:700 14px var(--sans)}
+.pair .sub{display:none;font:400 10.5px var(--mono);color:var(--muted)}
+.age{color:var(--muted)}
+.c-time{font-size:12px;white-space:nowrap;line-height:1.35}
+.c-entry{font-weight:700}
+.pill.stale{color:var(--red);border-color:rgba(255,51,102,.4);background:rgba(255,51,102,.1)}
+.item.stale .row{opacity:.6}
+.warn{display:none;margin-bottom:12px;padding:10px 14px;border-radius:8px;background:rgba(255,51,102,.1);border:1px solid rgba(255,51,102,.4);color:#ff8fa8;font-size:12px}
+.warn.show{display:block}
+.warn b{color:#fff;font-weight:500}
+.item.ready .c-time b{color:var(--green);font-weight:500}
+.item.wait .c-time b{color:var(--amber);font-weight:500}
+.dir{font-weight:700;font-size:12px}
+.dir.buy{color:var(--green)} .dir.sell{color:var(--red)} .dir.none{color:var(--dim);font-weight:400}
+.prob{display:flex;align-items:center;gap:8px}
+.prob .pct{width:38px;font-weight:700}
+.prob .track{flex:1;height:4px;background:#1c2330;border-radius:2px;overflow:hidden;max-width:80px}
+.prob .fill{height:100%;background:var(--blue)}
+.item.apex .pct{color:var(--green)} .item.apex .fill{background:var(--green)}
+.pill{display:inline-block;font-size:11px;padding:1px 8px;border-radius:10px;border:1px solid var(--line);color:var(--muted);white-space:nowrap}
+.pill.ready{color:var(--green);border-color:rgba(0,230,118,.4);background:rgba(0,230,118,.1)}
+.pill.wait{color:var(--amber);border-color:rgba(255,171,0,.4);background:rgba(255,171,0,.1)}
+.num{font-variant-numeric:tabular-nums}
+.sl{color:var(--red)} .tp{color:var(--green)} .rr{color:var(--text)}
+.chev{color:var(--dim);transition:transform .15s}
+.item.open .chev{transform:rotate(90deg)}
+.na{color:var(--dim)}
 
-/* STAT GRID */
-.stat-grid{display:grid;grid-template-columns:repeat(8,1fr);border-bottom:1px solid var(--border)}
-@media(max-width:900px){.stat-grid{grid-template-columns:repeat(4,1fr)}}
-@media(max-width:500px){.stat-grid{grid-template-columns:repeat(2,1fr)}}
-.stat-cell{padding:14px 16px;border-right:1px solid var(--border);background:var(--bg1)}
-.stat-cell:last-child{border-right:none}
-.sc-label{font-size:9px;color:var(--muted);letter-spacing:1.2px;text-transform:uppercase;margin-bottom:6px;font-weight:600}
-.sc-value{font-family:var(--sans);font-size:22px;font-weight:800;line-height:1;letter-spacing:-.5px}
-.sc-sub{font-size:10px;color:var(--muted);margin-top:3px}
-.c-green{color:var(--green)}
-.c-red{color:var(--red)}
-.c-blue{color:var(--blue)}
-.c-yellow{color:var(--yellow)}
-.c-purple{color:var(--purple)}
-.c-orange{color:var(--orange)}
-.c-teal{color:var(--teal)}
+/* details */
+.detail{display:none;padding:12px 14px 14px 17px;background:#0b1018;border-top:1px dashed var(--line);font-size:12px;color:var(--muted)}
+.item.open .detail{display:flex;flex-wrap:wrap;gap:8px 24px}
+.detail b{color:var(--text);font-weight:500}
+.empty{padding:36px;text-align:center;color:var(--muted)}
+.foot{text-align:center;font-size:11px;color:var(--dim);margin-top:24px}
 
-/* TABS */
-.tabs{display:flex;background:var(--bg1);border-bottom:1px solid var(--border);padding:0 24px}
-.tab-btn{background:none;border:none;border-bottom:2px solid transparent;color:var(--muted);cursor:pointer;font-family:var(--mono);font-size:11px;font-weight:500;letter-spacing:.8px;text-transform:uppercase;padding:11px 18px;transition:all .15s}
-.tab-btn:hover{color:var(--text)}
-.tab-btn.active{color:var(--accent);border-bottom-color:var(--accent)}
-.tab-count{display:inline-block;background:var(--bg3);border:1px solid var(--border);border-radius:10px;font-size:10px;padding:0 6px;margin-left:6px;line-height:16px}
-.tab-count.live{background:#f0fff4;border-color:var(--green);color:var(--green)}
-.tab-count.obs{background:#fffbeb;border-color:var(--yellow);color:var(--yellow)}
-.tab-panel{display:none}
-.tab-panel.active{display:block}
-
-/* TABLE */
-.table-wrap{overflow-x:auto;border-bottom:1px solid var(--border)}
-.tbl{width:100%;border-collapse:collapse;font-size:12px;font-family:var(--mono)}
-.tbl thead th{background:var(--bg3);padding:9px 12px;text-align:left;font-size:9px;letter-spacing:1px;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--border2);white-space:nowrap;font-weight:700}
-.tbl tbody tr{border-bottom:1px solid var(--border);transition:background .1s}
-.tbl tbody tr:hover{background:var(--bg3)}
-.tbl tbody td{padding:10px 12px;white-space:nowrap;vertical-align:middle;color:var(--text)}
-.tbl tbody tr.row-buy{border-left:3px solid var(--green)}
-.tbl tbody tr.row-sell{border-left:3px solid var(--red)}
-
-/* BADGES */
-.dir-badge{display:inline-block;padding:2px 8px;border-radius:2px;font-size:10px;font-weight:700;letter-spacing:1px}
-.dir-badge.buy{background:#f0fff4;color:var(--green);border:1px solid var(--green)}
-.dir-badge.sell{background:#fff5f5;color:var(--red);border:1px solid var(--red)}
-.status-badge{display:inline-block;padding:2px 8px;border-radius:2px;font-size:10px;font-weight:600;letter-spacing:.5px}
-.status-badge.pending{background:#ebf8ff;color:var(--blue);border:1px solid var(--blue)}
-.status-badge.hit_tp{background:#f0fff4;color:var(--green);border:1px solid var(--green)}
-.status-badge.hit_sl{background:#fff5f5;color:var(--red);border:1px solid var(--red)}
-.status-badge.triggered{background:#fffaf0;color:var(--orange);border:1px solid var(--orange)}
-.status-badge.entry_missed{background:var(--bg3);color:var(--muted);border:1px solid var(--border2)}
-.status-badge.expired{background:var(--bg3);color:var(--muted);border:1px solid var(--border2)}
-.status-badge.planned{background:#f3f0ff;color:var(--purple);border:1px solid var(--purple)}
-.status-badge.observation{background:#fffbeb;color:var(--yellow);border:1px solid var(--yellow)}
-.gate-pill{display:inline-block;padding:2px 8px;border-radius:2px;font-size:10px;background:#fffbeb;color:var(--yellow);border:1px solid var(--yellow)}
-.strat-pill{display:inline-block;padding:2px 7px;border-radius:2px;font-size:9px;letter-spacing:.5px}
-.strat-pill.rev{background:#e6fffa;color:var(--teal);border:1px solid var(--teal)}
-.strat-pill.cont{background:#f3f0ff;color:var(--purple);border:1px solid var(--purple)}
-.strat-pill.htf{background:#ebf8ff;color:var(--blue);border:1px solid var(--blue)}
-.type-badge{display:inline-block;padding:1px 4px;border-radius:2px;font-size:9px;font-weight:700;letter-spacing:.5px;margin-left:4px;vertical-align:middle;text-transform:uppercase}
-.type-badge.ob{background:rgba(107,70,193,0.1);color:var(--purple);border:1px solid rgba(107,70,193,0.25)}
-.type-badge.fvg{background:rgba(44,122,123,0.1);color:var(--teal);border:1px solid rgba(44,122,123,0.25)}
-
-/* PROB BAR */
-.prob-cell{display:flex;align-items:center;gap:6px}
-.prob-track{width:50px;height:3px;background:var(--border);border-radius:2px;flex-shrink:0}
-.prob-fill{height:100%;border-radius:2px;transition:width .3s}
-.prob-num{font-size:11px;min-width:36px;text-align:right}
-.prob-wrap{position:relative;display:inline-flex;align-items:center;gap:6px}
-.thr-marker{position:absolute;top:-3px;width:1px;height:9px;background:rgba(255,255,255,.25);pointer-events:none}
-
-/* FUNNEL TAB */
-.funnel-grid{display:grid;grid-template-columns:repeat(2,1fr)}
-@media(max-width:600px){.funnel-grid{grid-template-columns:1fr}}
-.funnel-card{border-right:1px solid var(--border);border-bottom:1px solid var(--border);padding:14px 16px;background:var(--bg1)}
-.funnel-card:nth-child(even){border-right:none}
-.fc-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
-.fc-sym{font-family:var(--sans);font-size:13px;font-weight:700;color:var(--text)}
-.fc-price{font-size:10px;color:var(--muted)}
-.fc-strategy-thresholds{display:flex;gap:6px;margin-bottom:8px}
-.funnel-steps{display:flex;flex-direction:column;gap:4px}
-.fstep{display:flex;align-items:center;gap:8px;font-size:10px;padding:4px 8px;border-radius:3px}
-.fstep.pass{background:#f0fff4;border:1px solid #9ae6b4}
-.fstep.fail{background:#fff5f5;border:1px solid #feb2b2}
-.fstep.warn{background:#fffbeb;border:1px solid #fbd38d}
-.fstep.info{background:#ebf8ff;border:1px solid #90cdf4}
-.fstep-num{font-size:9px;color:var(--muted);min-width:14px}
-.fstep-label{color:var(--text);opacity:0.75;flex:1}
-.fstep-val{color:var(--text);font-weight:600;text-align:right}
-.fstep-reason{color:var(--red);font-size:9px;text-align:right;font-weight:600}
-.rej-pills{display:flex;flex-wrap:wrap;gap:4px;margin-top:8px}
-.rej-pill{font-size:9px;padding:2px 7px;border-radius:2px;background:var(--bg2)}
-.rej-pill.dist{color:var(--blue);border:1px solid var(--blue)}
-.rej-pill.dir{color:var(--red);border:1px solid var(--red)}
-.rej-pill.prob{color:var(--yellow);border:1px solid var(--yellow)}
-.rej-pill.rr{color:var(--teal);border:1px solid var(--teal)}
-.rej-pill.conf{color:var(--purple);border:1px solid var(--purple)}
-.cycle-bar{display:flex;align-items:center;gap:12px;padding:8px 24px;background:var(--bg3);border-bottom:1px solid var(--border);font-size:11px;color:var(--muted)}
-.cycle-num{font-family:var(--sans);font-size:13px;font-weight:700;color:var(--text)}
-.cycle-next{margin-left:auto}
-.cache-status{font-size:10px;color:var(--muted);padding:0 24px 0 0}
-.cache-hit{color:var(--green)}
-.cache-miss{color:var(--yellow)}
-.sig-extra{font-size:9px;color:var(--muted);margin-top:1px}
-
-/* EMPTY */
-.empty{text-align:center;padding:60px 20px;color:var(--muted)}
-.empty-icon{font-size:32px;margin-bottom:12px;opacity:.4}
-.empty-title{font-family:var(--sans);font-size:15px;font-weight:600;color:var(--dim);margin-bottom:6px}
-.empty-sub{font-size:11px;max-width:360px;margin:0 auto;line-height:1.6}
-.section-header{display:flex;align-items:center;justify-content:space-between;padding:10px 24px;background:var(--bg1);border-bottom:1px solid var(--border);flex-wrap:wrap;gap:8px}
-.section-title{font-size:10px;color:var(--muted);letter-spacing:1px;text-transform:uppercase;font-weight:600}
-.section-note{font-size:10px;color:var(--muted);font-weight:500}
-.filter-group{display:flex;align-items:center;gap:6px}
-
-/* OUTCOMES */
-.outcomes-header{display:grid;grid-template-columns:repeat(4,1fr);border-bottom:1px solid var(--border)}
-@media(max-width:600px){.outcomes-header{grid-template-columns:repeat(2,1fr)}}
-.oc-cell{padding:20px 24px;border-right:1px solid var(--border);background:var(--bg1)}
-.oc-cell:last-child{border-right:none}
-.oc-label{font-size:9px;color:var(--muted);letter-spacing:1.2px;text-transform:uppercase;margin-bottom:8px;font-weight:700}
-.oc-value{font-family:var(--sans);font-size:32px;font-weight:800;line-height:1}
-.oc-sub{font-size:11px;color:var(--muted);margin-top:4px}
-.donut-row{display:flex;align-items:center;gap:14px;margin-top:14px}
-.donut-legend{font-size:11px}
-.dl-row{display:flex;align-items:center;gap:6px;margin-bottom:4px;color:var(--text);opacity:0.75}
-.dl-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
-.how-box{margin:0;padding:16px 24px;background:var(--bg3);border-bottom:1px solid var(--border);font-size:11px;color:var(--muted);line-height:2;display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:4px 32px}
-.how-box span{color:var(--text);font-weight:600}
-
-/* CURRENCY SELECT FILTER */
-select.select-filter {
-  background-color: var(--bg1);
-  border: 1px solid var(--border2);
-  color: var(--text);
-  cursor: pointer;
-  font-family: var(--mono);
-  font-size: 11px;
-  padding: 5px 28px 5px 12px;
-  border-radius: 3px;
-  letter-spacing: .5px;
-  transition: all .15s;
-  opacity: 0.85;
-  outline: none;
-  appearance: none;
-  -webkit-appearance: none;
-  -moz-appearance: none;
-  background-image: url("data:image/svg+xml;charset=UTF-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%230d1117' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 8px center;
+/* narrower screens: drop TP columns from the row, they show in details */
+@media (max-width:820px){
+  .head,.row{grid-template-columns:1fr .8fr 1.2fr 1fr 24px}
+  .c-sl,.c-tp1,.c-tp2,.c-rr,.c-time{display:none}
+  .pair .sub{display:block}
+  .detail .extra{display:inline}
 }
-select.select-filter:hover {
-  border-color: var(--accent);
-  color: var(--accent);
-  opacity: 1;
-}
-select.select-filter option {
-  background: var(--bg1);
-  color: var(--text);
-  font-family: var(--mono);
+@media (min-width:821px){.detail .extra{display:none}}
+@media (max-width:520px){
+  .head,.row{grid-template-columns:1fr .8fr 1fr 24px}
+  .c-prob{display:none}
+  .top{padding:10px 14px}
 }
 </style>
 </head>
 <body>
 
-<!-- HEADER -->
-<div class="header">
-  <div class="header-left">
-    <div class="logo">ML<span>SIGNAL</span> TERMINAL <span style="font-size:11px;color:var(--muted)">V9</span></div>
-    <div class="session-pill">
-      <div class="session-dot"></div>
-      <span id="session-name">DETECTING…</span>
+<header class="top">
+  <div class="brand">TREND<b>M30</b> ML
+    <span class="live" id="live"><span class="dot"></span><span id="live-text">Live</span></span>
+  </div>
+  <div class="top-right">
+    <span id="countdown">Next scan: …</span>
+    <button class="btn" id="refresh">Refresh</button>
+    <a class="btn" href="/">SMC dashboard</a>
+  </div>
+</header>
+
+<main class="wrap">
+  <div class="views" role="group" aria-label="View">
+    <button class="view-btn" data-v="live" aria-pressed="true">Live pairs</button>
+    <button class="view-btn" data-v="log" aria-pressed="false">Signal log <span class="meta" id="log-count"></span></button>
+  </div>
+  <div class="warn" id="warn" role="alert"></div>
+  <div id="live-view">
+  <div class="bar">
+    <div class="tabs" role="group" aria-label="Filter signals">
+      <button class="tab ready" data-f="ready" aria-pressed="true">Ready<span class="n" id="n-ready">0</span></button>
+      <button class="tab wait" data-f="wait" aria-pressed="false">Waiting<span class="n" id="n-wait">0</span></button>
+      <button class="tab" data-f="all" aria-pressed="false">All<span class="n" id="n-all">0</span></button>
     </div>
+    <div class="meta"><span id="updated"></span></div>
   </div>
-  <div class="header-right">
-    <div id="clock">--:--:-- UTC</div>
-    <select id="filter-currency" onchange="setCurrencyFilter(this.value)" class="select-filter">
-      <option value="all">ALL CURRENCIES</option>
-      <option value="EUR/USD">EUR/USD</option>
-      <option value="GBP/USD">GBP/USD</option>
-      <option value="USD/JPY">USD/JPY</option>
-      <option value="XAU/USD">XAU/USD</option>
-    </select>
-    <button class="btn" onclick="fetchAll()">⟳ REFRESH</button>
-    <div id="conn-status">CONNECTING…</div>
-  </div>
-</div>
 
-<!-- PAIR TICKER -->
-<div class="ticker-bar" id="ticker-bar">
-  <div class="ticker-item"><span class="ticker-sym">EUR/USD</span><div class="ticker-data"><span class="ticker-trend trend-neut">—</span><span class="ticker-atr">ATR —</span></div></div>
-  <div class="ticker-item"><span class="ticker-sym">GBP/USD</span><div class="ticker-data"><span class="ticker-trend trend-neut">—</span><span class="ticker-atr">ATR —</span></div></div>
-  <div class="ticker-item"><span class="ticker-sym">USD/JPY</span><div class="ticker-data"><span class="ticker-trend trend-neut">—</span><span class="ticker-atr">ATR —</span></div></div>
-  <div class="ticker-item"><span class="ticker-sym">XAU/USD</span><div class="ticker-data"><span class="ticker-trend trend-neut">—</span><span class="ticker-atr">ATR —</span></div></div>
-</div>
-
-<!-- D1 ZONE BAR -->
-<div class="d1-bar">
-  <div>
-    <div class="d1-label">D1 Zone</div>
-    <div id="d1-badge" class="d1-badge unknown">UNKNOWN</div>
-  </div>
-  <div class="d1-pos-text">Position: <b id="d1-pos">—</b></div>
-  <div style="flex:1;max-width:280px">
-    <div class="d1-track">
-      <div class="d1-fill" id="d1-fill" style="width:50%"></div>
-      <div class="d1-cursor" id="d1-cursor" style="left:50%"></div>
+  <div class="table" id="table">
+    <div class="head" aria-hidden="true">
+      <span>Pair</span><span>Signal</span><span class="c-prob">Win probability</span><span class="c-entry">Entry</span>
+      <span class="c-sl">Stop loss</span><span class="c-tp1">TP1</span><span class="c-tp2">TP2</span><span class="c-rr">RR</span><span class="c-time">Status · produced (EAT)</span><span></span>
     </div>
-    <div class="d1-range-labels">
-      <span>DISCOUNT &lt;40%</span><span>EQUILIBRIUM</span><span>PREMIUM &gt;60%</span>
+    <div id="list"><div class="empty">Loading signals…</div></div>
+  </div>
+
+  <p class="gate" style="margin-top:10px">Signals need 70%+ win probability. Green bars mark 75%+. Entries come from closed M30 candles, so they don't repaint. All times are EAT (UTC+3). Produced is when the M30 bar closed and the signal was generated. Click a row for more detail.</p>
+  </div>
+
+  <div id="log-view" hidden>
+    <div class="bar">
+      <div class="tabs" role="group" aria-label="Filter signal log">
+        <button class="ltab" data-lf="active" aria-pressed="true">Active</button>
+        <button class="ltab" data-lf="closed" aria-pressed="false">Finished</button>
+        <button class="ltab" data-lf="all" aria-pressed="false">All</button>
+      </div>
+      <div class="stats" id="log-stats"></div>
     </div>
+    <div class="table"><div class="scroll"><div class="lg-head" aria-hidden="true">
+      <span>Produced (EAT)</span><span>Pair</span><span>Signal</span><span>Prob</span><span>State</span><span>Entry</span><span>Stop loss</span><span>TP1</span><span>TP2</span><span>Triggered</span><span>Closed</span><span>Result</span>
+    </div><div id="log-list"><div class="empty">Loading…</div></div></div></div>
+    <p class="gate" style="margin-top:10px">Every signal at 70%+ is recorded here when it is produced, then followed until it hits TP2 or the stop, goes to break-even after TP1, or expires. Result is in R, with half the position closed at TP1 and the rest at TP2. If SL and TP1 touch in the same bar it counts as a loss. ↺ marks a signal caught up after a scanner gap, so its detected time is later than its produced time.</p>
   </div>
-  <div id="conn-updated" style="font-size:10px;color:var(--muted);margin-left:auto"></div>
-</div>
 
-<!-- THRESHOLD INFO BAR -->
-<div class="threshold-bar">
-  <span>PROBABILITY THRESHOLDS:</span>
-  <div class="thr-item"><span class="thr-pill rev">REV</span><span>≥ 65% (95.76% precision at 0.65)</span></div>
-  <div class="thr-item"><span class="thr-pill cont">CONT</span><span>≥ 60% (80.0% precision at 0.60)</span></div>
-  <span style="margin-left:auto;color:var(--dim)">Calibrated models · uniform ensemble average</span>
-</div>
-
-<!-- STAT GRID -->
-<div class="stat-grid">
-  <div class="stat-cell"><div class="sc-label">Live Signals</div><div class="sc-value c-green" id="s-live">—</div><div class="sc-sub">gates passed</div></div>
-  <div class="stat-cell"><div class="sc-label">Observation</div><div class="sc-value c-yellow" id="s-obs">—</div><div class="sc-sub">gate-blocked</div></div>
-  <div class="stat-cell"><div class="sc-label">Win Rate</div><div class="sc-value c-blue" id="s-wr">—</div><div class="sc-sub" id="s-tp-sl">TP / SL</div></div>
-  <div class="stat-cell"><div class="sc-label">Triggered</div><div class="sc-value c-orange" id="s-triggered">—</div><div class="sc-sub">entry hit</div></div>
-  <div class="stat-cell"><div class="sc-label">Avg Prob</div><div class="sc-value c-purple" id="s-prob">—</div><div class="sc-sub">model confidence</div></div>
-  <div class="stat-cell"><div class="sc-label">Avg R:R</div><div class="sc-value c-teal" id="s-rr">—</div><div class="sc-sub" id="s-bestrr">best —</div></div>
-  <div class="stat-cell"><div class="sc-label">Entry Missed</div><div class="sc-value c-red" id="s-missed">—</div><div class="sc-sub">never filled</div></div>
-  <div class="stat-cell"><div class="sc-label">H4 Bias</div><div class="sc-value" id="s-h4" style="font-size:14px;padding-top:4px">—</div><div class="sc-sub" id="s-d1trend">D1: —</div></div>
-</div>
-
-<!-- TABS -->
-<div class="tabs">
-  <button class="tab-btn active" onclick="switchTab('real')" id="tab-real">✦ Real Signals <span class="tab-count live" id="tc-real">0</span></button>
-  <button class="tab-btn" onclick="switchTab('obs')" id="tab-obs">◎ Observation <span class="tab-count obs" id="tc-obs">0</span></button>
-  <button class="tab-btn" onclick="switchTab('funnel')" id="tab-funnel">⬡ Funnel</button>
-  <button class="tab-btn" onclick="switchTab('outcomes')" id="tab-outcomes">◈ Outcomes</button>
-</div>
-
-<!-- REAL SIGNALS TAB -->
-<div class="tab-panel active" id="panel-real">
-  <div class="section-header">
-    <div class="section-title">Signals that passed ALL gates — REV ≥65% · CONT ≥60% · 4H bias · D1 zone EUR/USD	5.55p OB |GBP/USD 4.60p   FVG |USD/JPY	8.50p	    OB |4.09p   FVG</div>
-    <div class="filter-group">
-      <span style="font-size:10px;color:var(--muted);letter-spacing:.5px;margin-right:2px">FILTER:</span>
-      <button class="btn active-filter" id="filter-all" onclick="setFilter('all')" style="font-size:10px;padding:3px 10px">ALL</button>
-      <button class="btn" id="filter-htf" onclick="setFilter('htf')" style="font-size:10px;padding:3px 10px">HTF</button>
-      <button class="btn" id="filter-rev" onclick="setFilter('rev')" style="font-size:10px;padding:3px 10px">REV</button>
-      <div class="section-note" id="real-note" style="margin-left:8px">—</div>
-    </div>
-  </div>
-  <div class="table-wrap">
-    <table class="tbl">
-      <thead><tr>
-        <th>Date</th><th>Time UTC</th><th>Symbol</th><th>Strategy</th>
-        <th>Dir</th><th>Entry</th><th>SL</th><th>TP</th>
-        <th>Risk p</th><th>R:R</th><th>Probability</th>
-        <th>Confluence</th><th>Seen</th><th>H4 Trend</th><th>Status</th>
-      </tr></thead>
-      <tbody id="tbody-real">
-        <tr><td colspan="15"><div class="empty"><div class="empty-icon">⏳</div><div class="empty-title">Waiting for signals</div><div class="empty-sub">First signals appear during London open (10:00 EAT) and London/NY overlap (15:00–19:00 EAT).</div></div></td></tr>
-      </tbody>
-    </table>
-  </div>
-</div>
-
-<!-- OBSERVATION TAB -->
-<div class="tab-panel" id="panel-obs">
-  <div class="section-header">
-    <div class="section-title">Gate-blocked zones — for study only, not traded</div>
-    <div class="section-note" style="color:var(--yellow)">4H bias or D1 zone gate blocked these</div>
-  </div>
-  <div class="table-wrap">
-    <table class="tbl">
-      <thead><tr>
-        <th>Date</th><th>Time UTC</th><th>Symbol</th><th>Strategy</th>
-        <th>Dir</th><th>Entry</th><th>SL</th><th>TP est</th>
-        <th>Risk p</th><th>Strength</th><th>Confluence</th><th>Seen</th>
-        <th>H4 Trend</th><th>D1 Zone</th><th>Gate Blocked By</th>
-      </tr></thead>
-      <tbody id="tbody-obs">
-        <tr><td colspan="15"><div class="empty"><div class="empty-icon">◎</div><div class="empty-title">No observation signals yet</div><div class="empty-sub">Gate-blocked zones appear here as the system runs through cycles.</div></div></td></tr>
-      </tbody>
-    </table>
-  </div>
-</div>
-
-<!-- FUNNEL TAB -->
-<div class="tab-panel" id="panel-funnel">
-  <div class="cycle-bar">
-    <span style="font-size:10px;color:var(--muted);letter-spacing:.5px">CYCLE</span>
-    <span class="cycle-num" id="f-cycle">#—</span>
-    <span id="f-cycle-time" style="color:var(--muted);font-size:11px">—</span>
-    <span class="cache-status" id="f-cache" style="margin-left:12px"></span>
-    <span class="cycle-next" id="f-next" style="font-size:10px;color:var(--muted)">Next: —</span>
-  </div>
-  <div class="how-box">
-    <div><span>HTF filter</span> — 4H OBs/FVGs checked vs 1H trend; direction conflict = reject</div>
-    <div><span>Bias filter</span> — bullish bias blocks SELL; bearish blocks BUY</div>
-    <div><span>REV threshold</span> — ≥ 65% (reversion strategy, precision 95.76%)</div>
-    <div><span>CONT threshold</span> — ≥ 60% (continuation strategy, precision 80.0%)</div>
-    <div><span>15min zones</span> — tracked but not ML-scored (model trained on 4H OBs only)</div>
-    <div><span>Cache</span> — 15min/5min fetched every cycle · 1H/4H/1D cached until candle closes</div>
-  </div>
-  <div class="funnel-grid" id="funnel-grid">
-    <div style="grid-column:1/-1;padding:40px;text-align:center;color:var(--muted)">Funnel data loads from /api/funnel</div>
-  </div>
-</div>
-
-<!-- OUTCOMES TAB -->
-<div class="tab-panel" id="panel-outcomes">
-  <div class="outcomes-header">
-    <div class="oc-cell">
-      <div class="oc-label">Win Rate</div>
-      <div class="oc-value c-green" id="oc-wr">—</div>
-      <div class="oc-sub">TP / (TP + SL)</div>
-      <div id="donut-box" class="donut-row"></div>
-    </div>
-    <div class="oc-cell">
-      <div class="oc-label">Total Resolved</div>
-      <div class="oc-value c-blue" id="oc-resolved">—</div>
-      <div class="oc-sub" id="oc-resolved-sub">TP wins + SL losses</div>
-    </div>
-    <div class="oc-cell">
-      <div class="oc-label">Still Pending</div>
-      <div class="oc-value c-orange" id="oc-pending">—</div>
-      <div class="oc-sub">entry not triggered yet</div>
-    </div>
-    <div class="oc-cell">
-      <div class="oc-label">Entry Missed</div>
-      <div class="oc-value c-red" id="oc-missed">—</div>
-      <div class="oc-sub">price never reached entry</div>
-    </div>
-  </div>
-  <div class="how-box">
-    <div>✅ <span>HIT_TP</span> — entry touched → TP reached, SL not hit first</div>
-    <div>❌ <span>HIT_SL</span> — entry touched → SL hit (same bar = SL wins)</div>
-    <div>⏳ <span>TRIGGERED</span> — entry touched, trade still live</div>
-    <div>🔵 <span>PENDING</span> — signal fired, entry zone not yet touched</div>
-    <div>⚫ <span>ENTRY_MISSED</span> — expired before entry touched (excluded from win rate)</div>
-    <div><span>Win rate denominator</span> = TP + SL only — entry_missed excluded</div>
-  </div>
-  <div class="table-wrap">
-    <table class="tbl">
-      <thead><tr>
-        <th>Date</th><th>Time UTC</th><th>Symbol</th><th>Strategy</th><th>Dir</th>
-        <th>Entry</th><th>SL</th><th>TP</th><th>R:R</th>
-        <th>Prob</th><th>Threshold</th><th>Status</th>
-        <th>Bars→Entry</th><th>Bars→Exit</th><th>Resolved</th>
-      </tr></thead>
-      <tbody id="tbody-outcomes">
-        <tr><td colspan="15" style="text-align:center;padding:40px;color:var(--muted)">No resolved signals yet.</td></tr>
-      </tbody>
-    </table>
-  </div>
-</div>
+  <div class="foot">TrendM30 Pro · Calibrated XGBoost · Twelve Data</div>
+</main>
 
 <script>
-const $ = id => document.getElementById(id);
-const PAIRS = ['EUR/USD','GBP/USD','USD/JPY','XAU/USD'];
-
-// ── Active filter state ───────────────────────────────────────────────────────
-window._activeFilter = 'all';
-window._activeCurrency = 'all';
-
-function setFilter(f) {
-  window._activeFilter = f;
-  ['all','htf','rev'].forEach(k => {
-    const btn = $('filter-' + k);
-    if (!btn) return;
-    if (k === f) {
-      btn.classList.add('active-filter');
-    } else {
-      btn.classList.remove('active-filter');
-    }
-  });
-  renderReal(window._allSignals || []);
-}
-
-function setCurrencyFilter(c) {
-  window._activeCurrency = c;
-  const allSignals = window._allSignals || [];
-  const obsSignals = window._obsSignals || [];
-  const statsResp = window._statsResp || {};
-  const sigResp = window._sigResp || {};
-  const funnelResp = window._funnelResp || {};
-
-  renderStats(statsResp, sigResp);
-  renderReal(allSignals);
-  renderObs(obsSignals);
-  renderFunnel(allSignals, funnelResp);
-  renderOutcomes(allSignals, statsResp);
-}
-
-function clearFilters() {
-  window._activeFilter = 'all';
-  window._activeCurrency = 'all';
-  const sel = $('filter-currency');
-  if (sel) sel.value = 'all';
-  ['all','htf','rev'].forEach(k => {
-    const btn = $('filter-' + k);
-    if (btn) {
-      if (k === 'all') btn.classList.add('active-filter');
-      else btn.classList.remove('active-filter');
-    }
-  });
-  
-  const allSignals = window._allSignals || [];
-  const obsSignals = window._obsSignals || [];
-  const statsResp = window._statsResp || {};
-  const sigResp = window._sigResp || {};
-  const funnelResp = window._funnelResp || {};
-
-  renderStats(statsResp, sigResp);
-  renderReal(allSignals);
-  renderObs(obsSignals);
-  renderFunnel(allSignals, funnelResp);
-  renderOutcomes(allSignals, statsResp);
-}
-
-function updateCurrencyOptions(signals) {
-  const select = $('filter-currency');
-  if (!select) return;
-  
-  const uniqueSymbols = [...new Set(signals.map(s => s.symbol).filter(Boolean))].sort();
-  const defaultPairs = ['EUR/USD','GBP/USD','USD/JPY','XAU/USD'];
-  const allPairs = [...new Set([...defaultPairs, ...uniqueSymbols])].sort();
-  
-  const currentVal = select.value;
-  select.innerHTML = `<option value="all">ALL CURRENCIES</option>` +
-    allPairs.map(sym => `<option value="${sym}">${sym}</option>`).join('');
-    
-  if (allPairs.includes(currentVal)) {
-    select.value = currentVal;
-  } else {
-    select.value = 'all';
-    window._activeCurrency = 'all';
-  }
-}
-
-// ── Price formatting ──────────────────────────────────────────────────────────
-function fPrice(n, symbol) {
-  if (n === null || n === undefined || n === '') return '—';
-  const v = parseFloat(n) || 0;
-  if (v === 0) return '—';
-  if (!symbol) return v.toFixed(5);
-  const s = symbol.toUpperCase();
-  if (s.includes('XAU') || s.includes('GOLD')) return v.toFixed(2);
-  if (s.includes('JPY')) return v.toFixed(3);
-  return v.toFixed(5);
-}
-const f5 = n => {
-  if (n === null || n === undefined || n === '') return '—';
-  const v = parseFloat(n) || 0;
-  if (v === 0) return '—';
-  if (v > 500) return v.toFixed(2);
-  if (v > 20)  return v.toFixed(3);
-  return v.toFixed(5);
+let dataAge = 0; // ms since scanner last wrote updated_at
+const STALE_MS = 45 * 60000;
+const LOG_STATES = {
+  WAITING:['wait','Waiting retest'], OPEN:['open','Triggered'], TP1_HIT:['win','TP1 hit · runner open'],
+  TP2_HIT:['win','TP2 hit'], BE_STOP:['win','TP1 banked · BE stop'], SL_HIT:['loss','SL hit'], EXPIRED:['','Expired']
 };
+const ACTIVE_S = ['WAITING','OPEN','TP1_HIT'];
+const state = { view: 'live', logFilter: 'active', ledger: null, stats: null, filter: 'ready', data: [], open: new Set(), lastOk: 0 };
+const $ = id => document.getElementById(id);
+const esc = v => String(v ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const val = v => (v === undefined || v === null || v === '') ? '<span class="na">–</span>' : esc(v);
 
-// ── Threshold per strategy ────────────────────────────────────────────────────
-function stratThreshold(strategy) {
-  if (!strategy) return 65;
-  const s = strategy.toLowerCase();
-  if (s.includes('cont')) return 60;
-  return 65;
-}
-
-// ── Probability color ─────────────────────────────────────────────────────────
-function probColor(p, strategy) {
-  const thr = stratThreshold(strategy);
-  if (p >= thr + 15) return 'var(--green)';
-  if (p >= thr + 5)  return 'var(--teal)';
-  if (p >= thr)      return 'var(--blue)';
-  if (p >= thr - 5)  return 'var(--yellow)';
-  return 'var(--red)';
+// Reward:risk from entry, stop loss and target; falls back to the nominal 1.5 / 2.5
+function rrText(s, key){
+  const e = parseFloat(s.entry), sl = parseFloat(s.sl), tp = parseFloat(s[key]);
+  let rr = Math.abs(tp - e) / Math.abs(e - sl);
+  if (!isFinite(rr)) rr = key === 'tp1' ? 1.5 : 2.5;
+  return '1:' + rr.toFixed(2).replace(/\.?0+$/, '');
 }
 
-function trendColor(t) {
-  if (!t) return 'var(--muted)';
-  t = t.toLowerCase();
-  if (t === 'bullish') return 'var(--green)';
-  if (t === 'bearish') return 'var(--red)';
-  return 'var(--yellow)';
-}
-function trendLabel(t) {
-  if (!t || t === '—') return '—';
-  const m = t.toLowerCase();
-  return m === 'bullish' ? '▲ BULL' : m === 'bearish' ? '▼ BEAR' : '— NEUT';
-}
-function gateLabel(r) {
-  const m = {
-    '4h_bias_bullish_blocks_supply': '4H BULL → NO SHORT',
-    '4h_bias_bearish_blocks_demand': '4H BEAR → NO LONG',
-    'd1_premium_blocks_demand':      'D1 PREM → NO LONG',
-    'd1_discount_blocks_supply':     'D1 DISC → NO SHORT',
-  };
-  return m[r] || (r || '—').toUpperCase();
-}
-function parseTS(ts) {
-  if (!ts) return {date:'—', time:'—'};
-  const s = ts.replace(' UTC','').trim();
-  if (s.includes(' ') && s.split(' ')[0].includes('-')) {
-    const [d, t] = s.split(' ');
-    return {date: d, time: t};
-  }
-  return {date: '—', time: s};
-}
-function stratPill(s) {
-  if (!s) return '';
-  const sl = s.toLowerCase();
-  if (sl.includes('cont')) return `<span class="strat-pill cont">CONT</span>`;
-  if (sl.includes('rev'))  return `<span class="strat-pill rev">REV</span>`;
-  if (sl.includes('htf'))  return `<span class="strat-pill htf">HTF</span>`;
-  return `<span class="strat-pill rev">${s.slice(0,4).toUpperCase()}</span>`;
-}
-function thrPill(strategy) {
-  const thr = stratThreshold(strategy);
-  const cls = thr === 60 ? 'cont' : 'rev';
-  return `<span class="thr-pill ${cls}" style="font-size:9px;padding:1px 6px">${thr}%</span>`;
+// Server times are treated as UTC unless they carry a timezone, then shown in East Africa Time
+const eatFmt = new Intl.DateTimeFormat('en-GB', {
+  timeZone: 'Africa/Nairobi', day: '2-digit', month: 'short',
+  hour: '2-digit', minute: '2-digit', hour12: false
+});
+function fmtEAT(v){
+  if (!v) return '<span class="na">–</span>';
+  const d = toDate(v);
+  if (!d) return esc(v);
+  return fmtMs(d.getTime());
 }
 
-// ── Clock & session ───────────────────────────────────────────────────────────
-function updateClock() {
-  const n = new Date(), p = x => String(x).padStart(2,'0');
-  $('clock').textContent = `${n.getUTCFullYear()}-${p(n.getUTCMonth()+1)}-${p(n.getUTCDate())} ${p(n.getUTCHours())}:${p(n.getUTCMinutes())}:${p(n.getUTCSeconds())} UTC`;
-  const h = n.getUTCHours();
-  let sess = 'CLOSED', col = 'var(--muted)';
-  if (h >= 22 || h < 2)       { sess = 'SYDNEY';   col = 'var(--purple)'; }
-  else if (h >= 2  && h < 7)  { sess = 'TOKYO';    col = 'var(--blue)'; }
-  else if (h >= 7  && h < 12) { sess = 'LONDON';   col = 'var(--green)'; }
-  else if (h >= 12 && h < 17) { sess = 'LON/NY';   col = 'var(--teal)'; }
-  else if (h >= 17 && h < 22) { sess = 'NEW YORK'; col = 'var(--orange)'; }
-  $('session-name').textContent = sess;
-  $('session-name').style.color = col;
-  document.querySelector('.session-dot').style.background = col;
+function toDate(v){
+  if (!v) return null;
+  let str = String(v).trim().replace(/\s*(UTC|GMT)$/i, 'Z').replace(' ', 'T');
+  if (!/(Z|[+-]\d\d:?\d\d)$/.test(str)) str += 'Z';
+  const d = new Date(str);
+  return isNaN(d) ? null : d;
 }
-setInterval(updateClock, 1000);
-updateClock();
-
-function switchTab(name) {
-  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
-  $(`tab-${name}`).classList.add('active');
-  $(`panel-${name}`).classList.add('active');
+function fmtMs(ms){ return eatFmt.format(new Date(ms)).replace(',', '') + ' EAT'; }
+const hmFmt = new Intl.DateTimeFormat('en-GB', {timeZone:'Africa/Nairobi', hour:'2-digit', minute:'2-digit', hour12:false});
+const dayFmt = new Intl.DateTimeFormat('en-CA', {timeZone:'Africa/Nairobi'});
+function fmtShort(ms){
+  const d = new Date(ms), same = dayFmt.format(d) === dayFmt.format(new Date());
+  return same ? hmFmt.format(d) : eatFmt.format(d).replace(',', '');
+}
+function ago(ms){
+  const m = Math.floor((Date.now() - ms) / 60000);
+  if (m < 1) return 'just now';
+  if (m < 60) return m + 'm ago';
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + 'h ' + (m % 60) + 'm ago';
+  return Math.floor(h / 24) + 'd ago';
 }
 
-// ── Ticker ────────────────────────────────────────────────────────────────────
-function renderTicker(signals, funnelData) {
-  const bar = $('ticker-bar');
-  const pairs = funnelData?.pairs || {};
-  bar.innerHTML = PAIRS.map(sym => {
-    const pd = pairs[sym] || pairs[sym.replace('/','_')] || {};
-    const sigs = signals.filter(s => s.symbol === sym);
-    const last = sigs[sigs.length - 1];
-    const trend = pd.h1_trend || last?.h4_trend || last?.htf_trend || '—';
-    const tClass = trend === 'bullish' ? 'trend-bull' : trend === 'bearish' ? 'trend-bear' : 'trend-neut';
-    const tLabel = trend === 'bullish' ? '▲ BULLISH' : trend === 'bearish' ? '▼ BEARISH' : '— NEUTRAL';
-    const atr    = pd.atr   || last?.atr   || '—';
-    const price  = pd.price || last?.current_price || last?.entry || '—';
-    const priceFmt = price !== '—' ? fPrice(price, sym) : '—';
-    return `<div class="ticker-item">
-      <span class="ticker-sym">${sym}</span>
-      <div class="ticker-data">
-        <span class="ticker-trend ${tClass}">${tLabel}</span>
-        <span class="ticker-atr">ATR ${atr} | ${priceFmt}</span>
-      </div>
-    </div>`;
-  }).join('');
-}
-
-// ── D1 bar ────────────────────────────────────────────────────────────────────
-function renderD1(stats) {
-  const zone = stats.d1_zone || 'unknown';
-  const pos  = stats.d1_position;
-  const labels = {premium:'🔴 PREMIUM', discount:'🟢 DISCOUNT', equilibrium:'🟡 EQUILIBRIUM', unknown:'UNKNOWN'};
-  const badge = $('d1-badge');
-  badge.className = `d1-badge ${zone}`;
-  badge.textContent = labels[zone] || zone.toUpperCase();
-  $('d1-pos').textContent = pos != null ? (pos * 100).toFixed(1) + '%' : '—';
-  if (pos != null) {
-    const pct = Math.min(100, Math.max(0, pos * 100));
-    $('d1-fill').style.width  = pct + '%';
-    $('d1-cursor').style.left = pct + '%';
-  }
-}
-
-// ── Stats ─────────────────────────────────────────────────────────────────────
-function renderStats(stats, sigResp) {
-  const cur = window._activeCurrency || 'all';
-  const allSigs = window._allSignals || [];
-  const obsSigs = window._obsSignals || [];
-  
-  let filteredSigs = allSigs;
-  let filteredObs = obsSigs;
-  
-  if (cur !== 'all') {
-    filteredSigs = allSigs.filter(s => (s.symbol || '').toUpperCase() === cur.toUpperCase());
-    filteredObs = obsSigs.filter(s => (s.symbol || '').toUpperCase() === cur.toUpperCase());
-  }
-
-  const liveCount = filteredSigs.filter(s => s.source !== 'daily_plan').length;
-  const obsCount = filteredObs.length;
-  
-  const triggeredSigs = filteredSigs.filter(s => s.status === 'hit_tp' || s.status === 'hit_sl');
-  const winsCount = triggeredSigs.filter(s => s.status === 'hit_tp').length;
-  const lossesCount = triggeredSigs.length - winsCount;
-  const winRate = triggeredSigs.length > 0 ? (winsCount / triggeredSigs.length * 100).toFixed(1) : 0;
-  
-  const probs = filteredSigs.map(s => parseFloat(s.probability)).filter(p => !isNaN(p));
-  const avgProb = probs.length > 0 ? (probs.reduce((a,b)=>a+b, 0) / probs.length).toFixed(1) : 0;
-  
-  const rr_vals = [];
-  filteredSigs.forEach(s => {
-    const rr = s.rr || s.risk_reward || '';
-    if (typeof rr === 'string' && rr.includes(':')) {
-      const val = parseFloat(rr.split(':')[1]);
-      if (!isNaN(val)) rr_vals.push(val);
-    } else if (typeof rr === 'number') {
-      rr_vals.push(rr);
+// Signal timing. Uses a timestamp from the API when present (triggered_at / signal_time / created_at),
+// otherwise records when this browser first saw each state, persisted in localStorage.
+const STORE_KEY = 'trendm30_signal_times';
+let store = {};
+try { store = JSON.parse(localStorage.getItem(STORE_KEY) || '{}'); } catch (e) {}
+function trackTimes(results){
+  const now = Date.now(), live = new Set();
+  results.forEach(s => {
+    const c = classify(s);
+    if (c.kind === 'idle') return;
+    live.add(s.symbol);
+    let rec = store[s.symbol];
+    if (!rec || rec.dir !== s.direction || (rec.last === 'ready' && c.kind === 'wait')) {
+      rec = store[s.symbol] = { dir: s.direction };
     }
+    if (c.kind === 'wait' && !rec.waitAt) rec.waitAt = now;
+    if (c.kind === 'ready' && !rec.readyAt) rec.readyAt = now;
+    rec.last = c.kind;
   });
-  const avgRRVal = rr_vals.length > 0 ? (rr_vals.reduce((a,b)=>a+b, 0) / rr_vals.length).toFixed(1) : 0;
-  const bestRRVal = rr_vals.length > 0 ? Math.max(...rr_vals) : 0;
-  
-  const missedCount = filteredSigs.filter(s => s.status === 'entry_missed').length;
-
-  $('s-live').textContent      = liveCount;
-  $('s-obs').textContent       = obsCount;
-  $('s-wr').textContent        = triggeredSigs.length > 0 ? winRate + '%' : '—';
-  $('s-triggered').textContent = triggeredSigs.length;
-  $('s-tp-sl').textContent     = `${winsCount} TP / ${lossesCount} SL`;
-  $('s-prob').textContent      = probs.length > 0 ? avgProb + '%' : '—';
-  $('s-rr').textContent        = rr_vals.length > 0 ? `1:${avgRRVal}` : '—';
-  $('s-bestrr').textContent    = 'best ' + (rr_vals.length > 0 ? `1:${bestRRVal}` : '—');
-  $('s-missed').textContent    = missedCount;
-  
-  $('tc-real').textContent     = liveCount;
-  $('tc-obs').textContent      = obsCount;
-  
-  const last = filteredSigs.find(s => s.h4_trend || s.htf_trend);
-  const h4 = last?.h4_trend || last?.htf_trend || '—';
-  const d1 = last?.d1_trend || '—';
-  const h4el = $('s-h4');
-  h4el.textContent = h4.toUpperCase();
-  h4el.style.color = trendColor(h4);
-  $('s-d1trend').textContent = 'D1: ' + d1.toUpperCase();
-  
-  $('conn-status').textContent = '● LIVE';
-  $('conn-status').style.color = 'var(--green)';
-  $('conn-updated').textContent = stats.updated ? 'Updated ' + stats.updated.replace('UTC','').trim() + ' UTC' : '';
-  
-  const d1_positions = filteredObs.map(s => s.d1_position).filter(p => p != null);
-  let latestD1Pos = null;
-  let d1Zone = 'unknown';
-  if (d1_positions.length > 0) {
-    latestD1Pos = d1_positions[d1_positions.length - 1];
-    d1Zone = latestD1Pos > 0.6 ? 'premium' : latestD1Pos < 0.4 ? 'discount' : 'equilibrium';
-  } else if (cur === 'all') {
-    latestD1Pos = stats.d1_position;
-    d1Zone = stats.d1_zone || 'unknown';
-  }
-  
-  renderD1({ d1_zone: d1Zone, d1_position: latestD1Pos });
+  Object.keys(store).forEach(k => { if (!live.has(k)) delete store[k]; });
+  try { localStorage.setItem(STORE_KEY, JSON.stringify(store)); } catch (e) {}
+}
+function sigTimes(s, c){
+  if (c.kind === 'idle') return { main: null };
+  const rec = store[s.symbol] || {};
+  const api = toDate(s.triggered_at || s.signal_time || s.created_at);
+  // Twelve Data stamps a bar by its open time, so the signal was produced when the M30 bar closed
+  const bar = toDate(s.candle_time);
+  const produced = api ? api.getTime() : bar ? bar.getTime() + 30 * 60000 : null;
+  return { main: produced, produced, fromApi: !!api,
+    seen: c.kind === 'ready' ? rec.readyAt : rec.waitAt,
+    label: c.kind === 'ready' ? 'Ready' : 'Waiting' };
 }
 
-// ── Real signals ──────────────────────────────────────────────────────────────
-function renderReal(signals) {
-  let real = signals.filter(s => s.signal_type === 'real' || (!s.signal_type && s.status !== 'observation'));
+function classify(s){
+  const hasSetup = s.status !== 'NO_SETUP' && s.status !== 'ERROR';
+  const p = s.ml_probability || 0;
+  let kind = 'idle';
+  if (s.status === 'QUALIFIED' && s.decision === 'TAKE') kind = 'ready';
+  else if (s.status === 'WAITING_RETEST') kind = 'wait';
+  return { kind, hasSetup, p, apex: kind === 'ready' && p >= 75 };
+}
 
-  // Apply active filter
-  const f = window._activeFilter || 'all';
-  if (f === 'htf') {
-    real = real.filter(s => (s.strategy || '').toUpperCase().includes('HTF'));
-  } else if (f === 'rev') {
-    real = real.filter(s =>
-      (s.strategy || '').toLowerCase().includes('rev') ||
-      (s.type     || '').toLowerCase().includes('rev')
-    );
+function countdown(){
+  const now = new Date();
+  let diff = ((now.getUTCMinutes() < 30 ? 30 : 60) - now.getUTCMinutes()) * 60 - now.getUTCSeconds() + 25;
+  if (diff <= 0) diff += 1800;
+  const m = Math.floor(diff / 60), s = diff % 60;
+  const target = new Date(now.getTime() + diff * 1000);
+  const clock = new Intl.DateTimeFormat('en-GB', {timeZone:'Africa/Nairobi', hour:'2-digit', minute:'2-digit', hour12:false}).format(target);
+  $('countdown').innerHTML = `Next scan <b>${m}:${String(s).padStart(2,'0')}</b> (${clock} EAT)`;
+  // mark feed stale if no successful refresh for 30s
+  const stale = state.lastOk && Date.now() - state.lastOk > 30000;
+  $('live').classList.toggle('stale', !!stale);
+  $('live-text').textContent = stale ? 'Feed offline' : 'Live';
+  if (state.lastOk && dataAge > STALE_MS) $('live-text').textContent = 'Scanner stale';
+}
+setInterval(countdown, 1000); countdown();
+
+function render(){
+  const stale = dataAge > STALE_MS;
+  const w = $('warn');
+  if (stale) {
+    const h = Math.floor(dataAge / 3600000), m = Math.floor(dataAge % 3600000 / 60000);
+    w.innerHTML = `<b>Scanner data is ${h ? h + 'h ' : ''}${m}m old.</b> The scanner may have stopped or the market may be closed, so signals below are outdated and should not be traded.`;
   }
+  w.classList.toggle('show', stale);
+  const rows = state.data.map(s => ({ s, c: classify(s) }));
+  const ready = rows.filter(r => r.c.kind === 'ready');
+  const wait = rows.filter(r => r.c.kind === 'wait');
+  $('n-ready').textContent = ready.length;
+  $('n-wait').textContent = wait.length;
+  $('n-all').textContent = rows.length;
 
-  // Apply currency filter
-  const cur = window._activeCurrency || 'all';
-  if (cur !== 'all') {
-    real = real.filter(s => (s.symbol || '').toUpperCase() === cur.toUpperCase());
-  }
+  let shown = state.filter === 'ready' ? ready : state.filter === 'wait' ? wait : rows;
+  const order = { ready: 0, wait: 1, idle: 2 };
+  shown = shown.slice().sort((a, b) => order[a.c.kind] - order[b.c.kind] || b.c.p - a.c.p || a.s.symbol.localeCompare(b.s.symbol));
 
-  const tbody = $('tbody-real');
-  $('real-note').textContent = `${real.length} signal${real.length !== 1 ? 's' : ''}${f !== 'all' ? ' · ' + f.toUpperCase() + ' filter' : ''}${cur !== 'all' ? ' · ' + cur : ''}`;
-
-  if (!real.length) {
-    const filterMsg = f !== 'all' || cur !== 'all' ? `No matching signals found. <button class="btn" onclick="clearFilters()" style="font-size:10px;padding:2px 8px;margin-left:8px">Clear filters</button>` : 'System is scanning all 4 pairs. Best signal window is 08:00–12:00 UTC (London) and 13:00–17:00 UTC (NY overlap).';
-    tbody.innerHTML = `<tr><td colspan="15"><div class="empty"><div class="empty-icon">⏳</div><div class="empty-title">No matching signals</div><div class="empty-sub">${filterMsg}</div></div></td></tr>`;
+  if (!shown.length) {
+    const msg = state.filter === 'ready'
+      ? 'No trades ready right now. Check Waiting to see pairs close to a pullback entry.'
+      : state.filter === 'wait' ? 'No pairs are waiting for a retest.' : 'No data yet.';
+    $('list').innerHTML = `<div class="empty">${msg}</div>`;
     return;
   }
 
-  tbody.innerHTML = real.map(s => {
-    const dt  = parseTS(s.timestamp);
-    const dir = (s.direction || '').toLowerCase();
-    const prob   = parseFloat(s.probability || 0);
-    const status = s.status || 'pending';
-    const pct    = Math.min(100, prob);
-    const thr    = stratThreshold(s.strategy);
-    return `<tr class="row-${dir}">
-      <td style="color:var(--muted)">${dt.date}</td>
-      <td style="color:var(--muted)">${dt.time}</td>
-      <td>
-        <b style="font-family:var(--sans);font-size:12px">${s.symbol || '—'}</b>
-        <span class="type-badge ${(s.type || 'OB').toLowerCase()}">${s.type || 'OB'}</span>
-      </td>
-      <td>${stratPill(s.strategy)}</td>
-      <td><span class="dir-badge ${dir}">${s.direction || '—'}</span></td>
-      <td>${fPrice(s.entry, s.symbol)}</td>
-      <td style="color:var(--red)">${fPrice(s.sl, s.symbol)}</td>
-      <td style="color:var(--green)">${fPrice(s.tp, s.symbol)}</td>
-      <td style="color:var(--muted)">${s.risk_pips ?? '—'}</td>
-      <td style="color:var(--blue)">${s.rr || s.risk_reward || '—'}</td>
-      <td>
-        <div class="prob-cell" style="position:relative">
-          <div class="prob-track" style="position:relative">
-            <div class="prob-fill" style="width:${pct}%;background:${probColor(prob, s.strategy)}"></div>
-            <div class="thr-marker" style="left:${thr}%"></div>
-          </div>
-          <span class="prob-num" style="color:${probColor(prob, s.strategy)}">${prob.toFixed(1)}%</span>
-        </div>
-      </td>
-      <td style="color:var(--muted)">${s.confluence_score ?? '—'}/10</td>
-      <td style="color:var(--muted);text-align:center">${s.production_count ?? 1}x</td>
-      <td style="color:${trendColor(s.h4_trend)}">${trendLabel(s.h4_trend)}</td>
-      <td>
-        ${s.action === 'close' || s.news_risk ? 
-          `<span class="status-badge ${status}">${status.toUpperCase().replace('_',' ')}</span>
-           <span class="status-badge" style="background:#fff5f5;color:#e53e3e;border:1px solid #fed7d7;margin-left:4px;cursor:help" title="${s.note || 'Close Risk'}">⚠️ CLOSE RISK</span>` : 
-          (s.note && s.note.toLowerCase().includes('news') ? 
-           `<span class="status-badge ${status}">${status.toUpperCase().replace('_',' ')}</span>
-            <span class="status-badge" style="background:#edf2f7;color:#4a5568;border:1px solid #e2e8f0;margin-left:4px;cursor:help" title="${s.note}">⚠️ NEWS CANCEL</span>` :
-           `<span class="status-badge ${status}">${status.toUpperCase().replace('_',' ')}</span>`)
-        }
-      </td>
-    </tr>`;
-  }).join('');
-}
-
-// ── Observation signals ───────────────────────────────────────────────────────
-function renderObs(obs) {
-  const tbody = $('tbody-obs');
-  
-  const cur = window._activeCurrency || 'all';
-  let filteredObs = obs;
-  if (cur !== 'all') {
-    filteredObs = obs.filter(s => (s.symbol || '').toUpperCase() === cur.toUpperCase());
-  }
-
-  if (!filteredObs.length) {
-    const filterMsg = cur !== 'all' ? `No observation signals for ${cur} found.` : 'Gate-blocked zones will appear here as the system runs through cycles.';
-    tbody.innerHTML = `<tr><td colspan="15"><div class="empty"><div class="empty-icon">◎</div><div class="empty-title">No observation signals yet</div><div class="empty-sub">${filterMsg}</div></div></td></tr>`;
-    return;
-  }
-  tbody.innerHTML = obs.map(s => {
-    const dt  = parseTS(s.timestamp);
-    const dir = (s.direction || '').toLowerCase();
-    const d1z = s.d1_zone || 'unknown';
-    return `<tr class="row-${dir}">
-      <td style="color:var(--muted)">${dt.date}</td>
-      <td style="color:var(--muted)">${dt.time}</td>
-      <td>
-        <b style="font-family:var(--sans);font-size:12px">${s.symbol || '—'}</b>
-        <span class="type-badge ${(s.type || 'OB').toLowerCase()}">${s.type || 'OB'}</span>
-      </td>
-      <td>${stratPill(s.strategy)}</td>
-      <td><span class="dir-badge ${dir}">${s.direction || '—'}</span></td>
-      <td>${fPrice(s.entry, s.symbol)}</td>
-      <td style="color:var(--red)">${fPrice(s.sl, s.symbol)}</td>
-      <td style="color:var(--muted)">${fPrice(s.tp, s.symbol)}</td>
-      <td style="color:var(--muted)">${s.risk_pips ?? '—'}</td>
-      <td style="color:var(--muted)">${s.zone_strength ?? '—'}</td>
-      <td style="color:var(--muted)">${s.confluence_score ?? '—'}/10</td>
-      <td style="color:var(--muted);text-align:center">${s.production_count ?? 1}x</td>
-      <td style="color:${trendColor(s.h4_trend)}">${trendLabel(s.h4_trend)}</td>
-      <td><span class="d1-badge ${d1z}" style="font-size:10px;padding:2px 8px">${d1z.toUpperCase()}</span></td>
-      <td><span class="gate-pill">${gateLabel(s.gate_blocked_by)}</span></td>
-    </tr>`;
-  }).join('');
-}
-
-// ── Funnel ────────────────────────────────────────────────────────────────────
-function renderFunnel(signals, funnelData) {
-  const cycleNum  = funnelData?.cycle      ?? '—';
-  const cycleTime = funnelData?.cycle_time ?? '—';
-  const nextCycle = funnelData?.next_cycle ?? '—';
-  $('f-cycle').textContent      = cycleNum !== '—' ? '#' + cycleNum : '#—';
-  $('f-cycle-time').textContent = cycleTime;
-  $('f-next').textContent       = 'Next: ' + nextCycle;
-
-  const cacheEl = $('f-cache');
-  if (funnelData?.cache_summary) {
-    const c = funnelData.cache_summary;
-    cacheEl.innerHTML = `<span class="cache-miss">${c.fetched || 0} fetched</span> · <span class="cache-hit">${c.cached || 0} cached</span>`;
-  } else {
-    cacheEl.textContent = '';
-  }
-
-  const grid = $('funnel-grid');
-  if (!funnelData?.pairs && !signals.length) {
-    grid.innerHTML = `<div style="grid-column:1/-1;padding:40px;text-align:center;color:var(--muted)">No funnel data yet — production_predictor.py writes funnel_state.json each cycle.</div>`;
-    return;
-  }
-
-  const cur = window._activeCurrency || 'all';
-  const displayPairs = cur === 'all' ? PAIRS : PAIRS.filter(p => p.toUpperCase() === cur.toUpperCase());
-
-  const pairsData = funnelData?.pairs || {};
-  grid.innerHTML = displayPairs.map(sym => {
-    const pd   = pairsData[sym] || pairsData[sym.replace('/','_')] || {};
-    const sigs = signals.filter(s => s.symbol === sym);
-    const last = sigs[sigs.length - 1];
-    const trend = pd.h1_trend || last?.h4_trend || '—';
-    const price = pd.price || last?.entry || '—';
-    const atr   = pd.atr   || last?.atr   || '—';
-    const priceFmt  = price !== '—' ? fPrice(price, sym) : '—';
-    const fvg4h     = pd.fvg_4h    ?? '—';
-    const ob4h      = pd.ob_4h     ?? '—';
-    const fvg1h     = pd.fvg_1h    ?? '—';
-    const ob1h      = pd.ob_1h     ?? '—';
-    const zones15m  = pd.zones_15m  ?? '—';
-    const htfBefore = pd.htf_before ?? 0;
-    const htfAfter  = pd.htf_after  ?? 0;
-    const obSkips   = pd.ob_skips   ?? 0;
-    const revProb   = pd.rev_prob   ?? null;
-    const contProb  = pd.cont_prob  ?? null;
-    const rj = pd.reject_reasons || {};
-    const tClass = trend === 'bullish' ? 'trend-bull' : trend === 'bearish' ? 'trend-bear' : 'trend-neut';
-
-    const rejPills = [];
-    if (rj.dist)     rejPills.push(`<span class="rej-pill dist">dist: ${rj.dist}</span>`);
-    if (rj.dir)      rejPills.push(`<span class="rej-pill dir">dir: ${rj.dir}</span>`);
-    if (rj.prob)     rejPills.push(`<span class="rej-pill prob">prob: ${rj.prob}</span>`);
-    if (rj.rr)       rejPills.push(`<span class="rej-pill rr">rr: ${rj.rr}</span>`);
-    if (rj.conf)     rejPills.push(`<span class="rej-pill conf">conf: ${rj.conf}</span>`);
-    if (rj.strength) rejPills.push(`<span class="rej-pill dist">strength: ${rj.strength}</span>`);
-
-    const revProbStr  = revProb  != null ? `<span style="color:${probColor(revProb*100,'rev')}">${(revProb*100).toFixed(1)}%</span>`   : '—';
-    const contProbStr = contProb != null ? `<span style="color:${probColor(contProb*100,'cont')}">${(contProb*100).toFixed(1)}%</span>` : '—';
-
-    return `<div class="funnel-card">
-      <div class="fc-head">
-        <span class="fc-sym">${sym}</span>
-        <span class="ticker-trend ${tClass}" style="font-size:10px">${trend==='bullish'?'▲ bullish':trend==='bearish'?'▼ bearish':'— neutral'}</span>
-        <span class="fc-price">${priceFmt} | ATR ${atr}</span>
+  $('list').innerHTML = shown.map(({ s, c }) => {
+    const dirCls = s.direction === 'BUY' ? 'buy' : s.direction === 'SELL' ? 'sell' : 'none';
+    const dirTxt = s.direction === 'BUY' ? '▲ Buy' : s.direction === 'SELL' ? '▼ Sell' : 'No trend';
+    const pill = stale && c.kind !== 'idle' ? `<span class="pill stale">${c.kind === 'ready' ? 'Ready' : 'Waiting'} · stale</span>`
+               : c.kind === 'ready' ? '<span class="pill ready">Ready</span>'
+               : c.kind === 'wait' ? '<span class="pill wait">Waiting retest</span>'
+               : `<span class="pill">${esc(s.status === 'ERROR' ? 'Error' : 'No setup')}</span>`;
+    const prob = c.hasSetup
+      ? `<span class="pct num">${esc(s.ml_probability)}%</span><span class="track"><span class="fill" style="width:${Math.min(100, c.p)}%"></span></span>`
+      : '<span class="na">–</span>';
+    const open = state.open.has(s.symbol);
+    const lv = c.hasSetup;
+    const t = sigTimes(s, c);
+    return `
+    <div class="item ${c.kind} ${stale && c.kind !== 'idle' ? 'stale' : ''} ${c.apex ? 'apex' : ''} ${open ? 'open' : ''}">
+      <button class="row" data-sym="${esc(s.symbol)}" aria-expanded="${open}">
+        <span class="pair">${esc(s.symbol)}<small class="sub">${t.main ? fmtShort(t.main) + ' · ' + ago(t.main) : ''}</small></span>
+        <span class="dir ${dirCls}">${dirTxt}</span>
+        <span class="prob c-prob">${prob}</span>
+        <span class="c-entry num">${lv ? val(s.entry) : '<span class="na">–</span>'}</span>
+        <span class="c-sl num sl">${lv ? val(s.sl) : '<span class="na">–</span>'}</span>
+        <span class="c-tp1 num tp">${lv ? val(s.tp1) : '<span class="na">–</span>'}</span>
+        <span class="c-tp2 num tp">${lv ? val(s.tp2) : '<span class="na">–</span>'}</span>
+        <span class="c-rr num rr">${lv ? rrText(s, 'tp2') : '<span class="na">–</span>'}</span>
+        <span class="c-time num">${pill}${t.main ? `<br><b>${fmtShort(t.main)}</b> <span class="age">${ago(t.main)}</span>` : ''}</span>
+        <span class="chev">›</span>
+      </button>
+      <div class="detail">
+        ${lv ? `
+          <span>Entry <b class="num">${val(s.entry)}</b></span>
+          <span>Risk <b class="num">${val(s.risk_pips)} pips</b></span>
+          <span class="extra">Stop loss <b class="num">${val(s.sl)}</b></span>
+          <span class="extra">TP1 (1.5R) <b class="num">${val(s.tp1)}</b></span>
+          <span class="extra">TP2 (2.5R) <b class="num">${val(s.tp2)}</b></span>
+          <span>RR <b class="num">TP1 ${rrText(s, 'tp1')} · TP2 ${rrText(s, 'tp2')}</b></span>
+          <span>Tier <b>${val(s.tier)}</b></span>
+          <span>Distance from MA60 <b class="num">${val(s.dist_ma60_atr)} ATR</b></span>
+          <span>4H slope <b class="num">${val(s['4h_slope'])}</b></span>
+          <span>ADX <b class="num">${val(s.adx)}</b></span>
+        ` : `<span>${esc(s.message || 'Moving averages are not aligned. No trend to trade.')}</span>`}
+        <span>Bar closed <b>${fmtEAT(s.candle_time)}</b> (open time)</span>
+        ${t.produced ? `<span>Produced <b>${fmtMs(t.produced)}</b> (${ago(t.produced)})</span>` : ''}
+        ${t.seen ? `<span>Dashboard first saw it <b>${fmtMs(t.seen)}</b></span>` : ''}
       </div>
-      <div class="fc-strategy-thresholds">
-        <span class="thr-pill rev">REV ≥65%</span>
-        <span class="thr-pill cont">CONT ≥60%</span>
-        ${revProb != null || contProb != null ? `<span style="font-size:10px;color:var(--muted);margin-left:4px">scores: REV ${revProbStr} CONT ${contProbStr}</span>` : ''}
-      </div>
-      <div class="funnel-steps">
-        <div class="fstep pass">
-          <span class="fstep-num">①</span>
-          <span class="fstep-label">4H zones</span>
-          <span class="fstep-val">${fvg4h} FVG · ${ob4h} OB</span>
-        </div>
-        <div class="fstep pass">
-          <span class="fstep-num">②</span>
-          <span class="fstep-label">1H zones</span>
-          <span class="fstep-val">${fvg1h} FVG · ${ob1h} OB</span>
-        </div>
-        <div class="fstep pass">
-          <span class="fstep-num">③</span>
-          <span class="fstep-label">15m raw zones</span>
-          <span class="fstep-val">${zones15m} (tracking only)</span>
-        </div>
-        ${obSkips > 0 ? `<div class="fstep fail">
-          <span class="fstep-num">⛔</span>
-          <span class="fstep-label">OB skipped</span>
-          <span class="fstep-reason">${obSkips}× 1H trend opposite</span>
-        </div>` : ''}
-        <div class="fstep ${htfBefore > 0 ? 'pass' : 'fail'}">
-          <span class="fstep-num">④</span>
-          <span class="fstep-label">HTF before bias filter</span>
-          <span class="fstep-val">${htfBefore}</span>
-        </div>
-        <div class="fstep ${htfAfter > 0 ? 'pass' : 'fail'}">
-          <span class="fstep-num">⑤</span>
-          <span class="fstep-label">HTF after bias filter</span>
-          <span class="fstep-val">${htfAfter}</span>
-        </div>
-        <div class="fstep ${htfAfter > 0 ? 'info' : 'warn'}">
-          <span class="fstep-num">⑥</span>
-          <span class="fstep-label">Prob filter (REV≥65 / CONT≥60)</span>
-          <span class="fstep-reason">${htfAfter > 0 ? 'scored' : 'no HTF signals → skipped'}</span>
-        </div>
-      </div>
-      ${rejPills.length ? `<div class="rej-pills">${rejPills.join('')}</div>` : ''}
     </div>`;
   }).join('');
 }
 
-// ── Outcomes ──────────────────────────────────────────────────────────────────
-function renderOutcomes(signals, stats) {
-  const real   = signals.filter(s => s.signal_type === 'real' || (!s.signal_type && s.status !== 'observation'));
-  
-  const cur = window._activeCurrency || 'all';
-  let filteredReal = real;
-  if (cur !== 'all') {
-    filteredReal = real.filter(s => (s.symbol || '').toUpperCase() === cur.toUpperCase());
-  }
-
-  const wins   = filteredReal.filter(s => s.status === 'hit_tp').length;
-  const losses = filteredReal.filter(s => s.status === 'hit_sl').length;
-  const total  = wins + losses;
-  const winRate = total > 0 ? Math.round((wins / total) * 100) : 0;
-  const active = filteredReal.filter(s => s.status === 'active' || s.status === 'triggered').length;
-  const missed = filteredReal.filter(s => s.status === 'entry_missed').length;
-
-  $('oc-wr').textContent          = total > 0 ? winRate + '%' : '—';
-  $('oc-resolved').textContent    = total;
-  $('oc-resolved-sub').textContent = `${wins} TP wins + ${losses} SL losses`;
-  $('oc-pending').textContent     = active;
-  $('oc-missed').textContent      = missed;
-
-  const donutBox = $('donut-box');
-  if (total > 0) {
-    const r = 28, cx = 36, cy = 36, sw = 10;
-    const circ = 2 * Math.PI * r;
-    const wDash = (wins / total) * circ;
-    donutBox.innerHTML = `
-      <svg width="72" height="72" viewBox="0 0 72 72">
-        <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="var(--bg3)" stroke-width="${sw}"/>
-        <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="var(--red)" stroke-width="${sw}"
-          stroke-dasharray="${circ}" stroke-dashoffset="0" transform="rotate(-90 ${cx} ${cy})"/>
-        <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="var(--green)" stroke-width="${sw}"
-          stroke-dasharray="${wDash} ${circ - wDash}" stroke-dashoffset="0" transform="rotate(-90 ${cx} ${cy})"/>
-        <text x="${cx}" y="${cy + 5}" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="700" font-family="var(--sans)">${wins}/${total}</text>
-      </svg>
-      <div class="donut-legend">
-        <div class="dl-row"><div class="dl-dot" style="background:var(--green)"></div><span>${wins} TP (${Math.round(wins/total*100)}%)</span></div>
-        <div class="dl-row"><div class="dl-dot" style="background:var(--red)"></div><span>${losses} SL (${Math.round(losses/total*100)}%)</span></div>
-      </div>`;
-  } else {
-    donutBox.innerHTML = '';
-  }
-
-  const order  = ['hit_tp','hit_sl','triggered','pending','entry_missed','expired'];
-  const sorted = [...filteredReal].sort((a, b) => order.indexOf(a.status || 'pending') - order.indexOf(b.status || 'pending'));
-  const tbody  = $('tbody-outcomes');
-
-  if (!sorted.length) {
-    tbody.innerHTML = `<tr><td colspan="15" style="text-align:center;padding:40px;color:var(--muted)">No resolved signals yet.</td></tr>`;
+function renderLog(){
+  const list = $('log-list');
+  if (!state.ledger) {
+    list.innerHTML = '<div class="empty">No signal ledger in the API response yet. Restart the scanner with the updated trendm30_ml_filter.py and make sure /api/trendm30 returns the whole signals JSON.</div>';
+    $('log-stats').textContent = ''; $('log-count').textContent = '';
     return;
   }
-  tbody.innerHTML = sorted.map(s => {
-    const dt     = parseTS(s.timestamp);
-    const dir    = (s.direction || '').toLowerCase();
-    const status = s.status || 'pending';
-    const prob   = parseFloat(s.probability || 0);
-    return `<tr class="row-${dir}">
-      <td style="color:var(--muted)">${dt.date}</td>
-      <td style="color:var(--muted)">${dt.time}</td>
-      <td>
-        <b style="font-family:var(--sans);font-size:12px">${s.symbol || '—'}</b>
-        <span class="type-badge ${(s.type || 'OB').toLowerCase()}">${s.type || 'OB'}</span>
-      </td>
-      <td>${stratPill(s.strategy)}</td>
-      <td><span class="dir-badge ${dir}">${s.direction || '—'}</span></td>
-      <td>${fPrice(s.entry, s.symbol)}</td>
-      <td style="color:var(--red)">${fPrice(s.sl, s.symbol)}</td>
-      <td style="color:var(--green)">${fPrice(s.tp, s.symbol)}</td>
-      <td style="color:var(--blue)">${s.rr || s.risk_reward || '—'}</td>
-      <td style="color:${probColor(prob, s.strategy)}">${prob.toFixed(1)}%</td>
-      <td>${thrPill(s.strategy)}</td>
-      <td>
-        ${s.action === 'close' || s.news_risk ? 
-          `<span class="status-badge ${status}">${status.toUpperCase().replace('_',' ')}</span>
-           <span class="status-badge" style="background:#fff5f5;color:#e53e3e;border:1px solid #fed7d7;margin-left:4px;cursor:help" title="${s.note || 'Close Risk'}">⚠️ CLOSE RISK</span>` : 
-          (s.note && s.note.toLowerCase().includes('news') ? 
-           `<span class="status-badge ${status}">${status.toUpperCase().replace('_',' ')}</span>
-            <span class="status-badge" style="background:#edf2f7;color:#4a5568;border:1px solid #e2e8f0;margin-left:4px;cursor:help" title="${s.note}">⚠️ NEWS CANCEL</span>` :
-           `<span class="status-badge ${status}">${status.toUpperCase().replace('_',' ')}</span>`)
-        }
-      </td>
-      <td style="color:var(--muted);text-align:center">${s.bars_to_entry ?? '—'}</td>
-      <td style="color:var(--muted);text-align:center">${s.bars_to_exit  ?? '—'}</td>
-      <td style="color:var(--muted)">${s.resolved_at ? s.resolved_at.slice(0,10) : '—'}</td>
-    </tr>`;
+  const all = state.ledger, st = state.stats || {};
+  $('log-count').textContent = st.active ? '(' + st.active + ' active)' : '';
+  $('log-stats').innerHTML = `Win rate <b>${st.win_rate == null ? '–' : st.win_rate + '%'}</b> · Net <b class="${(st.net_r||0) >= 0 ? 'rpos' : 'rneg'}">${(st.net_r||0) >= 0 ? '+' : ''}${st.net_r || 0}R</b> · ${st.traded || 0} traded · ${st.never_triggered || 0} never triggered · ${st.total || 0} signals`;
+  let rows = all;
+  if (state.logFilter === 'active') rows = all.filter(x => ACTIVE_S.includes(x.state));
+  if (state.logFilter === 'closed') rows = all.filter(x => !ACTIVE_S.includes(x.state));
+  if (!rows.length) {
+    list.innerHTML = `<div class="empty">${state.logFilter === 'active' ? 'No active signals. New 70%+ setups will appear here the moment they are produced.' : 'Nothing here yet.'}</div>`;
+    return;
+  }
+  const t = v => { const d = toDate(v); return d ? `<span title="${esc(fmtMs(d.getTime()))}">${fmtShort(d.getTime())}</span>` : '<span class="na">–</span>'; };
+  list.innerHTML = rows.map(x => {
+    const [cls, label] = LOG_STATES[x.state] || ['', x.state];
+    const rowCls = x.state === 'EXPIRED' && !x.triggered_at ? 'exp'
+      : ACTIVE_S.includes(x.state) ? 'act' : (x.r_result || 0) > 0 ? 'win' : (x.r_result || 0) < 0 ? 'loss' : 'exp';
+    const r = x.r_result;
+    const res = r == null ? (x.state === 'TP1_HIT' ? '<span class="rpos">+' + (0.5 * x.rr1).toFixed(2) + 'R banked</span>' : '<span class="na">–</span>')
+      : `<span class="${r > 0 ? 'rpos' : r < 0 ? 'rneg' : ''}">${r > 0 ? '+' : ''}${r}R</span>`;
+    const dir = x.direction === 'BUY' ? '<span class="dir buy">▲ Buy</span>' : '<span class="dir sell">▼ Sell</span>';
+    const waitNote = x.state === 'WAITING' ? `<span class="sub2">bar ${x.bars_waited}/8</span>` : '';
+    return `<div class="lg-row ${rowCls}" title="${esc(x.close_reason || '')}">
+      <span class="num">${t(x.produced_at)}${x.backfilled ? ' <span title="Caught up after a scanner gap" class="age">↺</span>' : ''}</span>
+      <span class="pair" style="font-size:13px">${esc(x.symbol)}</span>${dir}
+      <span class="num">${esc(x.ml_probability)}%</span>
+      <span><span class="pill ${cls}">${label}</span>${waitNote}</span>
+      <span class="num"><b>${val(x.entry)}</b></span><span class="num sl">${val(x.sl)}</span>
+      <span class="num tp">${val(x.tp1)}</span><span class="num tp">${val(x.tp2)}</span>
+      <span class="num">${t(x.triggered_at)}</span><span class="num">${t(x.closed_at)}</span>
+      <span class="num">${res}</span>
+    </div>`;
   }).join('');
 }
 
-// ── Main fetch ────────────────────────────────────────────────────────────────
-async function fetchAll() {
-  $('conn-status').textContent = '● SYNCING…';
-  $('conn-status').style.color = 'var(--yellow)';
+function setView(v){
+  state.view = v;
+  document.querySelectorAll('.view-btn').forEach(b => b.setAttribute('aria-pressed', b.dataset.v === v));
+  $('live-view').hidden = v !== 'live';
+  $('log-view').hidden = v !== 'log';
+  if (v === 'log') renderLog();
+}
+document.querySelector('.views').addEventListener('click', e => { const b = e.target.closest('.view-btn'); if (b) setView(b.dataset.v); });
+document.querySelector('[aria-label="Filter signal log"]').addEventListener('click', e => {
+  const b = e.target.closest('.ltab'); if (!b) return;
+  state.logFilter = b.dataset.lf;
+  document.querySelectorAll('.ltab').forEach(x => x.setAttribute('aria-pressed', x === b));
+  renderLog();
+});
+
+async function loadSignals(){
   try {
-    const [sigResp, obsResp, statsResp, funnelResp] = await Promise.all([
-      fetch('/api/signals').then(r => r.json()).catch(() => ({data:[], live:0, observation:0})),
-      fetch('/api/observation_signals').then(r => r.json()).catch(() => ({data:[]})),
-      fetch('/api/stats').then(r => r.json()).catch(() => ({})),
-      fetch('/api/funnel').then(r => r.json()).catch(() => ({})),
-    ]);
-    const allSignals = sigResp.data || [];
-    const obsSignals = obsResp.data || [];
-    window._allSignals = allSignals;
-    window._obsSignals = obsSignals;
-    window._statsResp = statsResp;
-    window._sigResp = sigResp;
-    window._funnelResp = funnelResp;
-
-    updateCurrencyOptions(allSignals);
-
-    renderStats(statsResp, sigResp);
-    renderTicker(allSignals, funnelResp);
-    renderReal(allSignals);
-    renderObs(obsSignals);
-    renderFunnel(allSignals, funnelResp);
-    renderOutcomes(allSignals, statsResp);
-  } catch (err) {
-    console.error('Fetch error:', err);
-    $('conn-status').textContent = '● ERROR';
-    $('conn-status').style.color = 'var(--red)';
+    const res = await fetch('/api/trendm30');
+    if (!res.ok) throw new Error(res.status);
+    const data = await res.json();
+    state.lastOk = Date.now();
+    state.data = (data && data.results) || [];
+    state.ledger = (data && data.signal_ledger) || null;
+    state.stats = (data && data.ledger_stats) || null;
+    if (state.view === 'log') renderLog(); else $('log-count').textContent = state.stats && state.stats.active ? '(' + state.stats.active + ' active)' : '';
+    const up = data && toDate(data.updated_at);
+    dataAge = up ? Date.now() - up.getTime() : 0;
+    if (data && data.updated_at) $('updated').innerHTML = 'Updated ' + fmtEAT(data.updated_at);
+    if (!state.data.length) {
+      $('list').innerHTML = '<div class="empty">Waiting for the first scan. Run <code>./run_trendm30_scanner.sh</code> in your terminal.</div>';
+      return;
+    }
+    trackTimes(state.data);
+    render();
+  } catch (e) {
+    console.error('Error fetching trendm30 signals:', e);
   }
 }
 
-fetchAll();
-setInterval(fetchAll, 60000);
+$('list').addEventListener('click', e => {
+  const row = e.target.closest('.row');
+  if (!row) return;
+  const sym = row.dataset.sym;
+  state.open.has(sym) ? state.open.delete(sym) : state.open.add(sym);
+  const item = row.parentElement;
+  item.classList.toggle('open', state.open.has(sym));
+  row.setAttribute('aria-expanded', state.open.has(sym));
+});
+document.querySelector('.tabs').addEventListener('click', e => {
+  const t = e.target.closest('.tab'); if (!t) return;
+  state.filter = t.dataset.f;
+  document.querySelectorAll('.tab').forEach(b => b.setAttribute('aria-pressed', b === t));
+  render();
+});
+$('refresh').addEventListener('click', loadSignals);
+
+loadSignals();
+setInterval(loadSignals, 5000);
 </script>
 </body>
 </html>

@@ -545,15 +545,40 @@ class DualTaskTrainer:
                         )
                     X[f'{cat_col}_encoded'] = encoded
         if task == 'reversion':
-            y = df['label'].copy().astype(np.float64)
+            y_raw = df['label'].copy().astype(np.float64)
         elif task == 'continuation':
-            y = df['label_cont'].copy().astype(np.float64)
+            y_raw = df['label_cont'].copy().astype(np.float64)
         else:
             raise ValueError(f"Unknown task: {task}")
+
+        # FIX: label_generator.py's check_reversion_outcome / check_continuation_outcome
+        # return *soft* scores for timeouts (e.g. 0.75, 0.60, 0.35, 0.20 for reversion;
+        # 0.2/0.4/0.6/0.8 proximity for continuation) alongside clean 0.0/1.0 for decisive
+        # hits. Downstream this used to be passed straight into `.astype(int)` before
+        # fitting the classifiers, which TRUNCATES toward zero -- every non-1.0 timeout
+        # score silently became class 0, indistinguishable from a clean loss, regardless
+        # of how close the trade actually got to winning. That's label noise injected
+        # right at the decision boundary the model needs to learn best.
+        #
+        # Fix: drop ambiguous (non-decisive) rows from CLASSIFIER training entirely
+        # rather than mislabeling them. NaN also gets dropped here, which covers the
+        # load_with_outcomes() live-merge case (see that function's fix) where a
+        # decisive continuation label genuinely isn't known.
+        decisive_mask = np.isclose(y_raw, 0.0) | np.isclose(y_raw, 1.0)
+        n_ambiguous = int((~decisive_mask).sum())
+        if n_ambiguous:
+            logger.warning(
+                f"  Dropping {n_ambiguous}/{len(y_raw)} ambiguous/timeout rows "
+                f"(soft label strictly between 0 and 1, or NaN) from {task} classifier "
+                f"training -- previously these were silently truncated to class 0."
+            )
+        X = X.loc[decisive_mask].reset_index(drop=True)
+        y = y_raw.loc[decisive_mask].astype(int).reset_index(drop=True)
+
         self.feature_names = X.columns.tolist()
         assert_feature_columns_exact(self.feature_names)
         logger.info(f"Feature matrix shape: {X.shape}")
-        logger.info(f"Target ({task}): mean={y.mean():.3f}  min={y.min():.3f}  max={y.max():.3f}")
+        logger.info(f"Target ({task}): mean={y.mean():.3f}  min={y.min()}  max={y.max()}")
         return X, y
 
     def train_ensemble(self,
@@ -1102,7 +1127,21 @@ def load_with_outcomes(
                     )
                 if not decisive.empty:
                     decisive = decisive.rename(columns={"ml_label": "label"})
-                    decisive["label_cont"] = 1.0 - decisive["label"]
+                    # FIX: this used to set label_cont = 1.0 - label, i.e. "reversion
+                    # lost => call it a confirmed continuation win". That's not the same
+                    # event: label_generator.py's real check_continuation_outcome()
+                    # requires a CLOSE beyond the break level (with an ATR buffer,
+                    # entry-first ordering) before scoring a break. A live SL hit that
+                    # never confirmed a real structural break (chopped, timed out,
+                    # barely tagged SL) is not evidence the zone broke -- it's just
+                    # evidence the reversion trade lost. We don't have the equivalent
+                    # of backtest_replay.py's trace_post_sl_price_action() for live
+                    # outcomes (outcome_tracker.py doesn't record post-SL price action),
+                    # so there's no ground truth to assign here. Leave it NaN; the
+                    # decisive_mask filter in prepare_features() will correctly drop
+                    # these rows from CONTINUATION training while they still contribute
+                    # normally to REVERSION training via the real 'label' column.
+                    decisive["label_cont"] = np.nan
                     shared_cols = [c for c in decisive.columns if c in df.columns]
                     if shared_cols:
                         df = pd.concat([df, decisive[shared_cols]], ignore_index=True)

@@ -34,7 +34,7 @@ class ForexFactoryNewsFilter:
                 self.url,
                 headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
             )
-            with urllib.request.urlopen(req) as response:
+            with urllib.request.urlopen(req, timeout=20) as response:
                 xml_data = response.read()
 
             # FF rate-limits this endpoint and returns an HTML "Request Denied"
@@ -147,4 +147,46 @@ class ForexFactoryNewsFilter:
                 if abs(time_diff) <= window_minutes:
                     return True, event
                     
+        return False, None
+
+    # ------------------------------------------------------------------
+    # Historical / replay support (the public feed only covers THIS week)
+    # ------------------------------------------------------------------
+    def load_calendar_csv(self, path: str) -> list:
+        """Load a historical calendar export (UTC) for backtests.
+        Columns: a time column (datetime_utc|time_utc|datetime|time|date), currency|country|ccy,
+        optional impact (high/3/red) and title|event. Returns events in the same shape as load_events()."""
+        import csv as _csv
+        events = []
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            rd = _csv.DictReader(f)
+            cols = {c.lower().strip(): c for c in (rd.fieldnames or [])}
+            pick = lambda names: next((cols[n] for n in names if n in cols), None)
+            tcol = pick(["datetime_utc", "time_utc", "datetime", "time", "date"])
+            ccol = pick(["currency", "country", "ccy"]); icol = pick(["impact"]); ecol = pick(["title", "event", "name"])
+            if tcol is None or ccol is None:
+                raise ValueError(f"calendar CSV needs a time and a currency column, found {rd.fieldnames}")
+            for r in rd:
+                imp = (r.get(icol, "high") if icol else "high").strip().lower()
+                imp = "high" if imp in ("high", "3", "red", "high impact") else imp
+                try:
+                    t = datetime.fromisoformat(r[tcol].strip().replace("Z", "+00:00"))
+                except Exception:
+                    continue
+                t = t.astimezone(timezone.utc) if t.tzinfo else t.replace(tzinfo=timezone.utc)
+                events.append({"title": r.get(ecol, "") if ecol else "", "country": r[ccol].strip().upper(),
+                               "time_utc": t, "impact": imp})
+        self.last_load_reliable = True
+        return events
+
+    @staticmethod
+    def is_news_active_at(symbol: str, when_utc: datetime, events: list, window_minutes: int = 30) -> tuple:
+        """Time-explicit version of is_news_active() for replay / audits. `events` from load_calendar_csv()."""
+        currencies = [c.upper() for c in symbol.replace("/", "_").split("_")]
+        if when_utc.tzinfo is None:
+            when_utc = when_utc.replace(tzinfo=timezone.utc)
+        for ev in events:
+            if ev["impact"] == "high" and ev["country"] in currencies:
+                if abs((when_utc - ev["time_utc"]).total_seconds()) / 60.0 <= window_minutes:
+                    return True, ev
         return False, None

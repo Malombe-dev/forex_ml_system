@@ -22,7 +22,8 @@ forex_ml_system/
 │
 └── dash/                         # Dashboard folder
     ├── server.py                 # Flask server
-    ├── index.html                # Main UI interface
+    ├── index.html                # Main UI (trimmed: Signals + Outcomes, key stats only)
+    ├── index_full.html           # Previous full UI (Observation + Funnel tabs) - backup
     ├── ml_signal_terminal_v8.html# Alternative Terminal UI
     ├── requirements.txt          # Pip requirements
     ├── style.css                 # Local CSS style copy

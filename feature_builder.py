@@ -199,10 +199,16 @@ def _compute_raw_features(
 
     # ── approach_atr_regime ───────────────────────────────────────────────────
     t_idx = min(int(touch_index), len(df) - 1) if touch_index is not None else zone_index
-    t_bar = df.iloc[t_idx]
-    t_atr = _safe_atr(t_bar, df)
-    t_atr_ma = _rolling_atr_mean(df, t_idx, window=50)
-    approach_atr_reg = get_atr_regime(t_atr, t_atr_ma)
+    t_bar = df.iloc[t_idx]          # touch bar: only its OPEN time is used below
+    # LOOKAHEAD FIX (v11): the touch bar is the first bar to come within 1 ATR of
+    # the zone, and the outcome window starts on it.  Its close/high/low/ATR are
+    # NOT known at decision time and correlate directly with the label.  Every
+    # touch-time price feature now comes from p_bar = last fully CLOSED bar.
+    p_idx = max(t_idx - 1, 0)
+    p_bar = df.iloc[p_idx]
+    p_atr = _safe_atr(p_bar, df)
+    t_atr_ma = _rolling_atr_mean(df, p_idx, window=50)
+    approach_atr_reg = get_atr_regime(p_atr, t_atr_ma)
 
     # ── zone_touch_count and htf_trend_alignment ──────────────────────────────
     # zone_touch_count: accept either key name — upstream uses both spellings.
@@ -220,16 +226,22 @@ def _compute_raw_features(
 
     # ── v5: Approach-time features ────────────────────────────────────────────
     zone_edge = zone.get("price_high") if zone.get("type") == "demand" else zone.get("price_low")
-    if zone_edge is not None and atr_val > 0:
-        approach_distance = abs(float(t_bar.get("close", zone_edge)) - zone_edge) / pip_size
-        approach_distance = min(approach_distance, 50.0)
+    # v11: signed, ATR-normalised, measured from the last CLOSED bar before the
+    # touch bar.  >0 = price still outside the zone (approaching); <0 = already
+    # inside/through it.  Old version used abs(touch-bar close - edge) in pips,
+    # which encoded the outcome (bar that dives through the zone => break).
+    if zone_edge is not None and p_atr > 0:
+        _side = 1.0 if zone.get("type") == "demand" else -1.0
+        approach_distance = _side * (float(p_bar.get("close", zone_edge)) - float(zone_edge)) / p_atr
+        approach_distance = max(-5.0, min(approach_distance, 10.0))
     else:
         approach_distance = 0.0
 
-    t_high = float(t_bar.get("high", 0))
-    t_low  = float(t_bar.get("low",  0))
-    t_open = float(t_bar.get("open", 0))
-    t_close_val = float(t_bar.get("close", 0))
+    # Candle shape of the last closed bar (was: the touch bar itself)
+    t_high = float(p_bar.get("high", 0))
+    t_low  = float(p_bar.get("low",  0))
+    t_open = float(p_bar.get("open", 0))
+    t_close_val = float(p_bar.get("close", 0))
     candle_range = t_high - t_low
     candle_body  = abs(t_close_val - t_open)
     candle_body_ratio = (candle_body / candle_range) if candle_range > 0 else 0.5
@@ -240,9 +252,9 @@ def _compute_raw_features(
     zone_age_bars = float(t_idx - zone_index)
     zone_age_bars = max(0.0, min(zone_age_bars, 500.0))
 
-    if t_idx >= 3 and atr_val > 0:
-        close_3ago = float(df.iloc[t_idx - 3].get("close", t_close_val))
-        approach_momentum = (t_close_val - close_3ago) / atr_val
+    if p_idx >= 3 and p_atr > 0:
+        close_3ago = float(df.iloc[p_idx - 3].get("close", t_close_val))
+        approach_momentum = (t_close_val - close_3ago) / p_atr
         approach_momentum = max(-5.0, min(approach_momentum, 5.0))
     else:
         approach_momentum = 0.0
@@ -275,7 +287,7 @@ def _compute_raw_features(
     ) else 0.0
 
     d1_ema_distance = _compute_d1_ema_distance(
-        touch_bar=t_bar,
+        touch_bar=p_bar,   # v11: last CLOSED bar, not the touch bar
         touch_time=df["time"].iloc[t_idx] if "time" in df.columns else None,
         df_d1=df_d1,
     )
@@ -300,11 +312,23 @@ def _compute_raw_features(
         h1_trend_alignment, h1_structure_shift, h1_displacement, h1_liquidity_sweep = \
             _compute_h1_features(df_1h, touch_time_ts, zone.get("type", "demand"))
 
+    # v9: h1_fvg_nested -- ALWAYS computed fresh from df_1h, bounded to
+    # touch_time_ts, for BOTH training and live. Deliberately does NOT use
+    # the "prefer precomputed zone field" pattern above: smc_detector.py's
+    # check_h1_confirmation() (which populates zone['h1_confluence']) scans
+    # 1H bars up to zone_time + 80h regardless of when the zone was actually
+    # touched/entered -- for zones touched sooner than 80h after formation,
+    # that precomputed value can reflect 1H FVGs that hadn't formed yet at
+    # entry time. Recomputing here from touch_time_ts avoids that leak and
+    # guarantees the training and live values come from the identical
+    # touch-time-bounded computation.
+    h1_fvg_nested = _compute_h1_nested_fvg(df_1h, zone, touch_time_ts, pip_size)
+
     # ── v7: Premium / Discount features ──────────────────────────────────────
     zone_price = float(zone.get("price_mid", t_close_val))
 
-    d1_premium_discount = _compute_premium_discount(df_d1, zone_price, touch_time_ts, lookback=20)
-    h4_premium_discount = _compute_premium_discount(df_4h, zone_price, touch_time_ts, lookback=50)
+    d1_premium_discount = _compute_premium_discount(df_d1, zone_price, touch_time_ts, lookback=20, bar_len=_BAR_D1)
+    h4_premium_discount = _compute_premium_discount(df_4h, zone_price, touch_time_ts, lookback=50, bar_len=_BAR_4H)
 
     # ── v7: 5M execution features ─────────────────────────────────────────────
     m5_micro_bos, m5_sweep_confirmation, m5_entry_candle_quality = \
@@ -326,14 +350,19 @@ def _compute_raw_features(
         "candle_body_ratio":        float(candle_body_ratio),
         "zone_age_bars":            float(zone_age_bars),
         "approach_momentum":        float(approach_momentum),
-        # v6 (h1_confluence removed; prev_zone_outcome+time_since_last_touch removed v8)
-        "h4_fvg_inside":            h4_fvg_inside,
+        # v6 (h1_confluence removed; prev_zone_outcome+time_since_last_touch removed v8; h4_fvg_inside removed v10)
         "d1_ema_distance":          d1_ema_distance,
         # v7: 1H alignment
         "h1_trend_alignment":       float(h1_trend_alignment),
         "h1_structure_shift":       float(h1_structure_shift),
         "h1_displacement":          float(h1_displacement),
         "h1_liquidity_sweep":       float(h1_liquidity_sweep),
+        # v9: 1H FVG nested inside this 4H zone (the actual "does a 1H FVG sit
+        # inside the same price zone as this 4H FVG" check). Computed fresh
+        # from df_1h for BOTH training and live -- see _compute_h1_nested_fvg
+        # below for why this deliberately does NOT reuse smc_detector.py's
+        # precomputed 'h1_confluence' zone field.
+        "h1_fvg_nested":            float(h1_fvg_nested),
         # v7: premium/discount
         "d1_premium_discount":      float(d1_premium_discount),
         "h4_premium_discount":      float(h4_premium_discount),
@@ -351,6 +380,24 @@ def _compute_raw_features(
 # ─────────────────────────────────────────────────────────────────────────────
 # v7 helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ── v11: closed-bar filter ────────────────────────────────────────────────────
+# Higher-timeframe bars are stamped with their OPEN time.  The old filter
+# `time <= touch_ts` therefore included the 1H/4H/D1 bar that was still FORMING
+# at the touch, i.e. its close/high/low were future information.  A bar is only
+# usable once time + bar_length <= touch_ts.  (label_generator's
+# calculate_htf_trend_alignment already applies the equivalent D1 gate.)
+_BAR_5M = pd.Timedelta(minutes=5)
+_BAR_1H = pd.Timedelta(hours=1)
+_BAR_4H = pd.Timedelta(hours=4)
+_BAR_D1 = pd.Timedelta(days=1)
+
+
+def _closed_by(df_tf: pd.DataFrame, ts, bar_len: pd.Timedelta) -> pd.DataFrame:
+    """Rows of df_tf whose bar had fully closed by timestamp ts."""
+    t = pd.to_datetime(df_tf["time"])
+    return df_tf[(t + bar_len) <= pd.to_datetime(ts)]
+
 
 def _compute_h1_features(
     df_1h: Optional[pd.DataFrame],
@@ -371,8 +418,7 @@ def _compute_h1_features(
 
     try:
         if touch_time is not None and "time" in df_1h.columns:
-            ts  = pd.to_datetime(touch_time)
-            sub = df_1h[pd.to_datetime(df_1h["time"]) <= ts].copy()
+            sub = _closed_by(df_1h, touch_time, _BAR_1H).copy()
         else:
             sub = df_1h.copy()
 
@@ -474,11 +520,116 @@ def _compute_h1_features(
         return defaults
 
 
+def _compute_h1_nested_fvg(
+    df_1h: Optional[pd.DataFrame],
+    zone: Dict,
+    touch_time,
+    pip_size: float,
+    lookback_bars: int = 300,
+) -> float:
+    """
+    v9.1: "Is there an UNFILLED 1H Fair Value Gap whose midpoint sits inside
+    this 4H zone's price range?" -- the "1H FVG nested inside the 4H zone"
+    confirmation concept. Separate from h4_fvg_inside (4H-OB-vs-4H-FVG
+    overlap, same timeframe, unrelated).
+
+    Mirrors smc_detector.py's detect_fvg() gap definition (min_gap_atr=0.3)
+    and check_h1_confirmation()'s "filled" definition (price has since
+    traded back through the gap's midpoint) so this stays consistent with
+    the rest of the codebase's FVG lifecycle conventions -- v9 was missing
+    the fill check, which let already-mitigated gaps count as live
+    confirmation indefinitely and pushed this toward near-constant. Does
+    NOT filter by direction match against zone type, matching
+    check_h1_confirmation()'s own existing convention (not unique to this
+    function) -- pass require_direction_match=True at the call site later
+    if you want to test the stricter variant.
+
+    lookback_bars default lowered from 500 (~3 weeks) to 300 (~12.5 days) --
+    still bounded to touch_time so it can't leak the future, just tighter
+    so a stale gap from three weeks ago carries less weight than one from
+    the last week and a half.
+
+    Returns 1.0 / 0.0.
+    """
+    MIN_GAP_ATR = 0.3  # kept in sync with smc_detector.py's H1_FVG_MIN_GAP_ATR
+
+    try:
+        if df_1h is None or df_1h.empty or len(df_1h) < 5:
+            return 0.0
+
+        z_low  = zone.get("price_low")
+        z_high = zone.get("price_high")
+        if z_low is None or z_high is None:
+            return 0.0
+        if z_low > z_high:
+            z_low, z_high = z_high, z_low
+
+        if touch_time is not None and "time" in df_1h.columns:
+            sub = _closed_by(df_1h, touch_time, _BAR_1H).copy()
+        else:
+            sub = df_1h.copy()
+
+        sub = sub.tail(lookback_bars).reset_index(drop=True)
+        if len(sub) < 5:
+            return 0.0
+
+        high = sub["high"]; low = sub["low"]; close = sub["close"]
+        tr = pd.concat([
+            high - low,
+            (high - close.shift(1)).abs(),
+            (low  - close.shift(1)).abs(),
+        ], axis=1).max(axis=1)
+        atr_1h = tr.rolling(14).mean()
+
+        for i in range(2, len(sub)):
+            bar1 = sub.iloc[i - 2]
+            bar3 = sub.iloc[i]
+            current_atr = float(atr_1h.iloc[i])
+            if not np.isfinite(current_atr) or current_atr <= 0:
+                current_atr = pip_size * 15
+
+            price_mid = None
+            if bar1["high"] < bar3["low"]:                       # bullish FVG
+                gap_size = bar3["low"] - bar1["high"]
+                if gap_size >= MIN_GAP_ATR * current_atr:
+                    price_mid = (bar3["low"] + bar1["high"]) / 2
+                    is_bullish = True
+            elif bar1["low"] > bar3["high"]:                      # bearish FVG
+                gap_size = bar1["low"] - bar3["high"]
+                if gap_size >= MIN_GAP_ATR * current_atr:
+                    price_mid = (bar1["low"] + bar3["high"]) / 2
+                    is_bullish = False
+
+            if price_mid is None or not (z_low <= price_mid <= z_high):
+                continue
+
+            # FIX (v9.1): skip if already filled -- mirrors
+            # smc_detector.py's exact "filled" definition (price traded
+            # back through the gap's midpoint at any point between
+            # formation and touch_time).
+            future = sub.iloc[i + 1:]
+            if is_bullish:
+                filled = bool((future["low"] <= price_mid).any())
+            else:
+                filled = bool((future["high"] >= price_mid).any())
+            if filled:
+                continue
+
+            return 1.0
+
+        return 0.0
+
+    except Exception as e:
+        logger.warning(f"_compute_h1_nested_fvg failed: {e}")
+        return 0.0
+
+
 def _compute_premium_discount(
     df_tf: Optional[pd.DataFrame],
     zone_price: float,
     touch_time,
     lookback: int = 20,
+    bar_len: pd.Timedelta = _BAR_1H,
 ) -> int:
     """
     Returns -1 (discount), 0 (equilibrium ±10%), or 1 (premium).
@@ -491,8 +642,7 @@ def _compute_premium_discount(
 
     try:
         if touch_time is not None and "time" in df_tf.columns:
-            ts  = pd.to_datetime(touch_time)
-            sub = df_tf[pd.to_datetime(df_tf["time"]) <= ts].tail(lookback)
+            sub = _closed_by(df_tf, touch_time, bar_len).tail(lookback)
         else:
             sub = df_tf.tail(lookback)
 
@@ -553,8 +703,7 @@ def _compute_m5_features(
 
         # ── Time filter: only use 5M bars up to and including touch_time ──────
         if touch_time is not None and "time" in df_5m.columns:
-            ts  = pd.to_datetime(touch_time)
-            sub = df_5m[pd.to_datetime(df_5m["time"]) <= ts]
+            sub = _closed_by(df_5m, touch_time, _BAR_5M)
         else:
             sub = df_5m
 
@@ -678,9 +827,9 @@ def _compute_d1_ema_distance(
             touch_ts = pd.to_datetime(touch_time)
             col = "time" if "time" in df_d1.columns else None
             if col:
-                d1_before = df_d1[pd.to_datetime(df_d1[col]) <= touch_ts]
+                d1_before = _closed_by(df_d1, touch_ts, _BAR_D1)
             else:
-                d1_before = df_d1[df_d1.index <= touch_ts]
+                d1_before = df_d1[(df_d1.index + _BAR_D1) <= touch_ts]
         else:
             d1_before = df_d1
 

@@ -149,7 +149,23 @@ Probability: `{signal['probability']}%`
 
 🎯 *5min Refined:*
    Score: {signal.get('5min_score', 0)}/8"""
-        
+
+        # Add Advisor Status
+        adv = signal.get('advisor', {})
+        if adv:
+            adv_advice = adv.get('advice', 'TAKE' if adv.get('qualified') else 'SKIP')
+            adv_badge = "🟢" if adv.get('qualified') else "⚪"
+            adv_tier = adv.get('tier', '').upper()
+            tier_badge = f" [{adv_tier}]" if adv_tier else ""
+            msg += f"\n\n📢 *Advisor:* {adv_badge} `{adv_advice}`{tier_badge}"
+            if adv.get('conditions_met'):
+                msg += f"\n   _met: {', '.join(adv.get('conditions_met'))}_"
+        elif signal.get('advisor_advice'):
+            adv_badge = "🟢" if signal.get('advisor_qualified') else "⚪"
+            adv_tier = signal.get('advisor_tier', '').upper()
+            tier_badge = f" [{adv_tier}]" if adv_tier else ""
+            msg += f"\n\n📢 *Advisor:* {adv_badge} `{signal.get('advisor_advice')}`{tier_badge}"
+
         msg += f"\n\n⏰ `{signal.get('timestamp', datetime.now().isoformat())}`"
         
         return msg

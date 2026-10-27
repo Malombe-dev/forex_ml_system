@@ -1,0 +1,35 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+
+# --- Virtual environment ---
+venv/
+.env
+
+# --- Data (DO NOT COMMIT) ---
+data/
+*.parquet
+*.csv
+*.json
+
+# --- Models (DO NOT COMMIT) ---
+
+
+# --- Logs & temp ---
+*.log
+tmp/

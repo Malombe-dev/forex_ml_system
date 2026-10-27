@@ -19,3 +19,6 @@ data/
 # --- Logs & temp ---
 *.log
 tmp/
+
+signals/feature_logs/
+*.jsonl

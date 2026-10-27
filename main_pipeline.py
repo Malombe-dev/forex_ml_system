@@ -176,6 +176,16 @@ def phase3_labels(symbols: list = None) -> bool:
             df_d1 = _load(Path(f"data/bars_1d_{sym}.parquet"))
             if df_d1 is None:
                 df_d1 = _load(Path(f"data/bars_d1_{sym}.parquet"))
+            # FIX: df_5m was never loaded here, so generate_labels_from_zones()
+            # always received df_5m=None (its default) regardless of whether
+            # bars_5min_{sym}.parquet actually existed on disk -- silently
+            # zeroing out m5_micro_bos/m5_sweep_confirmation/m5_entry_candle_quality
+            # for every symbol, every run.
+            df_5m = _load(Path(f"data/bars_5min_{sym}.parquet"))
+            if df_5m is None:
+                df_5m = _load(Path(f"data/bars_5m_{sym}.parquet"))
+            if df_5m is None:
+                df_5m = _load(Path(f"data/bars_m5_{sym}.parquet"))
 
             generator = DualLabelGenerator(
                 risk_reward            = 1.5,
@@ -186,7 +196,7 @@ def phase3_labels(symbols: list = None) -> bool:
             )
 
             labels_df = generator.generate_labels_from_zones(
-                zones, df_15, df_d1=df_d1, df_1h=df_1h, df_4h=df_4h
+                zones, df_15, df_d1=df_d1, df_1h=df_1h, df_4h=df_4h, df_5m=df_5m
             )
 
             if labels_df.empty:
@@ -348,15 +358,22 @@ def run_pipeline(csv_path: str,
     logger.info("FOREX ML TRADING SYSTEM — FULL PIPELINE")
     logger.info("=" * 70)
 
+    # FIX: these were int keys 35/36, meant to sort between phase 3 and 4
+    # like "3.5"/"3.6" -- but sorted() on plain ints gives
+    # [1, 2, 3, 4, 5, 6, 35, 36], so validation/preprocessing were silently
+    # running AFTER training and backtest, not before. Training was always
+    # reading whichever training_labels_clean.parquet existed from the
+    # PREVIOUS run. Float keys sort correctly (argparse's int start_phase
+    # compares fine against them) and fix the actual execution order.
     phases = {
-        1: lambda: phase1_ingest(csv_path),
-        2: phase2_features,
-        3: phase3_labels,
-        35: phase35_validate,
-        36: phase36_preprocess,
-        4: lambda: phase4_train(skip_if_exists=skip_training),
-        5: phase5_backtest if run_backtest else lambda: True,
-        6: phase6_outcomes if run_outcomes else lambda: True,
+        1:   lambda: phase1_ingest(csv_path),
+        2:   phase2_features,
+        3:   phase3_labels,
+        3.5: phase35_validate,
+        3.6: phase36_preprocess,
+        4:   lambda: phase4_train(skip_if_exists=skip_training),
+        5:   phase5_backtest if run_backtest else lambda: True,
+        6:   phase6_outcomes if run_outcomes else lambda: True,
     }
 
     for num in sorted(phases.keys()):

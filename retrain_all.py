@@ -35,7 +35,14 @@ logger = logging.getLogger(__name__)
 
 MODELS_DIR = Path("models")
 LABELS_DIR = Path("data/labels")
-METRICS_DIR = Path("models/metrics_reversion") / Path("models/metrics_continuation")
+# Not currently referenced anywhere in this file (calibration_check() builds
+# its own paths directly), but the old definition --
+# Path("models/metrics_reversion") / Path("models/metrics_continuation") --
+# joins two paths instead of holding two separate ones, producing the
+# nonsense path models/metrics_reversion/models/metrics_continuation.
+# Left as a tuple so it can't silently misresolve if something starts using
+# it later.
+METRICS_DIRS = (Path("models/metrics_reversion"), Path("models/metrics_continuation"))
 
 
 def section(title: str):
@@ -188,18 +195,25 @@ def verify_models():
     step("Loading trained models...")
     try:
         import pickle
+        # FIX (2026-09-17): this checked model_v5_*.pkl while
+        # model_trainer.train_both_tasks() actually saves model_v6_*.pkl
+        # (confirmed against model_trainer.py's own print statements at the
+        # end of train_both_tasks()). Every retrain would train successfully
+        # and then this step would call error() -> sys.exit(1) immediately
+        # after, aborting steps 5/6 and reporting failure on a run that had
+        # actually succeeded.
         models = {
             'reversion': {
-                'xgb': MODELS_DIR / "model_v5_reversion.pkl",
-                'rf': MODELS_DIR / "rf_v5_reversion.pkl",
-                'lr': MODELS_DIR / "lr_v5_reversion.pkl",
-                'scaler': MODELS_DIR / "scaler_v5_reversion.pkl",
+                'xgb': MODELS_DIR / "model_v6_reversion.pkl",
+                'rf': MODELS_DIR / "rf_v6_reversion.pkl",
+                'lr': MODELS_DIR / "lr_v6_reversion.pkl",
+                'scaler': MODELS_DIR / "scaler_v6_reversion.pkl",
             },
             'continuation': {
-                'xgb': MODELS_DIR / "model_v5_continuation.pkl",
-                'rf': MODELS_DIR / "rf_v5_continuation.pkl",
-                'lr': MODELS_DIR / "lr_v5_continuation.pkl",
-                'scaler': MODELS_DIR / "scaler_v5_continuation.pkl",
+                'xgb': MODELS_DIR / "model_v6_continuation.pkl",
+                'rf': MODELS_DIR / "rf_v6_continuation.pkl",
+                'lr': MODELS_DIR / "lr_v6_continuation.pkl",
+                'scaler': MODELS_DIR / "scaler_v6_continuation.pkl",
             }
         }
 

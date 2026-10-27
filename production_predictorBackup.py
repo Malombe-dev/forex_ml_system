@@ -1,0 +1,5272 @@
+import pandas as pd
+import numpy as np
+import requests
+import pickle
+import logging
+import os
+import threading
+import schedule
+import time
+import json
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timedelta, timezone
+import warnings
+from feature_builder import build_feature_row
+from features import get_session as _canonical_get_session
+from outcome_tracker import SignalOutcomeTrackerV2
+from news_filter import ForexFactoryNewsFilter
+try:
+    from signal_advisor import advise as _advisor_advise   # shadow-mode advisor: labels only, never blocks
+except Exception:
+    _advisor_advise = None
+from zone_arrival_engine import ZoneState, ZoneArrivalConfig, evaluate_zone_step, compute_arrival_features
+
+warnings.filterwarnings('ignore')
+
+logging.basicConfig(level=logging.WARNING, format='%(asctime)s [%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
+
+# SHARED BAR CACHE — 60-second TTL, keyed by (symbol, interval, outputsize).
+# TTL is intentionally short (60 s) so the cache never goes stale across
+# cycles.  Every new cycle the REV predictor always re-fetches fresh bars;
+# the cache just prevents the duplicate within the same cycle.
+_SHARED_BAR_CACHE: Dict[tuple, Dict] = {}
+_SHARED_BAR_CACHE_LOCK = threading.Lock()
+
+# Closed-bars-only (parity with backtest_replay_patched.py --closed-bars-only).
+# Twelve Data returns the still-forming candle as the newest row. Scoring on it makes
+# zones/scores repaint every cycle and cannot be reproduced in replay. Set the env var
+# CLOSED_BARS_ONLY=0 to restore the old behaviour.
+CLOSED_BARS_ONLY = os.getenv("CLOSED_BARS_ONLY", "1") != "0"
+ADVISOR_GATE = os.getenv("ADVISOR_GATE", "0") != "0"
+_BAR_MINUTES = {"5min": 5, "15min": 15, "1h": 60, "4h": 240, "1day": 1440}
+_SHARED_BAR_CACHE_TTL  = 60.0   # seconds — long enough for REV→CONT within one cycle
+
+class _RateLimiter:
+    def __init__(self, max_calls: int = 7, window_seconds: float = 62.0):
+        self._max      = max_calls
+        self._window   = window_seconds
+        self._calls    = []
+        self._lock     = threading.Lock()
+
+    def acquire(self):
+        """Block until a call slot is available within the rolling window."""
+        while True:
+            with self._lock:
+                now     = time.time()
+                cutoff  = now - self._window
+                self._calls = [t for t in self._calls if t > cutoff]
+                if len(self._calls) < self._max:
+                    self._calls.append(now)
+                    return
+                wait_until = self._calls[0] + self._window
+            sleep_secs = max(0.1, wait_until - time.time())
+            print(f"  ⏳ Rate limit: waiting {sleep_secs:.1f}s for next API slot "
+                  f"({len(self._calls)}/{self._max} calls in window)...")
+            time.sleep(sleep_secs)
+
+    def try_acquire(self) -> bool:
+        """Non-blocking: take a slot now if one is free, else return False
+        immediately without sleeping. Used for fallback-key probing."""
+        with self._lock:
+            now    = time.time()
+            cutoff = now - self._window
+            self._calls = [t for t in self._calls if t > cutoff]
+            if len(self._calls) < self._max:
+                self._calls.append(now)
+                return True
+            return False
+
+    def next_free_in(self) -> float:
+        """Seconds until this limiter will next have a free slot (0 if free now)."""
+        with self._lock:
+            now    = time.time()
+            cutoff = now - self._window
+            self._calls = [t for t in self._calls if t > cutoff]
+            if len(self._calls) < self._max:
+                return 0.0
+            return max(0.0, (self._calls[0] + self._window) - now)
+
+# Per-API-key rate limiters — each key gets its own 7-call/min budget.
+# If you use two keys (one for REV, one for CONT), each gets independent
+# throttling so combined throughput is 14 real calls/min instead of 7.
+_API_RATE_LIMITERS: Dict[str, "_RateLimiter"] = {}
+_API_RATE_LIMITERS_LOCK = threading.Lock()
+
+def _get_rate_limiter(api_key: str) -> "_RateLimiter":
+    """Return (or create) the rate limiter for a given API key."""
+    with _API_RATE_LIMITERS_LOCK:
+        if api_key not in _API_RATE_LIMITERS:
+            _API_RATE_LIMITERS[api_key] = _RateLimiter(max_calls=7, window_seconds=62.0)
+        return _API_RATE_LIMITERS[api_key]
+
+# ---------------------------------------------------------------------------
+# DYNAMIC FALLBACK POOL
+# ---------------------------------------------------------------------------
+# A shared pool of "spare" API keys any symbol can borrow from when its own
+# primary key's 7-call/min budget is full. Populated at startup in
+# run_dual_strategy() from TWELVE_KEY_SPARE_1, TWELVE_KEY_SPARE_2, etc.
+_SPARE_KEY_POOL: List[str] = []
+
+def _register_spare_keys(keys: List[str]):
+    """Call once at startup with the list of unused/spare API keys."""
+    for k in keys:
+        if k and k not in _SPARE_KEY_POOL:
+            _SPARE_KEY_POOL.append(k)
+
+def acquire_any(primary_key: str) -> str:
+    """
+    Acquire a rate-limit slot for a call, trying the primary key first and
+    falling back to any free spare key if the primary is currently full.
+    Returns the API key whose slot was actually taken — callers MUST use
+    this returned key for the actual HTTP request (not the original
+    primary_key), since a different account's key may have been used.
+    """
+    primary_limiter = _get_rate_limiter(primary_key)
+
+    # Fast path — primary key has room right now.
+    if primary_limiter.try_acquire():
+        return primary_key
+
+    # Primary is full — try every registered spare key, in order.
+    for spare_key in _SPARE_KEY_POOL:
+        if spare_key == primary_key:
+            continue
+        spare_limiter = _get_rate_limiter(spare_key)
+        if spare_limiter.try_acquire():
+            print(f"  🔁 Rate limit: primary key full — borrowed spare key "
+                  f"...{spare_key[-6:]} instead")
+            return spare_key
+
+    # Everyone is full — block on whichever (primary or spare) frees up soonest.
+    candidates = [primary_key] + [k for k in _SPARE_KEY_POOL if k != primary_key]
+    waits = [(_get_rate_limiter(k).next_free_in(), k) for k in candidates]
+    waits.sort(key=lambda pair: pair[0])
+    soonest_wait, soonest_key = waits[0]
+    print(f"  ⏳ Rate limit: all keys full — waiting {soonest_wait:.1f}s "
+          f"on key ...{soonest_key[-6:]}...")
+    _get_rate_limiter(soonest_key).acquire()
+    return soonest_key
+
+
+
+class HTFInstitutionalAnalyzer:
+    """Analyzes higher timeframes for institutional footprints"""
+
+    def __init__(self, pip_size: float = 0.0001,
+                 fvg_min_gap_atr: float = 0.4,
+                 ob_min_reaction_atr: float = 1.8,
+                 ob_drop_violated: bool = True,
+                 ob_require_unmitigated: bool = False,
+                 max_zone_age_hours: Optional[float] = None):
+        self.pip_size = pip_size
+        self.fvg_min_gap_atr = fvg_min_gap_atr
+        self.ob_min_reaction_atr = ob_min_reaction_atr
+        # WIRING FIX (2026-09-17): these three were previously read via
+        # getattr(self, ..., default) inside detect_order_blocks/detect_fvg,
+        # but were only ever set as attributes on ProductionForexPredictor --
+        # a *different* object from this analyzer. They silently always fell
+        # back to their defaults. Now actually threaded through from the
+        # caller (see ProductionForexPredictor.__init__).
+        self.ob_drop_violated       = ob_drop_violated
+        self.ob_require_unmitigated = ob_require_unmitigated
+        # Stored as HOURS, not bars: this analyzer is called on 4H, 1H and
+        # daily bars from the same instance (see call sites at
+        # htf_trade_detect), so the hours->bars conversion has to happen
+        # per-call using each method's own `timeframe` argument, not once
+        # here. None = no cap (legacy behaviour).
+        self.max_zone_age_hours     = max_zone_age_hours
+
+    _TF_HOURS = {'4h': 4.0, '1h': 1.0, '1d': 24.0, 'daily': 24.0, '15m': 0.25}
+
+    def _max_zone_age_bars(self, timeframe: str) -> Optional[int]:
+        if self.max_zone_age_hours is None:
+            return None
+        # Scoped to 4H only. smc_detector.py's PRIMARY zone detection (what
+        # label_generator.py actually built the 30h touch-horizon labels
+        # from) runs on 4H bars -- see smc_detector.py header: "Primary
+        # detection on 4H, confirmed by 1H, entries on 15min." This class's
+        # 1H/daily order-block lists feed confluence checks (h1_trend_
+        # alignment etc.), not the trade candidates themselves, and I have
+        # no evidence those need the same cutoff -- leaving them uncapped
+        # rather than guessing.
+        if timeframe.lower() != '4h':
+            return None
+        return int(self.max_zone_age_hours / 4.0)
+
+    def _recent_extreme(self, df: pd.DataFrame, lookback: int = 5) -> Dict:
+        recent = df.tail(lookback)
+        return {'swing_high': recent['high'].max(),
+                'swing_low':  recent['low'].min()}
+
+    def detect_fvg(self, df: pd.DataFrame, timeframe: str = '4h') -> List[Dict]:
+        fvgs = []
+        current_price = df['close'].iloc[-1]
+        min_gap_atr = self.fvg_min_gap_atr
+        # TRAIN/LIVE PARITY: don't even scan candles old enough that a zone
+        # formed there could never have contributed a training label. See
+        # ProductionForexPredictor.max_zone_age_hours for the full rationale.
+        min_i = 2
+        _max_age = self._max_zone_age_bars(timeframe)
+        if _max_age is not None:
+            min_i = max(min_i, len(df) - 3 - _max_age)
+
+        for i in range(min_i, len(df) - 3):
+            candle  = df.iloc[i]
+            prev_c  = df.iloc[i - 1]
+            next_c  = df.iloc[i + 1]
+            atr     = df['atr'].iloc[i]
+            if pd.isna(atr) or atr <= 0:
+                continue
+
+            # Bullish FVG: prev_high < next_low
+            if prev_c['high'] < next_c['low']:
+                gap_size = next_c['low'] - prev_c['high']
+                if gap_size < atr * min_gap_atr:
+                    continue
+                top    = next_c['low']
+                bottom = prev_c['high']
+                mid    = (top + bottom) / 2
+                # FIX: was checking full-edge fill (prev_c['high'], 0% mitigation
+                # tolerance) -- smc_detector.py (training) uses the 50% midpoint
+                # instead. Changed to match, so live and training agree on when
+                # a gap counts as still-open vs already filled.
+                future_bars = df.iloc[i + 1:]
+                if (future_bars['low'] <= mid).any():
+                    continue
+                # FIX: middle-candle direction requirement removed -- not part
+                # of smc_detector.py's (training) FVG definition, which accepts
+                # any qualifying 3-candle gap regardless of the middle candle's
+                # own color.
+                fvgs.append({
+                    'type': 'bullish', 'index': i, 'time': candle['time'],
+                    'top': top, 'bottom': bottom, 'mid': mid,
+                    'size': gap_size, 'size_atr': gap_size / atr,
+                    'distance_pips': abs(current_price - mid) / self.pip_size,
+                    'mitigated': False, 'strength': gap_size / atr
+                })
+
+            # Bearish FVG: prev_low > next_high
+            elif prev_c['low'] > next_c['high']:
+                gap_size = prev_c['low'] - next_c['high']
+                if gap_size < atr * min_gap_atr:
+                    continue
+                top    = prev_c['low']
+                bottom = next_c['high']
+                mid    = (top + bottom) / 2
+                future_bars = df.iloc[i + 1:]
+                if (future_bars['high'] >= mid).any():
+                    continue
+                fvgs.append({
+                    'type': 'bearish', 'index': i, 'time': candle['time'],
+                    'top': top, 'bottom': bottom, 'mid': mid,
+                    'size': gap_size, 'size_atr': gap_size / atr,
+                    'distance_pips': abs(current_price - mid) / self.pip_size,
+                    'mitigated': False, 'strength': gap_size / atr
+                })
+        return fvgs
+
+    @staticmethod
+    def _zone_lifecycle(df: pd.DataFrame, i: int, top: float, bottom: float,
+                        bullish: bool, impulse_bars: int = 3) -> Dict:
+        """Classify what has happened to a zone since it formed at bar `i`.
+
+        LIFECYCLE FIX (2026-09-17). detect_fvg() already refuses to return a
+        gap that price has traded back through (see the `future_bars` /
+        midpoint check there), but detect_order_blocks() returned every block
+        it ever found, forever. That asymmetry is the source of the
+        untriggered-signal flood: a block from three weeks ago that price
+        blew clean through was still being offered as a live setup whenever
+        price wandered back within max_distance_pips of it.
+
+        Training never had this problem for free: label_generator evaluates
+        each zone exactly once, at its first touch after formation, so a
+        used-up or blown-through zone simply never appears again in the
+        training set. Live/replay rescans the last N bars on every pass and
+        so needs the lifecycle stated explicitly.
+
+        Returns:
+          violated  -- a later bar CLOSED beyond the far edge. The block is
+                       destroyed; it can never be a valid setup again.
+          mitigated -- price left the block after the impulse and has since
+                       traded back into it. The first touch (the only touch
+                       training ever scored) is already spent.
+        """
+        # Skip the impulse window itself: those bars are still leaving the
+        # block, so they trivially overlap it and would flag every block.
+        start = i + impulse_bars + 1
+        future = df.iloc[start:]
+        if future.empty:
+            return {'violated': False, 'mitigated': False}
+
+        if bullish:
+            violated = bool((future['close'] < bottom).any())
+            left = future['low'] > top
+        else:
+            violated = bool((future['close'] > top).any())
+            left = future['high'] < bottom
+
+        mitigated = False
+        if left.any():
+            first_left = int(np.argmax(left.values))
+            after = future.iloc[first_left:]
+            mitigated = bool((after['low'] <= top).any() if bullish
+                             else (after['high'] >= bottom).any())
+        return {'violated': violated, 'mitigated': mitigated}
+
+    def detect_order_blocks(self, df: pd.DataFrame, timeframe: str = '4h') -> List[Dict]:
+        obs = []
+        current_price = df['close'].iloc[-1]
+        min_reaction_atr = self.ob_min_reaction_atr
+        drop_violated        = self.ob_drop_violated
+        require_unmitigated  = self.ob_require_unmitigated
+        min_i = 5
+        _max_age = self._max_zone_age_bars(timeframe)
+        if _max_age is not None:
+            min_i = max(min_i, len(df) - 6 - _max_age)
+
+        for i in range(min_i, len(df) - 6):
+            candle    = df.iloc[i]
+            atr       = df['atr'].iloc[i]
+            if pd.isna(atr) or atr <= 0:
+                continue
+            # FIX: was next_5 = df.iloc[i+1:i+6] (5-bar window). smc_detector.py
+            # (training) measures the reaction over 3 bars -- changed to match.
+            next_3    = df.iloc[i + 1:i + 4]
+
+            # Bullish OB
+            if candle['close'] < candle['open']:
+                impulse = next_3['high'].max() - candle['low']
+                if impulse >= atr * min_reaction_atr:
+                    life = self._zone_lifecycle(df, i, candle['high'], candle['low'],
+                                                 bullish=True)
+                    if drop_violated and life['violated']:
+                        continue
+                    if require_unmitigated and life['mitigated']:
+                        continue
+                    obs.append({
+                        'type': 'bullish', 'index': i, 'time': candle['time'],
+                        'top': candle['high'], 'bottom': candle['low'],
+                        'mid': (candle['high'] + candle['low']) / 2,
+                        'reaction_size': impulse, 'reaction_atr': impulse / atr,
+                        'distance_pips': abs(current_price - ((candle['high'] + candle['low']) / 2)) / self.pip_size,
+                        'violated': life['violated'], 'mitigated': life['mitigated'],
+                        'strength': impulse / atr
+                    })
+
+            # Bearish OB
+            elif candle['close'] > candle['open']:
+                impulse = candle['high'] - next_3['low'].min()
+                if impulse >= atr * min_reaction_atr:
+                    life = self._zone_lifecycle(df, i, candle['high'], candle['low'],
+                                                 bullish=False)
+                    if drop_violated and life['violated']:
+                        continue
+                    if require_unmitigated and life['mitigated']:
+                        continue
+                    obs.append({
+                        'type': 'bearish', 'index': i, 'time': candle['time'],
+                        'top': candle['high'], 'bottom': candle['low'],
+                        'mid': (candle['high'] + candle['low']) / 2,
+                        'reaction_size': impulse, 'reaction_atr': impulse / atr,
+                        'distance_pips': abs(((candle['high'] + candle['low']) / 2) - current_price) / self.pip_size,
+                        'violated': life['violated'], 'mitigated': life['mitigated'],
+                        'strength': impulse / atr
+                    })
+        return obs
+
+    def detect_market_structure_shift(self, df: pd.DataFrame) -> Dict:
+        swing_highs, swing_lows = [], []
+        for i in range(5, len(df) - 5):
+            bar = df.iloc[i]
+            if bar['high'] > df.iloc[i-5:i]['high'].max() and bar['high'] > df.iloc[i+1:i+6]['high'].max():
+                swing_highs.append({'index': i, 'price': bar['high'], 'time': bar['time']})
+            if bar['low'] < df.iloc[i-5:i]['low'].min() and bar['low'] < df.iloc[i+1:i+6]['low'].min():
+                swing_lows.append({'index': i, 'price': bar['low'], 'time': bar['time']})
+
+        current_price = df['close'].iloc[-1]
+        recent_highs  = swing_highs[-3:] if len(swing_highs) >= 3 else swing_highs
+        recent_lows   = swing_lows[-3:]  if len(swing_lows)  >= 3 else swing_lows
+
+        trend, bos_detected, mss_detected = 'neutral', False, False
+        if len(recent_highs) >= 2 and len(recent_lows) >= 2:
+            hh = recent_highs[-1]['price'] > recent_highs[-2]['price']
+            hl = recent_lows[-1]['price']  > recent_lows[-2]['price']
+            lh = recent_highs[-1]['price'] < recent_highs[-2]['price']
+            ll = recent_lows[-1]['price']  < recent_lows[-2]['price']
+            if hh and hl:
+                trend = 'bullish'
+                if current_price > recent_highs[-1]['price']:
+                    bos_detected = True
+            if lh and ll:
+                trend = 'bearish'
+                if current_price < recent_lows[-1]['price']:
+                    bos_detected = True
+            if trend == 'bullish' and current_price < recent_lows[-2]['price']:
+                mss_detected = True
+            elif trend == 'bearish' and current_price > recent_highs[-2]['price']:
+                mss_detected = True
+
+        return {
+            'trend': trend, 'bos_detected': bos_detected, 'mss_detected': mss_detected,
+            'swing_highs': swing_highs[-3:], 'swing_lows': swing_lows[-3:],
+            'last_swing_high': swing_highs[-1] if swing_highs else None,
+            'last_swing_low':  swing_lows[-1]  if swing_lows  else None
+        }
+
+    def calculate_fibonacci_levels(self, df: pd.DataFrame, lookback: int = 100) -> Dict:
+        recent     = df.tail(lookback)
+        swing_high = recent['high'].max()
+        swing_low  = recent['low'].min()
+        diff       = swing_high - swing_low
+        return {
+            '0.0': swing_high, '0.236': swing_high - diff * 0.236,
+            '0.382': swing_high - diff * 0.382, '0.5': swing_high - diff * 0.5,
+            '0.618': swing_high - diff * 0.618, '0.786': swing_high - diff * 0.786,
+            '1.0': swing_low, 'swing_high': swing_high, 'swing_low': swing_low
+        }
+
+    def check_confluence(self, zone: Dict, fvgs: List[Dict], order_blocks: List[Dict],
+                         fib_levels: Dict, current_price: float) -> Dict:
+        score, factors = 0, []
+        zone_top    = zone.get('price_high', zone.get('price_mid', current_price))
+        zone_bottom = zone.get('price_low',  zone.get('price_mid', current_price))
+        zone_mid    = zone.get('price_mid',  current_price)
+
+        for fvg in fvgs:
+            if self._ranges_overlap(zone_bottom, zone_top, fvg['bottom'], fvg['top']):
+                score += 3; factors.append(f"FVG_{fvg['type']}"); break
+
+        for ob in order_blocks:
+            if self._ranges_overlap(zone_bottom, zone_top, ob['bottom'], ob['top']):
+                score += 2; factors.append(f"OB_{ob['type']}"); break
+
+        fib_hit = False
+        # tolerance = 10 * 0.0001
+        tolerance = 10 * self.pip_size
+        for level_name, level_price in fib_levels.items():
+            if level_name in ['swing_high', 'swing_low']:
+                continue
+            if abs(zone_mid - level_price) <= tolerance:
+                score += 2; factors.append(f"Fib_{level_name}"); fib_hit = True; break
+
+        if score == 0:
+            score = 1; factors.append('zone_structure')
+
+        session      = self._get_session(self._current_time().hour)
+        distance_pips = abs(zone.get('distance_pips', 999))
+        if session in ('london', 'ny') and distance_pips < 25:
+            score += 1; factors.append('session_lq')
+
+        return {
+            'score': score, 'factors': factors, 'max_score': 10,
+            'percentage': (score / 10) * 100,
+            'has_fvg': any('FVG' in f for f in factors),
+            'has_ob':  any('OB'  in f for f in factors),
+            'has_fib': fib_hit
+        }
+
+    def _ranges_overlap(self, a_low, a_high, b_low, b_high) -> bool:
+        return not (a_high < b_low or b_high < a_low)
+
+    def _get_session(self, hour: int) -> str:
+        return _canonical_get_session(hour)
+
+    def _current_time(self) -> datetime:
+        """Single time source for anything session/time-of-day dependent.
+        Live: wall-clock UTC. Backtest replay must monkeypatch this to return
+        the simulated bar time (same pattern as fetch_bars) -- otherwise
+        datetime.utcnow() returns the moment 'run' was clicked, not the
+        historical bar's time."""
+        return datetime.utcnow()
+
+
+
+class ActiveZoneTracker:
+
+    def _get_broker_server_offset(self) -> int:
+        return 0
+
+    def __init__(self, ttl_hours: float = 5.8,
+                 distance_threshold_pips: float = 50,
+                 broker_offset: int = 0,
+                 state_file: str = "signals/zones_state.json"):
+        self.active_zones             = {}
+        self.ttl_seconds              = ttl_hours * 3600
+        self.distance_threshold_pips  = distance_threshold_pips
+        self.pip_size                 = 0.0001  # updated per symbol via set_pip_size()
+        self.broker_offset            = self._get_broker_server_offset()
+        self.state_file               = Path(state_file)
+        self._load_state()
+
+    def _load_state(self):
+        """Load persisted zones from disk on startup."""
+        if self.state_file.exists():
+            try:
+                with open(self.state_file, 'r') as f:
+                    self.active_zones = json.load(f)
+            except Exception as e:
+                logger.warning(f"Zone tracker: could not load state — {e}. Starting fresh.")
+                self.active_zones = {}
+
+    def _save_state(self):
+        """Persist current zones to disk."""
+        try:
+            self.state_file.parent.mkdir(exist_ok=True)
+            with open(self.state_file, 'w') as f:
+                json.dump(self.active_zones, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Zone tracker: could not save state — {e}")
+
+    def get_canonical_signature(self, zone: Dict, symbol: str, precision: int = 5) -> str:
+        direction = zone['type'].upper()
+        if zone['type'] == 'demand':
+            proximal, distal = zone['price_high'], zone['price_low']
+        else:
+            proximal, distal = zone['price_low'],  zone['price_high']
+        rf = 10 ** precision
+        return (f"{symbol}|{direction}|"
+                f"{round(proximal * rf) / rf:.5f}|"
+                f"{round(distal  * rf) / rf:.5f}")
+
+    def _should_expire(self, zone_meta: Dict, current_time: datetime,
+                       current_price: float) -> bool:
+        try:
+            created = datetime.fromisoformat(zone_meta['created_at'])
+        except Exception:
+            return True
+        if (current_time - created).total_seconds() > self.ttl_seconds:
+            return True
+        zone_mid = zone_meta.get('price_mid', 0)
+        if zone_mid > 0:
+            dist_pips = abs(current_price - zone_mid) / self.pip_size
+            if dist_pips > self.distance_threshold_pips:
+                return True
+        return False
+
+    def is_duplicate(self, signature: str, current_time: datetime,
+                      current_price: float) -> Tuple[bool, Optional[str]]:
+        self._load_state()  # Reload disk state before query
+        if signature not in self.active_zones:
+            return False, None
+        meta = self.active_zones[signature]
+        if self._should_expire(meta, current_time, current_price):
+            del self.active_zones[signature]
+            self._save_state()
+            return False, None
+        
+        # Zone still active — increment touch count
+        touch_count = meta.get('touch_count', 1)
+        meta['touch_count'] = min(touch_count + 1, 15)
+        meta['last_touch'] = current_time.isoformat()
+        self._save_state()
+
+        created = datetime.fromisoformat(meta['created_at'])
+        age_m   = int((current_time - created).total_seconds() / 60)
+        touches = meta.get('touch_count', 1)
+        return True, f"Active zone (age: {age_m}m, touches: {touches}, status: {meta.get('status','active')})"
+
+    def add_zone(self, signature: str, zone: Dict, status: str = 'active'):
+        self._load_state()  # Reload disk state before addition/update
+        if signature in self.active_zones:
+            # Zone already tracked — increment touch count
+            self.active_zones[signature]['touch_count'] = min(
+                self.active_zones[signature].get('touch_count', 1) + 1,
+                15  # Cap at 15 to match training ceiling
+            )
+            self.active_zones[signature]['last_touch'] = datetime.utcnow().isoformat()
+        else:
+            # New zone
+            self.active_zones[signature] = {
+                'signature':  signature,
+                'status':     status,
+                'created_at': datetime.utcnow().isoformat(),
+                'last_touch': datetime.utcnow().isoformat(),
+                'price_mid':  zone.get('price_mid'),
+                'zone_type':  zone.get('type'),
+                'probability': zone.get('probability', 0),
+                'touch_count': 1
+            }
+        self._save_state()
+
+    def get_active_count(self) -> int:
+        self._load_state()
+        return len(self.active_zones)
+
+    def cleanup_expired(self, current_time: datetime, current_price: float) -> int:
+        self._load_state()
+        expired = [s for s, m in self.active_zones.items()
+                   if self._should_expire(m, current_time, current_price)]
+        for s in expired:
+            del self.active_zones[s]
+        if expired:
+            self._save_state()
+        return len(expired)
+
+
+
+
+def save_signals_to_single_file(signals: List[Dict],
+                                filepath: str = "signals/all_signals.json"):
+    filepath = Path(filepath)
+    filepath.parent.mkdir(exist_ok=True)
+
+    existing_signals: List[Dict] = []
+    if filepath.exists():
+        try:
+            with open(filepath, 'r') as f:
+                content = f.read().strip()
+                if content:
+                    data = json.loads(content)
+                    existing_signals = data if isinstance(data, list) else [data]
+        except Exception as e:
+            logger.warning(f"save_signals: could not read existing file — {e}")
+            existing_signals = []
+
+    # Resolved statuses that must never be overwritten
+    RESOLVED_STATUSES = {'hit_tp', 'hit_sl', 'expired', 'entry_missed', 'violated'}
+
+    def get_signal_id(signal):
+        sym   = str(signal.get('symbol', ''))
+        entry = float(signal.get('entry', 0))
+        if 'XAU' in sym or 'GOLD' in sym.upper():
+            pip_size = 1.0        # $1 = 1 pip, matches training convention
+        elif 'JPY' in sym:
+            pip_size = 0.01
+        else:
+            pip_size = 0.0001
+
+        # FIX: bucket width now scales with the ZONE'S OWN size (risk_pips)
+        # instead of a flat 0.5 pip. A flat 0.5 pip (=$0.50 for gold) is
+        # far tighter than the natural drift of a re-detected zone on a
+        # volatile instrument — gold's edges commonly shift $2-8 between
+        # cycles as new candles form, so a fixed tiny bucket was logging
+        # the SAME zone as brand-new "duplicate" signals a few dollars
+        # apart (e.g. 4078 vs 4072) instead of updating the existing one.
+        # Tying the bucket to a fraction of the zone's own risk width means
+        # "same area" scales with how wide that zone actually is.
+        risk_pips = float(signal.get('risk_pips', 0) or 0)
+        if risk_pips > 0:
+            bucket_width = max(pip_size * 0.5, risk_pips * pip_size * 0.35)
+        else:
+            bucket_width = pip_size * 0.5
+        entry_bucketed = round(entry / bucket_width) * bucket_width
+        strat = signal.get('strategy', 'REVERSION')
+        return (f"{sym}_{strat}_{signal.get('direction')}_"
+                f"{entry_bucketed}_{signal.get('timeframe', '')}")
+
+    existing_ids = {get_signal_id(s): i for i, s in enumerate(existing_signals)}
+    new_added = updated = skipped_resolved = 0
+
+    # A resolved trade should only dedupe against re-detections of the SAME
+    # watch cycle — not block a genuinely new signal that reappears at the
+    # same zone a day (or more) later. hit_sl today shouldn't permanently
+    # veto the same setup reappearing tomorrow.
+    RESOLVED_BLOCK_HOURS = 24
+
+    for signal in signals:
+        sig_id = get_signal_id(signal)
+        cur_ts = signal.get('timestamp') or datetime.utcnow().isoformat()
+
+        treat_as_new = sig_id not in existing_ids
+
+        if not treat_as_new:
+            idx = existing_ids[sig_id]
+            ex  = existing_signals[idx]
+
+            is_expired = (ex.get('status') == 'expired')
+
+            # Never touch resolved outcomes — unless it's expired and re-generated
+            # in the current cycle, or the resolved record is stale enough that
+            # this is clearly a new, unrelated signal rather than a re-detection.
+            if ex.get('status') in RESOLVED_STATUSES and not is_expired:
+                stale = True
+                try:
+                    ref_ts = ex.get('last_seen') or ex.get('resolved_at') or ex.get('timestamp')
+                    new_ts = datetime.fromisoformat(str(cur_ts))
+                    old_ts = datetime.fromisoformat(str(ref_ts))
+                    age_hours = (new_ts - old_ts).total_seconds() / 3600
+                    stale = age_hours >= RESOLVED_BLOCK_HOURS
+                except Exception:
+                    stale = False  # if we can't parse timestamps, fail safe (keep old behavior)
+
+                if not stale:
+                    skipped_resolved += 1
+                    continue
+                # Stale — this is a distinct new signal, not a re-detection of
+                # the old resolved trade. Fall through to append-as-new below.
+                treat_as_new = True
+
+            elif is_expired:
+                # Update status back to pending
+                if 'cycle_history' not in ex or not isinstance(ex['cycle_history'], list):
+                    orig_ts = ex.get('timestamp') or ex.get('last_seen')
+                    ex['cycle_history'] = [orig_ts] if orig_ts else []
+                if cur_ts not in ex['cycle_history']:
+                    ex['cycle_history'].append(cur_ts)
+                ex['production_count'] = len(ex['cycle_history'])
+
+                ex['status'] = 'pending'
+                # Clean up resolved trackers
+                ex.pop('exit_price', None)
+                ex.pop('exit_time', None)
+                ex.pop('outcome_reason', None)
+                ex.pop('resolved_at', None)
+                ex.pop('bars_to_entry', None)
+                ex.pop('bars_to_exit', None)
+
+                # Overwrite/refresh everything since it is a regenerated zone
+                ex['entry']        = signal.get('entry',       ex.get('entry'))
+                ex['sl']           = signal.get('sl',          ex.get('sl'))
+                ex['tp']           = signal.get('tp',          ex.get('tp'))
+                ex['risk_pips']    = signal.get('risk_pips',   ex.get('risk_pips'))
+                ex['reward_pips']  = signal.get('reward_pips', ex.get('reward_pips'))
+                ex['risk_reward']  = signal.get('risk_reward', ex.get('risk_reward'))
+                ex['rr']           = signal.get('rr',          ex.get('rr'))
+                ex['strategy']     = signal.get('strategy',    ex.get('strategy', 'REVERSION'))
+                ex['probability']      = float(signal.get('probability', 0))
+                ex['base_probability'] = float(signal.get('base_probability', signal.get('probability', 0)))
+                ex['confluence']    = signal.get('confluence',    ex.get('confluence'))
+                ex['distance_pips'] = signal.get('distance_pips', ex.get('distance_pips'))
+                ex['valid_until']   = signal.get('valid_until')
+                ex['last_seen']     = cur_ts
+                ex['timestamp']     = cur_ts
+                updated += 1
+                continue
+
+            else:
+                # Not resolved, not expired — normal re-detection update path.
+                if 'cycle_history' not in ex or not isinstance(ex['cycle_history'], list):
+                    orig_ts = ex.get('timestamp') or ex.get('last_seen')
+                    ex['cycle_history'] = [orig_ts] if orig_ts else []
+                if cur_ts not in ex['cycle_history']:
+                    ex['cycle_history'].append(cur_ts)
+                ex['production_count'] = len(ex['cycle_history'])
+
+                # Only update signals still awaiting entry
+                if ex.get('status') == 'pending':
+                    # Snapshot BEFORE overwrite so we can tell whether the
+                    # tradeable levels actually moved this cycle.
+                    _old_entry = ex.get('entry')
+                    _old_sl    = ex.get('sl')
+                    _old_tp    = ex.get('tp')
+
+                    # Rule 1 — always refresh execution levels (model has fresher data)
+                    ex['entry']        = signal.get('entry',       ex.get('entry'))
+                    ex['sl']           = signal.get('sl',          ex.get('sl'))
+                    ex['tp']           = signal.get('tp',          ex.get('tp'))
+                    ex['risk_pips']    = signal.get('risk_pips',   ex.get('risk_pips'))
+                    ex['reward_pips']  = signal.get('reward_pips', ex.get('reward_pips'))
+                    ex['risk_reward']  = signal.get('risk_reward', ex.get('risk_reward'))
+                    ex['rr']           = signal.get('rr',          ex.get('rr'))
+                    ex['strategy']     = signal.get('strategy',    ex.get('strategy', 'REVERSION'))
+
+                    # FIX: if entry/sl/tp changed, the zone the tracker should be
+                    # watching is different from the one it was watching before —
+                    # re-anchor `timestamp` to now. Otherwise check_outcomes()
+                    # slices bars_after using the OLD (often much earlier)
+                    # timestamp and replays them against the NEW levels, which
+                    # can "discover" a trigger/TP/SL hit from price action that
+                    # happened before this exact zone existed. That's what
+                    # produces status labels (triggered / hit_tp / hit_sl) that
+                    # don't match reality.
+                    if (ex['entry'] != _old_entry or ex['sl'] != _old_sl
+                            or ex['tp'] != _old_tp):
+                        ex['timestamp'] = cur_ts
+
+                    # Rule 2 — only upgrade probability, never degrade
+                    new_prob = float(signal.get('probability', 0))
+                    old_prob = float(ex.get('probability', 0))
+                    if new_prob > old_prob:
+                        ex['probability']      = new_prob
+                        ex['base_probability'] = signal.get(
+                            'base_probability',
+                            signal.get('probability', ex.get('base_probability', 0))
+                        )
+
+                    # Rule 4 — refresh metadata with latest values where available
+                    ex['confluence']    = signal.get('confluence',    ex.get('confluence'))
+                    ex['distance_pips'] = signal.get('distance_pips', ex.get('distance_pips'))
+                    if not ex.get('valid_until'):
+                        ex['valid_until'] = signal.get('valid_until')
+                    ex['last_seen']     = cur_ts
+
+                    updated += 1
+                continue
+
+        # Brand-new signal (or a stale-resolved bucket collision treated as new)
+        # — add with pending status.
+        prior_at_bucket = [s for s in existing_signals if get_signal_id(s) == sig_id]
+        signal['round']     = len(prior_at_bucket) + 1
+        signal['status']    = 'pending'
+        signal['last_seen'] = cur_ts
+        signal['cycle_history'] = [cur_ts]
+        signal['production_count'] = 1
+        existing_signals.append(signal)
+        existing_ids[sig_id] = len(existing_signals) - 1  # future dedup targets THIS entry
+        new_added += 1
+
+    if skipped_resolved:
+        logger.debug(f"save_signals: {skipped_resolved} resolved signal(s) left unchanged")
+
+    existing_signals = _convert_numpy(existing_signals)
+    with open(filepath, 'w') as f:
+        json.dump(existing_signals, f, indent=2)
+    return new_added, updated
+
+
+def _convert_numpy(obj):
+    """Recursively convert NumPy/Pandas types to Python native types for JSON."""
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, (np.integer, np.int64, np.int32)):
+        return int(obj)
+    if isinstance(obj, (np.floating, np.float64, np.float32)):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    # pandas Timestamp → ISO string
+    try:
+        import pandas as pd
+        if isinstance(obj, pd.Timestamp):
+            return obj.isoformat()
+    except ImportError:
+        pass
+    # Any other datetime-like → string
+    if hasattr(obj, 'isoformat'):
+        return obj.isoformat()
+    if isinstance(obj, dict):
+        return {k: _convert_numpy(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_convert_numpy(i) for i in obj]
+    return obj
+
+
+
+class ProductionForexPredictor:
+    """V7 Production Forex Predictor — all improvements applied"""
+
+    def __init__(self,
+                 api_key: str,
+                 model_path: str = "models/model_v6_reversion.pkl",
+                 scaler_path: str = "models/scaler_v6_reversion.pkl",
+                 encoders_path: str = "models/encoders_v6_reversion.pkl",
+                 stats_path: str = "models/training_stats_v6_reversion.pkl",
+                 symbol: str = "EUR/USD",
+                 prob_threshold: float = None,
+                 max_disagreement: float = 0.10,
+                 max_rr: float = 3.5,
+                 min_risk_atr: float = 0.8,
+                 max_distance_pips: float = 25.0,
+                 min_strength_atr: float = 0.35,
+                 use_5min_refinement: bool = True,
+                 refine_max_dist_multiplier: float = 1.0,
+                 enable_continuation: bool = False,
+                 continuation_prob_boost: float = 0.05,
+                 use_htf_analysis: bool = True,
+                 min_confluence_score: int = 4,
+                 zone_ttl_hours: float = 48.0,
+                 zone_distance_threshold: float = 50.0,
+                 htf_fvg_min_gap_atr: float = 0.5,
+                 htf_ob_min_reaction_atr: float = 2.0,
+                 is_continuation_strategy: bool = False,
+                 require_zone_close: bool = False,
+                 ob_drop_violated: bool = True,
+                 ob_require_unmitigated: bool = False,
+                 max_zone_age_hours: float = 30.0,
+                 require_htf_bias_gate: bool = False,
+                 debug: bool = False):
+
+        self.api_key     = api_key
+        self.symbol      = symbol
+        self.base_url    = "https://api.twelvedata.com"
+        self.pip_size    = 0.0001
+        self.broker_offset = 0
+        self.debug       = debug
+
+        key = "cont" if is_continuation_strategy else "rev"
+        validated_stats = {
+            "rev":  {"base_prob": 0.65, "max_boost": 0.0},
+            "cont": {"base_prob": 0.65, "max_boost": 0.0}
+        }[key]
+
+        self.prob_threshold  = validated_stats["base_prob"] if prob_threshold is None else prob_threshold
+        # Model-agreement gate (see disagreement_diagnostic_v2.py): reject signals
+        # where XGB/RF/LR disagree beyond this std-dev, even if the blended
+        # probability clears prob_threshold. 0.10 was validated on the
+        # 2024-02-01+ test set (precision 83.4%→92.4% at threshold=0.65).
+        self.max_disagreement = max_disagreement
+        self.max_boost       = validated_stats["max_boost"]
+        self.max_rr          = max_rr
+        self.min_risk_atr    = min_risk_atr
+        self.max_distance_pips   = max_distance_pips
+        self.min_strength_atr    = min_strength_atr
+        self.use_5min_refinement = use_5min_refinement
+        self.refine_max_dist_multiplier = refine_max_dist_multiplier
+        self.enable_continuation     = enable_continuation
+        self.continuation_prob_boost = continuation_prob_boost
+        self.use_htf_analysis        = use_htf_analysis
+        self.is_continuation_strategy = is_continuation_strategy
+        self.require_zone_close       = require_zone_close  # IMPROVE: filter blown-through zones
+        # Order-block lifecycle gates -- see _zone_lifecycle() docstring.
+        #   ob_drop_violated:       block destroyed (a later bar CLOSED beyond
+        #                           its far edge). Safe default ON: a destroyed
+        #                           block can never be a valid setup again, so
+        #                           re-proposing it is never correct.
+        #   ob_require_unmitigated: block's first touch is already spent.
+        #                           Matches training semantics exactly but is
+        #                           aggressive -- leave OFF until A/B tested.
+        self.ob_drop_violated         = ob_drop_violated
+        self.ob_require_unmitigated   = ob_require_unmitigated
+        # TRAIN/LIVE PARITY (2026-09-17): label_generator.py's
+        # find_first_touch_index() only searches horizon_bars=120 15-min bars
+        # (30h) forward of zone FORMATION before giving up on that zone
+        # entirely -- an untouched zone past that point contributes no label
+        # at all (see label_generator.py:523-528). The model has literally
+        # zero training examples of a trade entered more than 30h after its
+        # zone formed. detect_order_blocks()/detect_fvg() used to scan the
+        # full lookback window with no age limit, so live routinely proposed
+        # setups on weeks-old zones the model was never trained to price --
+        # this is the root cause of both the untriggered-signal flood and
+        # the flat probability-vs-outcome calibration (any prob bucket can
+        # contain a mix of in-distribution and totally-unseen zones).
+        # Default matches training's horizon exactly; override only after
+        # re-running label_generator with a wider horizon_bars to match.
+        self.max_zone_age_hours       = max_zone_age_hours
+        # TRAIN/LIVE PARITY (2026-09-17): confirmed by direct search of
+        # label_generator.py, smc_detector.py and feature_builder.py -- zero
+        # occurrences of any bias-agreement or premium/discount HARD gate.
+        # Training never filters a zone on D1/4H trend agreement; it only
+        # ever feeds the model *graded* features for this (d1_premium_
+        # discount, h4_premium_discount, htf_trend_alignment) and lets the
+        # ensemble learn how much they matter. This live-only three-way
+        # hard block (D1 EMA + D1 structure + 4H trend must all agree)
+        # accounted for ~83% of all candidate rejections in the
+        # 2026-09-17 replay (6,122 of 7,414 rejections). Default OFF: the
+        # model already has the information these gates duplicate, learned
+        # on data these gates never touched. Set True only after an A/B
+        # replay shows it actually helps -- don't assume it does.
+        self.require_htf_bias_gate    = require_htf_bias_gate
+
+        # Time-of-day gate. Default OFF (both None). Do NOT enable until a
+        # replay run with the corrected 'session' field shows an edge that
+        # survives a cross-tab against symbol -- early data (n=1-4 per
+        # bucket, 7/12 'sydney/asia' trades were XAU) was noise.
+        # allowed_sessions: e.g. {'london', 'ny'}; blocked_hours: e.g. {21, 22}
+        self.allowed_sessions: Optional[set] = None
+        self.blocked_hours:    Optional[set] = None
+
+        if not self.is_continuation_strategy:
+            # TASK 1: REVERSION STRATEGY
+            # NOTE (was hardcoded to 0.60 here, silently overriding the constructor
+            # arg passed by run_dual_strategy, e.g. 0.62). That override is removed —
+            # prob_threshold now respects whatever the caller passes in.
+            # Prior rationale for 0.60 (kept for reference, not applied):
+            #   SL hits clustered in the 65-71% probability band (6 of 6 losses were
+            #   below 0.73). The 95.76% precision stat was measured at 0.65 on training
+            #   data; live data showed more noise in that band.
+            pass
+        else:
+            # TASK 2: CONTINUATION STRATEGY
+            # NOTE: previously hardcoded to 0.60 here too, overriding the constructor
+            # arg (e.g. 0.65). Removed for the same reason as above.
+            # Prior rationale (kept for reference, not applied):
+            #   Precision peaked stably at 80.0% at 0.60; pushing to 0.65 caused a
+            #   severe sample-scarcity collapse.
+            pass
+        self.min_confluence_score     = min_confluence_score
+
+        # Symbol-specific pip size (JPY pairs, Gold)
+        sym_upper = symbol.upper()
+        if 'JPY' in sym_upper:
+            self.pip_size = 0.01
+        elif 'XAU' in sym_upper or 'GOLD' in sym_upper:
+            self.pip_size = 1.0   # $1 = 1 pip (MT4/MT5 standard, matches training)
+
+        self.htf_analyzer = HTFInstitutionalAnalyzer(
+            pip_size=self.pip_size,
+            fvg_min_gap_atr=htf_fvg_min_gap_atr,
+            ob_min_reaction_atr=htf_ob_min_reaction_atr,
+            ob_drop_violated=self.ob_drop_violated,
+            ob_require_unmitigated=self.ob_require_unmitigated,
+            max_zone_age_hours=self.max_zone_age_hours,
+        )
+
+        safe_sym = symbol.replace('/', '_')
+        self.zone_tracker = ActiveZoneTracker(
+            ttl_hours=zone_ttl_hours,
+            distance_threshold_pips=zone_distance_threshold,
+            broker_offset=self.broker_offset,
+            state_file=f"signals/zones_{safe_sym}.json"
+        )
+
+        self.load_model(model_path, scaler_path, encoders_path, stats_path)
+
+        self.htf_cache             = {}  # kept for attribute compatibility; not used for caching
+        self.tracked_zones_15min   = []
+        self.last_15min_bar_time   = None
+        self.zone_history          = {}   # FIX: was never initialised — caused AttributeError at runtime
+
+        # FIX #5: dedup guard. Same zone/price-level was observed firing multiple
+        # signals within minutes/seconds of each other (e.g. XAU/USD BUY firing
+        # 3x on 2026-07-23, EUR/USD BUY firing twice one second apart on
+        # 2026-07-27) — this isn't 3 independent trade ideas, it's one market
+        # move counted (and risked) as several. Track last-fired time per
+        # (symbol, direction, price-bucket) and suppress re-firing within the
+        # cooldown window.
+        self._recent_zone_signals: Dict[str, datetime] = {}
+        self.zone_dedupe_cooldown_minutes: float = 360.0
+
+        self.stats = {
+            'total_iterations': 0, 'total_candidates': 0,
+            'total_duplicates': 0, 'total_new_zones': 0,
+            'total_rejected': 0,   'htf_boosted': 0,
+            'refine_rejections': 0
+        }
+
+        if not self.debug:
+            print(f"✓ {key.upper()} [{symbol}] loaded | Base: {self.prob_threshold*100:.0f}% | "
+                  f"MaxBoost: {self.max_boost*100:.0f}% | MaxDisagreement: {self.max_disagreement:.2f}")
+
+    # Cache removed — pre_warm_cache is a no-op kept for call-site compatibility.
+    def pre_warm_cache(self) -> None:
+        pass
+
+    def _is_duplicate_zone_signal(self, symbol: str, direction: str, entry: float) -> bool:
+        """
+        FIX #5: returns True (and records the firing) if a signal for this
+        symbol/direction/price-level already fired within the cooldown window.
+        Price is bucketed to the nearest 10 pips (or $1 for XAU) so minor zone
+        migrations between near-duplicate detections still count as the same
+        level, matching the bucketing already used for zone_history elsewhere.
+        """
+        bucket = round(entry / (self.pip_size * 10)) * (self.pip_size * 10)
+        key = f"{symbol}:{direction}:{bucket:.5f}"
+        now = datetime.utcnow()
+
+        last_fired = self._recent_zone_signals.get(key)
+        if last_fired is not None:
+            elapsed_min = (now - last_fired).total_seconds() / 60.0
+            if elapsed_min < self.zone_dedupe_cooldown_minutes:
+                if self.debug:
+                    print(f"     ⛔ DEDUP: {key} suppressed — fired {elapsed_min:.1f}min ago "
+                          f"(cooldown={self.zone_dedupe_cooldown_minutes}min)")
+                return True
+
+        self._recent_zone_signals[key] = now
+        return False
+
+
+    def load_model(self, model_path, scaler_path, encoders_path, stats_path):
+        # Ensemble weights — must match model_trainer.py exactly
+        self._ensemble_weights = {'xgb': 0.50, 'rf': 0.35, 'lr': 0.15}
+
+        try:
+            with open(model_path,    'rb') as f: self.model          = pickle.load(f)  # XGBoost
+            with open(scaler_path,   'rb') as f: self.scaler         = pickle.load(f)
+            with open(encoders_path, 'rb') as f: self.encoders       = pickle.load(f)
+            with open(stats_path,    'rb') as f: self.training_stats = pickle.load(f)
+
+            # Load RF and LR — saved alongside XGBoost by model_trainer.save_models()
+            rf_path = model_path.replace("model_", "rf_")
+            lr_path = model_path.replace("model_", "lr_")
+            self.rf_model = None
+            self.lr_model = None
+            try:
+                with open(rf_path, 'rb') as f: self.rf_model = pickle.load(f)
+            except FileNotFoundError:
+                logger.warning(f"RF model not found at {rf_path} — ensemble will use XGBoost only")
+            try:
+                with open(lr_path, 'rb') as f: self.lr_model = pickle.load(f)
+            except FileNotFoundError:
+                logger.warning(f"LR model not found at {lr_path} — ensemble will use XGBoost only")
+
+            # FIX: filename was wrong (constructed 'calibrator_v6_reversion.pkl',
+            # but model_trainer.py actually saves 'calibrator_ensemble_v6_reversion.pkl')
+            # AND the saved file is a {'calibrator':obj, 'kind':'platt'|'isotonic'|None}
+            # bundle, not the raw calibrator object — both bugs meant calibration
+            # NEVER actually loaded, silently, even when a real one existed.
+            cal_path = model_path.replace("model_", "calibrator_ensemble_")
+            self._calibrator      = None
+            self._calibrator_kind = None
+            try:
+                with open(cal_path, 'rb') as f:
+                    _cal_bundle = pickle.load(f)
+                if isinstance(_cal_bundle, dict):
+                    self._calibrator      = _cal_bundle.get('calibrator')
+                    self._calibrator_kind = _cal_bundle.get('kind')
+                else:
+                    # defensive fallback in case an older-format file exists
+                    self._calibrator = _cal_bundle
+            except FileNotFoundError:
+                pass
+
+            strat    = "continuation" if self.is_continuation_strategy else "reversion"
+            # NOTE: self._calibrator is an OPTIONAL post-blend recalibration step —
+            # current training pipeline doesn't produce one (no
+            # calibrator_ensemble_*.pkl saved) because calibration already happens
+            # per-base-model: model_v6_*.pkl / rf_v6_*.pkl / lr_v6_*.pkl are each
+            # saved as CalibratedClassifierCV (sigmoid/Platt) wrappers, so
+            # self.model.predict_proba() etc. already return calibrated probabilities.
+            # "no ensemble-level calibrator" here is expected, not a missing artifact.
+            cal_st   = (f"with additional '{self._calibrator_kind}' ensemble calibrator"
+                        if self._calibrator is not None
+                        else "base models individually calibrated (no extra ensemble-level calibrator)")
+            rf_st    = "RF✓" if self.rf_model else "RF✗"
+            lr_st    = "LR✓" if self.lr_model else "LR✗"
+            import os as _os
+            print(
+                f"  ✅ Model loaded ({_os.path.basename(model_path)}, {strat}) — "
+                f"XGB✓ {rf_st} {lr_st} [{cal_st}]"
+            )
+
+        except FileNotFoundError:
+            logger.warning("Model files not found, falling back to reversion model")
+            with open("models/model_v6_reversion.pkl",          'rb') as f: self.model          = pickle.load(f)
+            with open("models/scaler_v6_reversion.pkl",         'rb') as f: self.scaler         = pickle.load(f)
+            with open("models/encoders_v6_reversion.pkl",       'rb') as f: self.encoders       = pickle.load(f)
+            with open("models/training_stats_v6_reversion.pkl", 'rb') as f: self.training_stats = pickle.load(f)
+            self.rf_model         = None
+            self.lr_model         = None
+            self._calibrator      = None
+            self._calibrator_kind = None
+
+
+    def get_scan_distance(self, current_atr, symbol, zone_type: str = "FVG"):
+        """Dynamic scan distance based on ATR and zone structure.
+
+        FIX (2026-08-18 replay audit): previously used ONE multiplier for
+        both FVGs and Order Blocks. But an Order Block is only valid after
+        an impulse move of >= ob_min_reaction_atr (2.0-2.5x ATR) away from
+        where it formed — so a fresh unmitigated OB naturally sits 2-3x ATR
+        from current price by construction. Scanning only 1.0-1.5x ATR (the
+        old single multiplier) meant most real OBs were rejected on 'dist'
+        before ever reaching ML scoring — confirmed in the 60-day replay:
+        13,199 OB 'dist' rejections vs 2,709 for FVGs, and 0 OB signals
+        passed in the entire window. FVGs form from a much smaller gap
+        (>= fvg_min_gap_atr, ~0.4-0.5x ATR) so they legitimately sit close
+        to price and keep their original multiplier.
+        """
+        is_gold = 'XAU' in symbol or 'GOLD' in symbol.upper()
+        if zone_type == "OB":
+            multiplier = 4.0 if is_gold else 3.5
+        else:
+            multiplier = 2.2 if is_gold else 1.8
+        return current_atr * multiplier / self.pip_size
+
+    def _get_session(self, hour: int) -> str:
+        return _canonical_get_session(hour)
+
+    def _current_time(self) -> datetime:
+        """Single time source for anything session/time-of-day dependent.
+        Live: wall-clock UTC. Backtest replay must monkeypatch this to return
+        the simulated bar time (same pattern as fetch_bars) -- otherwise
+        datetime.utcnow() returns the moment 'run' was clicked, not the
+        historical bar's time."""
+        return datetime.utcnow()
+
+    def _time_gate_blocks(self, ts: Optional[datetime] = None) -> Tuple[bool, str]:
+        """Single-purpose time-of-day gate. Returns (blocked, reason).
+        No-op unless allowed_sessions / blocked_hours is configured.
+        Pass the bar/trigger time explicitly, or omit to use _current_time()
+        so live and replay share one time source."""
+        ts = ts or self._current_time()
+        if self.blocked_hours and ts.hour in self.blocked_hours:
+            return True, f"blocked_hour_{ts.hour:02d}"
+        if self.allowed_sessions:
+            sess = self._get_session(ts.hour)
+            if sess not in self.allowed_sessions:
+                return True, f"session_{sess}_not_allowed"
+        return False, ""
+
+
+    def _calculate_indicators(self, df: pd.DataFrame):
+        high       = df['high']
+        low        = df['low']
+        close_prev = df['close'].shift(1)
+        tr         = pd.concat([high - low,
+                                 (high - close_prev).abs(),
+                                 (low  - close_prev).abs()], axis=1).max(axis=1)
+
+        # Wilder's smoothing: seed with 14-bar SMA, then exponential
+        atr_values = np.full(len(df), np.nan)
+        seed_end   = 14
+        if len(df) >= seed_end:
+            atr_values[seed_end - 1] = tr.iloc[:seed_end].mean()
+            for i in range(seed_end, len(df)):
+                atr_values[i] = (atr_values[i - 1] * 13 + tr.iloc[i]) / 14
+        df['atr'] = atr_values
+
+        df['ema_20']  = df['close'].ewm(span=20,  adjust=False).mean()
+        df['ema_50']  = df['close'].ewm(span=50,  adjust=False).mean()
+        df['ema_200'] = df['close'].ewm(span=200, adjust=False).mean()
+
+        delta = df['close'].diff()
+        # Wilder's EMA smoothing (alpha = 1/14), seeded with a 14-bar SMA.
+        # Rolling SMA gives different values on trending data and misclassifies
+        # overbought/oversold zones — Wilder's method matches every RSI indicator.
+        gain  = delta.where(delta > 0, 0.0)
+        loss  = (-delta.where(delta < 0, 0.0))
+        gain  = gain.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+        loss  = loss.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+        rs    = gain / (loss + 1e-10)
+        df['rsi'] = 100 - (100 / (1 + rs))
+
+        for col in ['atr', 'ema_20', 'ema_50', 'ema_200', 'rsi']:
+            df[col] = df[col].bfill().ffill()
+            df[col] = df[col].replace([np.inf, -np.inf], np.nan)
+            df[col] = df[col].fillna(df[col].median())
+
+
+    def _drop_forming_bars(self, df: pd.DataFrame, interval: str) -> pd.DataFrame:
+        """Keep only bars that have fully closed.
+
+        Completeness is judged against the newest 5-minute bar (its open time is
+        within 5 min of 'now'), so no timezone / DST assumption is needed: API bar
+        times are in Twelve Data's exchange timezone, not UTC.
+        A bar is kept when bar_open + interval <= open of the newest 5-min bar.
+        If the 5-min feed is unavailable, fall back to dropping the newest row.
+        """
+        mins = _BAR_MINUTES[interval]
+        if interval == "5min":
+            ref = df["time"].iloc[-1]                      # newest (forming) 5-min bar
+        else:
+            m5  = self.fetch_bars("5min", 60)              # already closed-only, shared-cached
+            ref = None if (m5 is None or m5.empty) else m5["time"].iloc[-1] + pd.Timedelta(minutes=5)
+        if ref is None:
+            logger.warning(f"closed-bars: no 5min reference for {interval}; dropping newest row")
+            return df.iloc[:-1].reset_index(drop=True)
+        keep = df[df["time"] + pd.Timedelta(minutes=mins) <= ref]
+        return keep.reset_index(drop=True)
+
+    def fetch_bars(self, interval: str = "15min", outputsize: int = 200) -> Optional[pd.DataFrame]:
+        cache_key = (self.symbol, interval, outputsize)
+        with _SHARED_BAR_CACHE_LOCK:
+            entry = _SHARED_BAR_CACHE.get(cache_key)
+            if entry is not None:
+                age = time.time() - entry['ts']
+                if age < _SHARED_BAR_CACHE_TTL:
+                    return entry['df']
+                # Stale entry — evict and re-fetch
+                del _SHARED_BAR_CACHE[cache_key]
+
+        endpoint = f"{self.base_url.rstrip()}/time_series"
+        params   = {
+            "symbol": self.symbol, "interval": interval,
+            "outputsize": outputsize, "apikey": self.api_key, "format": "JSON"
+        }
+
+        # Acquire a rate-limit slot — tries this predictor's own key first,
+        # then falls back to any free spare key if the primary is full.
+        call_key = acquire_any(self.api_key)
+        params["apikey"] = call_key
+
+        last_error = None
+        for attempt in range(3):
+            try:
+                response = requests.get(endpoint, params=params, timeout=30)
+                response.raise_for_status()
+                data       = response.json()
+                last_error = None
+                break
+            except Exception as e:
+                last_error = e
+                if attempt < 2:
+                    time.sleep((attempt + 1) * 5)
+
+        if last_error is not None:
+            print(f"  ❌ fetch_bars({interval}): 3 attempts failed — {last_error}")
+            logger.warning(f"fetch_bars({interval}): 3 attempts failed — {last_error}")
+            return None
+        if "values" not in data:
+            api_status = data.get("status", "?")
+            api_msg    = data.get("message", str(data)[:120])
+            print(f"  ❌ fetch_bars({interval}): no 'values' in response — status={api_status} msg={api_msg}")
+            return None
+
+        df_data = []
+        for candle in data["values"]:
+            try:
+                df_data.append({
+                    "time":  pd.to_datetime(candle["datetime"]) + timedelta(hours=self.broker_offset),
+                    "open":  float(candle["open"]),
+                    "high":  float(candle["high"]),
+                    "low":   float(candle["low"]),
+                    "close": float(candle["close"])
+                })
+            except Exception as e:
+                logger.warning(f"fetch_bars: bad candle row — {e}")
+                continue
+
+        if not df_data:
+            return None
+
+        df = pd.DataFrame(df_data)
+        df.sort_values("time", inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        if CLOSED_BARS_ONLY and interval in _BAR_MINUTES:
+            df = self._drop_forming_bars(df, interval)
+            if df.empty:
+                return None
+        df["avg_spread"] = 0.00005
+        self._calculate_indicators(df)
+
+        # Store in the shared cache so the sibling predictor (REV↔CONT) can
+        # reuse these bars within the same 15-min cycle without a duplicate fetch.
+        with _SHARED_BAR_CACHE_LOCK:
+            _SHARED_BAR_CACHE[cache_key] = {'df': df, 'ts': time.time()}
+
+        return df
+
+
+    def get_htf_context(self,
+                         df_1h:   Optional[pd.DataFrame] = None,
+                         df_4h_c: Optional[pd.DataFrame] = None,
+                         df_4h:   Optional[pd.DataFrame] = None,
+                         df_1d:   Optional[pd.DataFrame] = None) -> Dict:
+        context = {}
+
+        # Resolve bars — use pre-fetched if supplied, otherwise fetch live.
+        _df_1h   = df_1h   if df_1h   is not None else self.fetch_bars(interval="1h",   outputsize=100)
+        _df_4h_c = df_4h_c if df_4h_c is not None else self.fetch_bars(interval="4h",   outputsize=100)
+        _df_4h   = df_4h   if df_4h   is not None else self.fetch_bars(interval="4h",   outputsize=200)
+        _df_1d   = df_1d   if df_1d   is not None else self.fetch_bars(interval="1day", outputsize=90)
+        # ── CLOSED-D1 GATE (get_htf_context) ─────────────────────────────────
+        # Drop the still-forming D1 candle. D1 bar 'time' = open time (00:00 UTC).
+        # Only bars from BEFORE today are fully closed and safe to use.
+        # Matches the fix applied in label_generator.py line 1026.
+        if _df_1d is not None and len(_df_1d) > 0 and 'time' in _df_1d.columns:
+            _today_utc = pd.Timestamp(datetime.utcnow().date())
+            _df_1d = _df_1d[pd.to_datetime(_df_1d['time']).dt.normalize() < _today_utc].copy()
+            if len(_df_1d) == 0:
+                _df_1d = None
+        # ─────────────────────────────────────────────────────────────────────
+
+        if _df_1h is not None and len(_df_1h) > 50:
+            context['h1_trend']  = 'bullish' if _df_1h['ema_20'].iloc[-1] > _df_1h['ema_50'].iloc[-1] else 'bearish'
+            context['h1_close']  = _df_1h['close'].iloc[-1]
+            context['trend_source'] = '1H'
+        else:
+            if _df_4h_c is not None and len(_df_4h_c) > 50:
+                context['h1_trend']  = 'bullish' if _df_4h_c['ema_20'].iloc[-1] > _df_4h_c['ema_50'].iloc[-1] else 'bearish'
+                context['h1_close']  = _df_4h_c['close'].iloc[-1]
+                context['trend_source'] = '4H'
+            else:
+                context['h1_trend']     = 'neutral'
+                context['h1_close']     = None
+                context['trend_source'] = 'FALLBACK'
+
+        context['h4_atr'] = _df_4h_c['atr'].iloc[-1] if _df_4h_c is not None and len(_df_4h_c) > 14 else None
+
+        # ── D1 EMA20/50 trend (matches what the model was trained on) ─────────
+        # This is the SAME calculation as label_generator.calculate_htf_trend_
+        # alignment / smc_detector.get_d1_trend — cached here once, on the
+        # already closed-bar-filtered _df_1d, so every bias gate in this file
+        # reads the identical value instead of each recomputing it slightly
+        # differently (and potentially against non-closed-bar-filtered data).
+        context['d1_ema_trend'] = self._get_d1_trend_ema(_df_1d)
+
+        # outputsize=90: the D1 premium/discount gate uses tail(60) so we need
+        # at least 60 bars here.
+        if _df_1d is not None and len(_df_1d) > 1:
+            y = _df_1d.iloc[-2]
+            pivot = (y['high'] + y['low'] + y['close']) / 3
+            context.update({
+                'daily_pivot': pivot, 'daily_r1': 2 * pivot - y['low'],
+                'daily_s1': 2 * pivot - y['high'],
+                'yesterday_high': y['high'], 'yesterday_low': y['low']
+            })
+        else:
+            context.update({'daily_pivot': None, 'daily_r1': None, 'daily_s1': None})
+
+        if self.use_htf_analysis:
+            if _df_4h is not None and len(_df_4h) > 20:
+                context['h4_fvgs']         = self.htf_analyzer.detect_fvg(_df_4h, '4h')
+                context['h4_order_blocks'] = self.htf_analyzer.detect_order_blocks(_df_4h, '4h')
+                context['h4_structure']    = self.htf_analyzer.detect_market_structure_shift(_df_4h)
+                context['h4_fib_levels']   = self.htf_analyzer.calculate_fibonacci_levels(_df_4h, 100)
+                context['h4_atr']          = _df_4h['atr'].iloc[-1]
+                if self.debug:
+                    print(f"\n  🔍 4H [{self.symbol}]: {len(context['h4_fvgs'])} FVGs, {len(context['h4_order_blocks'])} OBs")
+            else:
+                context.update({'h4_fvgs': [], 'h4_order_blocks': [], 'h4_structure': {'trend': 'neutral'}, 'h4_fib_levels': {}})
+
+            # Reuse _df_1h (outputsize=100) for 1H FVG/OB detection.
+            # 100 bars covers ~4 days of 1H history — sufficient for zone detection.
+            if _df_1h is not None and len(_df_1h) > 20:
+                context['h1_fvgs']         = self.htf_analyzer.detect_fvg(_df_1h, '1h')
+                context['h1_order_blocks'] = self.htf_analyzer.detect_order_blocks(_df_1h, '1h')
+                context['h1_structure']    = self.htf_analyzer.detect_market_structure_shift(_df_1h)
+                context['h1_fib_levels']   = self.htf_analyzer.calculate_fibonacci_levels(_df_1h, 50)
+                if self.debug:
+                    print(f"  🔍 1H [{self.symbol}]: {len(context['h1_fvgs'])} FVGs, {len(context['h1_order_blocks'])} OBs")
+            else:
+                context.update({'h1_fvgs': [], 'h1_order_blocks': [], 'h1_structure': {'trend': 'neutral'}, 'h1_fib_levels': {}})
+
+            if _df_1d is not None and len(_df_1d) > 20:
+                context['daily_fvgs']         = self.htf_analyzer.detect_fvg(_df_1d, 'daily')
+                context['daily_order_blocks']  = self.htf_analyzer.detect_order_blocks(_df_1d, 'daily')
+                context['daily_structure']     = self.htf_analyzer.detect_market_structure_shift(_df_1d)
+            else:
+                context.update({'daily_fvgs': [], 'daily_order_blocks': [], 'daily_structure': {'trend': 'neutral'}})
+
+        return context
+
+
+    def _detect_zones_with_validation(self, df: pd.DataFrame, htf_context: Dict) -> List[Dict]:
+        zones        = []
+        current_price = df['close'].iloc[-1]
+        current_atr   = df['atr'].iloc[-1]
+        if pd.isna(current_atr) or current_atr <= 0:
+            current_atr = self.pip_size * 10
+
+        lookback = min(384, len(df) - 10)
+        recent   = df.tail(lookback)
+
+        for i in range(10, len(recent) - 5):
+            idx_in_df = len(df) - lookback + i
+            bar       = recent.iloc[i]
+
+            # ── SUPPLY ZONE ──────────────────────────────────────────────────
+            prev_highs = recent.iloc[i - 5:i]['high']
+            next_highs = recent.iloc[i + 1:i + 6]['high']
+
+            if bar['high'] > prev_highs.max() and bar['high'] > next_highs.max():
+                next_lows = recent.iloc[i + 1:i + 6]['low']
+                drop = bar['high'] - next_lows.min()
+
+                if drop > current_atr * self.min_strength_atr and bar['high'] > current_price:
+                    strength     = drop / current_atr
+                    # scanning to end-of-dataset — a Monday zone was being checked
+                    # against all of Friday's future price action.
+                    future_bars  = recent.iloc[i:i + 50]
+                    # that normal retest wicks don't discard valid supply zones.
+                    violated     = (future_bars['close'] > bar['high'] + current_atr * 1.5).any()
+
+                    if not violated:
+                        if htf_context.get('h1_trend') == 'bullish':
+                            strength *= 0.7
+
+                        body_top    = max(bar['open'], bar['close'])
+                        # When body_top == bar['high'] the zone has no width,
+                        # risk collapses to zero and SL falls entirely on ATR floor.
+                        if (bar['high'] - body_top) < current_atr * 0.1:
+                            continue
+                        # Confluence = count of HTF structures overlapping this zone
+                        # Matches training schema where confluence is an integer count
+                        z_top = bar['high']; z_bot = body_top
+                        conf_count = 1
+                        for htf_item in (htf_context.get('h4_fvgs', []) +
+                                         htf_context.get('h1_fvgs', []) +
+                                         htf_context.get('h4_order_blocks', []) +
+                                         htf_context.get('h1_order_blocks', [])):
+                            ib = htf_item.get('bottom', htf_item.get('price_low', 0))
+                            it = htf_item.get('top',    htf_item.get('price_high', 0))
+                            if ib < z_top and it > z_bot:
+                                conf_count += 1
+                        zones.append({
+                            'type':         'supply',
+                            'price_mid':    (bar['high'] + body_top) / 2,
+                            'price_high':   bar['high'],
+                            'price_low':    body_top,
+                            'strength':     strength,
+                            'confluence':   conf_count,
+                            'index':        idx_in_df,
+                            'distance_pips': (bar['high'] - current_price) / self.pip_size,
+                            'validated':    True,
+                            'bar_time':     bar['time']
+                        })
+
+            # ── DEMAND ZONE ──────────────────────────────────────────────────
+            prev_lows = recent.iloc[i - 5:i]['low']
+            next_lows = recent.iloc[i + 1:i + 6]['low']
+
+            if bar['low'] < prev_lows.min() and bar['low'] < next_lows.min():
+                next_highs = recent.iloc[i + 1:i + 6]['high']
+                rise = next_highs.max() - bar['low']
+
+                if rise > current_atr * self.min_strength_atr and bar['low'] < current_price:
+                    strength    = rise / current_atr
+                    future_bars = recent.iloc[i:i + 50]
+                    violated    = (future_bars['close'] < bar['low'] - current_atr * 1.5).any()
+
+                    if not violated:
+                        if htf_context.get('h1_trend') == 'bearish':
+                            strength *= 0.7
+
+                        body_bottom = min(bar['open'], bar['close'])
+                        # When body_bottom == bar['low'] the zone has no width,
+                        # risk collapses to zero and SL falls entirely on ATR floor.
+                        if (body_bottom - bar['low']) < current_atr * 0.1:
+                            continue
+                        z_top = body_bottom; z_bot = bar['low']
+                        conf_count = 1
+                        for htf_item in (htf_context.get('h4_fvgs', []) +
+                                         htf_context.get('h1_fvgs', []) +
+                                         htf_context.get('h4_order_blocks', []) +
+                                         htf_context.get('h1_order_blocks', [])):
+                            ib = htf_item.get('bottom', htf_item.get('price_low', 0))
+                            it = htf_item.get('top',    htf_item.get('price_high', 0))
+                            if ib < z_top and it > z_bot:
+                                conf_count += 1
+                        zones.append({
+                            'type':         'demand',
+                            'price_mid':    (body_bottom + bar['low']) / 2,
+                            'price_high':   body_bottom,
+                            'price_low':    bar['low'],
+                            'strength':     strength,
+                            'confluence':   conf_count,
+                            'index':        idx_in_df,
+                            'distance_pips': (current_price - bar['low']) / self.pip_size,
+                            'validated':    True,
+                            'bar_time':     bar['time']
+                        })
+
+        # FIX: previously counted every 15-min bar whose range overlapped the
+        # zone, with no de-duplication — a single sustained price excursion
+        # through the zone over N consecutive bars counted as N touches. This
+        # is the value that actually feeds the model (feature_builder.py's
+        # zone.get("touch_count", zone.get("zone_touch_count", 1)) fallback —
+        # 'touch_count' is never set on the raw zone object, only this one
+        # is), so it needs to match how training counts touches:
+        # calculate_zone_touch_count() (and this file's own, correctly
+        # implemented _calculate_touch_count()) explicitly skip 20 bars after
+        # each detected touch specifically to avoid this over-counting.
+        for zone in zones:
+            zone['zone_touch_count'] = self._calculate_touch_count(zone, df)
+
+        adaptive_max = max(35.0, current_atr / self.pip_size * 4.0)
+        return [z for z in zones if abs(z['distance_pips']) < adaptive_max]
+
+
+    def _htf_direction_filter(self, zones: List[Dict], htf_context: Dict,
+                               current_price: float) -> List[Dict]:
+        trend = htf_context.get('h1_trend', 'neutral')
+        if trend == 'neutral':
+            return zones
+        allowed_type  = 'supply'  if trend == 'bearish' else 'demand'
+        pullback_type = 'demand'  if trend == 'bearish' else 'supply'
+        out = []
+        for z in zones:
+            if z['type'] == allowed_type:
+                out.append(z)
+            elif z['type'] == pullback_type and abs(z['distance_pips']) <= 25:
+                z['is_pullback'] = True
+                out.append(z)
+        return out
+
+
+    def detect_zone_flip(self, zone: Dict, df_5min: pd.DataFrame,
+                         current_atr_15min: float) -> Optional[Dict]:
+        if df_5min is None or len(df_5min) < 20:
+            return None
+        current_price   = df_5min['close'].iloc[-1]
+        current_5min_atr = df_5min['atr'].iloc[-1]
+        if pd.isna(current_5min_atr) or current_5min_atr <= 0:
+            current_5min_atr = self.pip_size * 5
+
+        zone_type       = zone['type']
+        break_threshold = 5 * self.pip_size
+
+        if zone_type == 'demand':
+            flip_level  = zone['price_high']
+            break_level = zone['price_low'] - break_threshold
+            if not (df_5min.tail(20)['low'] < break_level).any():
+                return None
+            dist_pips = (flip_level - current_price) / self.pip_size
+            if not (0 <= dist_pips <= 20):
+                return None
+            if df_5min['ema_20'].iloc[-1] >= df_5min['ema_50'].iloc[-1]:
+                return None
+            break_bars_ago = next(
+                (len(df_5min) - 1 - i for i in range(len(df_5min) - 1, max(0, len(df_5min) - 21), -1)
+                 if df_5min.iloc[i]['low'] < break_level), None)
+            if break_bars_ago is None or break_bars_ago > 15:
+                return None
+            return {
+                'flipped': True, 'original_type': 'demand', 'new_type': 'resistance',
+                'flip_direction': 'SELL', 'flip_level': flip_level,
+                'break_bars_ago': break_bars_ago, 'pullback_pips': dist_pips,
+                'momentum_aligned': True
+            }
+        else:
+            flip_level  = zone['price_low']
+            break_level = zone['price_high'] + break_threshold
+            if not (df_5min.tail(20)['high'] > break_level).any():
+                return None
+            dist_pips = (current_price - flip_level) / self.pip_size
+            if not (0 <= dist_pips <= 20):
+                return None
+            if df_5min['ema_20'].iloc[-1] <= df_5min['ema_50'].iloc[-1]:
+                return None
+            break_bars_ago = next(
+                (len(df_5min) - 1 - i for i in range(len(df_5min) - 1, max(0, len(df_5min) - 21), -1)
+                 if df_5min.iloc[i]['high'] > break_level), None)
+            if break_bars_ago is None or break_bars_ago > 15:
+                return None
+            return {
+                'flipped': True, 'original_type': 'supply', 'new_type': 'support',
+                'flip_direction': 'BUY', 'flip_level': flip_level,
+                'break_bars_ago': break_bars_ago, 'pullback_pips': dist_pips,
+                'momentum_aligned': True
+            }
+
+
+    def refine_entry_with_5min(self, zone: Dict, current_price: float,
+                                current_atr_15min: float,
+                                df_5min: Optional[pd.DataFrame] = None) -> Optional[Dict]:
+        _df = df_5min if df_5min is not None else self.fetch_bars(interval="5min", outputsize=100)
+        if _df is None or len(_df) < 20:
+            return None
+        current_5min_price = _df['close'].iloc[-1]
+        atr_5min           = _df['atr'].iloc[-1]
+        if pd.isna(atr_5min) or atr_5min <= 0:
+            atr_5min = self.pip_size * 5
+
+        atr_15min_pips    = current_atr_15min / self.pip_size
+        dynamic_threshold = atr_15min_pips * self.refine_max_dist_multiplier
+        zone_mid          = zone['price_mid']
+        dist_to_zone      = abs(current_5min_price - zone_mid) / self.pip_size
+
+        if dist_to_zone > dynamic_threshold:
+            if self.debug:
+                print(f"    ⚠️  5-min far zone: {dist_to_zone:.1f}p > {dynamic_threshold:.1f}p "
+                      f"(passing to ML — no hard reject)")
+
+        recent_5min    = _df.tail(20)
+        rejection_score = 0
+        for i in range(-5, 0):
+            bar        = recent_5min.iloc[i]
+            body       = abs(bar['close'] - bar['open'])
+            total_range = bar['high'] - bar['low']
+            if total_range > 0:
+                if zone['type'] == 'demand':
+                    if (min(bar['open'], bar['close']) - bar['low']) > body * 1.5:
+                        rejection_score += 1
+                else:
+                    if (bar['high'] - max(bar['open'], bar['close'])) > body * 1.5:
+                        rejection_score += 1
+
+        micro_zone_found = False
+        refined_entry    = zone_mid
+        max_micro_dist   = max(15, atr_5min / self.pip_size * 1.5)
+
+        if zone['type'] == 'demand':
+            for i in range(5, len(recent_5min) - 2):
+                bar = recent_5min.iloc[i]
+                if (bar['low'] < recent_5min.iloc[i-3:i]['low'].min() and
+                        bar['low'] < recent_5min.iloc[i+1:i+3]['low'].min() and
+                        abs(bar['low'] - zone_mid) / self.pip_size < max_micro_dist):
+                    refined_entry = bar['low']; micro_zone_found = True; break
+        else:
+            for i in range(5, len(recent_5min) - 2):
+                bar = recent_5min.iloc[i]
+                if (bar['high'] > recent_5min.iloc[i-3:i]['high'].max() and
+                        bar['high'] > recent_5min.iloc[i+1:i+3]['high'].max() and
+                        abs(bar['high'] - zone_mid) / self.pip_size < max_micro_dist):
+                    refined_entry = bar['high']; micro_zone_found = True; break
+
+        momentum_aligned = (
+            (zone['type'] == 'demand' and recent_5min['ema_20'].iloc[-1] > recent_5min['ema_50'].iloc[-1]) or
+            (zone['type'] == 'supply' and recent_5min['ema_20'].iloc[-1] < recent_5min['ema_50'].iloc[-1])
+        )
+        total_score = rejection_score + (2 if micro_zone_found else 0) + (1 if momentum_aligned else 0)
+
+        if total_score < 2:
+            if self.debug:
+                print(f"    ⚠️  5-min score low: {total_score}/8 < 2 "
+                      f"(no refinement — zone continues to ML with base geometry)")
+            return None
+
+        sl_mult    = 2.2 if micro_zone_found else 2.8
+        # tight. Use current_atr_15min (the 15min ATR passed in) so the SL is
+        # always anchored to the correct timeframe's noise level.
+        # sl_mult still controls how many ATRs of buffer beyond the entry.
+        refined_sl = (refined_entry - current_atr_15min * sl_mult if zone['type'] == 'demand'
+                      else refined_entry + current_atr_15min * sl_mult)
+
+        atr_5min_pips  = atr_5min / self.pip_size
+        # filled worse than planned; 0.15×ATR was systematically under-estimating fill slip)
+        slippage_pips  = max(1.0, atr_5min_pips * 0.30)
+        if zone['type'] == 'demand':
+            refined_entry += slippage_pips * self.pip_size
+            refined_sl    += slippage_pips * self.pip_size
+        else:
+            refined_entry -= slippage_pips * self.pip_size
+            refined_sl    -= slippage_pips * self.pip_size
+
+        return {
+            'refined_entry': refined_entry, 'refined_sl': refined_sl,
+            'confidence_boost': min(total_score * 0.02, 0.08),
+            'confirmation_score': total_score, 'rejection_candles': rejection_score,
+            'micro_zone_found': micro_zone_found, 'momentum_aligned': momentum_aligned,
+            'distance_used': dist_to_zone, 'threshold_used': dynamic_threshold
+        }
+
+
+    def calculate_realistic_levels(self, zone: Dict, current_atr: float,
+                                    current_price: float, refinement: Optional[Dict],
+                                    htf_context: Dict) -> Tuple[float, float, float, float]:
+        MIN_RR = 1.5
+        is_buy = zone['type'] == 'demand'
+
+        # ── Entry and SL ─────────────────────────────────────────────────────
+        if refinement:
+            entry = refinement['refined_entry']
+            sl    = refinement['refined_sl']
+            # Re-enforce the 15min ATR floor here so the SL is never tighter
+            # than 1.5 × 15min ATR regardless of which path set it.
+            _min_sl_dist = current_atr * max(self.min_risk_atr, 2.5)
+            if abs(entry - sl) < _min_sl_dist:
+                sl = entry - _min_sl_dist if is_buy else entry + _min_sl_dist
+        else:
+            if zone.get('is_continuation') and zone.get('flip_info'):
+                entry = zone['flip_info']['flip_level']
+            else:
+                # limit order absorbs the normal wick overshoot before filling.
+                # Without this, price routinely overshoots the body by 5-25 pips
+                # and the fill is already at or past the SL.
+                _body_proximal = (zone.get('price_high', zone['price_mid']) if is_buy
+                                  else zone.get('price_low', zone['price_mid']))
+                # slippage of +7.7 pips — price consistently blows through the body
+                _buf = current_atr * 0.55
+                entry = _body_proximal - _buf if is_buy else _body_proximal + _buf
+
+            # not just the body edge. price_low (demand) / price_high (supply)
+            # already holds the wick extreme from _detect_zones_with_validation.
+            # Use 1.0 ATR as minimum so normal 15min noise never stops us out.
+            if is_buy:
+                wick_risk = entry - zone['price_low']          # entry to wick low
+                risk      = max(wick_risk, current_atr * max(self.min_risk_atr, 2.5))
+                sl        = entry - risk
+            else:
+                wick_risk = zone['price_high'] - entry         # wick high to entry
+                risk      = max(wick_risk, current_atr * max(self.min_risk_atr, 2.5))
+                sl        = entry + risk
+
+        risk = abs(entry - sl)
+        if risk <= 0:
+            risk = current_atr * max(self.min_risk_atr, 2.5)
+            sl   = entry - risk if is_buy else entry + risk
+
+        # ── Spread on SL (entry slip, once) ──────────────────────────────────
+        session_spread = {'sydney': 1.5, 'asia': 1.2, 'london': 0.7, 'ny': 0.8}
+        spread_pips    = session_spread.get(self._get_session(self._current_time().hour), 1.0)
+        spread_price   = spread_pips * self.pip_size
+        sl   = sl - spread_price * 0.5 if is_buy else sl + spread_price * 0.5
+        risk = abs(entry - sl)
+
+        # ── Collect opposing zones as TP candidates ───────────────────────────
+        # BUY  → TP at SUPPLY zones (bearish FVGs + bearish OBs) above entry
+        # SELL → TP at DEMAND zones (bullish FVGs + bullish OBs) below entry
+        opposing_fvg_type = 'bearish' if is_buy else 'bullish'
+        opposing_ob_type  = 'bearish' if is_buy else 'bullish'
+
+        all_fvgs = (htf_context.get('h1_fvgs', []) +
+                    htf_context.get('h4_fvgs', []) +
+                    htf_context.get('daily_fvgs', []))
+        all_obs  = (htf_context.get('h1_order_blocks', []) +
+                    htf_context.get('h4_order_blocks', []) +
+                    htf_context.get('daily_order_blocks', []))
+
+        tp_candidates = []  # list of (distance_from_entry, source_label, raw_level)
+
+        # FVGs — target the near edge (bottom of bearish FVG for BUY, top of bullish FVG for SELL)
+        for fvg in all_fvgs:
+            if fvg.get('type') != opposing_fvg_type:
+                continue
+            level = fvg['bottom'] if is_buy else fvg['top']
+            if (is_buy and level > entry) or (not is_buy and level < entry):
+                tp_candidates.append((abs(level - entry), 'fvg', level))
+
+        # OBs — target the proximal edge of the opposing OB
+        for ob in all_obs:
+            if ob.get('type') != opposing_ob_type:
+                continue
+            level = ob['bottom'] if is_buy else ob['top']
+            if (is_buy and level > entry) or (not is_buy and level < entry):
+                tp_candidates.append((abs(level - entry), 'ob', level))
+
+        # Swing structure — nearest swing high (BUY) or swing low (SELL)
+        for struct in [htf_context.get('h4_structure', {}), htf_context.get('h1_structure', {})]:
+            if is_buy:
+                for sh in struct.get('swing_highs', []):
+                    lvl = sh.get('price', 0)
+                    if lvl > entry:
+                        tp_candidates.append((abs(lvl - entry), 'swing_high', lvl))
+            else:
+                for sl_s in struct.get('swing_lows', []):
+                    lvl = sl_s.get('price', 0)
+                    if lvl < entry:
+                        tp_candidates.append((abs(lvl - entry), 'swing_low', lvl))
+
+        # ── Filter by RR validity and pick best candidate ─────────────────────
+        TP_MAX_RR   = max(self.max_rr, 12.0)  # winners ran to RR 7-11, raise ceiling
+        TARGET_RR   = 6.0                      # aim for this RR (was 4.0, winners averaged 9.7)
+
+        def effective_rr(raw_level: float) -> float:
+            tp_adj = raw_level - spread_price * 0.5 if is_buy else raw_level + spread_price * 0.5
+            reward = abs(tp_adj - entry)
+            return reward / risk if risk > 0 else 0.0
+
+        tp_candidates.sort(key=lambda x: x[0])  # nearest first
+        tp, actual_rr, tp_source = None, None, 'fallback'
+
+        valid_candidates = []
+        for dist, source, raw_level in tp_candidates:
+            rr = effective_rr(raw_level)
+            if MIN_RR <= rr <= TP_MAX_RR:
+                valid_candidates.append((rr, dist, source, raw_level))
+
+        if valid_candidates:
+            # Pick candidate whose RR is closest to TARGET_RR
+            best = min(valid_candidates, key=lambda x: abs(x[0] - TARGET_RR))
+            _, _, tp_source, raw_level = best
+            tp_adj    = raw_level - spread_price * 0.5 if is_buy else raw_level + spread_price * 0.5
+            tp        = tp_adj
+            actual_rr = effective_rr(raw_level)
+
+        # ── Fallback: fixed RR if no opposing zone found ──────────────────────
+        if tp is None:
+            tp        = entry + risk * self.max_rr if is_buy else entry - risk * self.max_rr
+            tp        = tp - spread_price * 0.5 if is_buy else tp + spread_price * 0.5
+            actual_rr = abs(tp - entry) / risk if risk > 0 else self.max_rr
+            tp_source = 'fixed_rr'
+
+        # Hard floor
+        if actual_rr < MIN_RR:
+            tp        = entry + risk * MIN_RR if is_buy else entry - risk * MIN_RR
+            actual_rr = MIN_RR
+            tp_source = 'min_rr_floor'
+
+        if self.debug:
+            print(f"    📐 TP [{tp_source}]  Entry={entry:.5f}  SL={sl:.5f}  "
+                  f"TP={tp:.5f}  RR=1:{actual_rr:.2f}  "
+                  f"({len(tp_candidates)} candidates checked)")
+
+        return entry, sl, tp, actual_rr
+
+    def _predict(self, zone: Dict, df: pd.DataFrame,
+                 entry: float, sl: float,
+                 df_1h: Optional[pd.DataFrame] = None,
+                 df_4h: Optional[pd.DataFrame] = None,
+                 df_5m: Optional[pd.DataFrame] = None,
+                 df_d1: Optional[pd.DataFrame] = None) -> float:
+        try:
+            # ── Per-zone touch_index ───────────────────────────────────────────
+            # zones on the same pair shared the same approach bar → identical
+            # candle_body_ratio, approach_momentum, approach_distance across every
+            # OB regardless of price level. This collapsed model discrimination.
+            _zone_top = zone.get('price_high', zone.get('top',    df['close'].iloc[-1]))
+            _zone_bot = zone.get('price_low',  zone.get('bottom', df['close'].iloc[-1]))
+            _cur_atr  = (df['atr'].iloc[-1]
+                         if 'atr' in df.columns and not pd.isna(df['atr'].iloc[-1])
+                         else self.pip_size * 15)
+
+            # Last bar where price was within 1 ATR of the zone boundaries
+            _near = (df['low']  <= _zone_top + _cur_atr) & \
+                    (df['high'] >= _zone_bot - _cur_atr)
+            if _near.any():
+                _touch_index = int(_near.values.nonzero()[0][-1])
+            else:
+                _touch_index = len(df) - 1   # fallback: current bar
+
+            row_df = build_feature_row(
+                zone=zone, df=df, entry=entry, sl=sl,
+                encoders=self.encoders, pip_size=self.pip_size,
+                touch_index=_touch_index,
+                df_1h=df_1h, df_4h=df_4h, df_5m=df_5m, df_d1=df_d1,
+            )
+        except ValueError as exc:
+            print(f"  ❌ build_feature_row FAILED: {exc}")
+            logger.error(f"Feature extraction failed for {zone.get('id','unknown')} ({self.symbol}): {exc}", exc_info=True)
+            return 0.5
+        except Exception as exc:
+            print(f"  ❌ build_feature_row ERROR: {exc}")
+            logger.error(f"Unexpected error building features for {zone.get('id','unknown')} ({self.symbol}): {exc}", exc_info=True)
+            return 0.5
+
+        _d = row_df.iloc[0].to_dict()
+
+        if self.debug:
+            print(
+                f"  🔍 features: h4_fvg_inside={_d.get('h4_fvg_inside')}"
+                f"  rsi={_d.get('rsi', 0):.1f}"
+                f"  h1_liq_sweep={_d.get('h1_liquidity_sweep')}"
+                f"  m5_bos={_d.get('m5_micro_bos')}"
+                f"  m5_sweep={_d.get('m5_sweep_confirmation')}"
+                f"  touch={_d.get('zone_touch_count')}"
+                f"  zone_age={_d.get('zone_age_bars')}"
+                f"  htf_align={_d.get('htf_trend_alignment')}"
+                f"  h4_prem={_d.get('h4_premium_discount')}"
+                f"  d1_prem={_d.get('d1_premium_discount')}"
+            )
+
+        # ── Feature audit log — ONE entry per unique zone per day ─────────────
+        # Intentionally OUTSIDE if self.debug so it runs in production too.
+        # Dedup guard prevents re-logging when rev + cont predictors both score
+        # the same zone (previously caused 4× duplicates across 4 symbol passes).
+        try:
+            _log_dir  = Path('signals/feature_logs')
+            _log_dir.mkdir(parents=True, exist_ok=True)
+            _log_file = _log_dir / f"features_{datetime.utcnow().strftime('%Y%m%d')}.jsonl"
+            _fingerprint = (
+                self.symbol,
+                round(_d.get('rsi', 0), 1),
+                round(_d.get('distance_from_ema20', 0), 4),
+                _d.get('zone_age_bars'),
+                _d.get('zone_touch_count'),
+            )
+            _seen: set = set()
+            if _log_file.exists():
+                with open(_log_file) as _rf:
+                    for _line in _rf:
+                        try:
+                            _e = json.loads(_line)
+                            _f = _e.get('features', {})
+                            _seen.add((
+                                _e.get('symbol'),
+                                round(_f.get('rsi', 0), 1),
+                                round(_f.get('distance_from_ema20', 0), 4),
+                                _f.get('zone_age_bars'),
+                                _f.get('zone_touch_count'),
+                            ))
+                        except Exception:
+                            pass
+            if _fingerprint not in _seen:
+                # ── Join-key fields — the replay report already writes zone_top,
+                # zone_bottom, symbol, and proposed_at/trigger_time for every
+                # signal. Mirroring the same zone_top/zone_bottom here (already
+                # computed above as _zone_top/_zone_bot) plus the actual
+                # historical bar time (not the wall-clock logging timestamp)
+                # lets the two files be joined on
+                # (symbol, round(zone_top,5), round(zone_bottom,5), evaluated_at)
+                # instead of the old age/rsi/touch_count zone_id, which has no
+                # relationship to anything in the replay output.
+                _evaluated_at = df['time'].iloc[_touch_index] if 'time' in df.columns else None
+                _log_entry = {
+                    'timestamp':    datetime.utcnow().isoformat(),
+                    'symbol':       self.symbol,
+                    'zone_id':      (f"{self.symbol}_age{_d.get('zone_age_bars')}"
+                                      f"_rsi{round(_d.get('rsi', 0), 1)}"
+                                      f"_touch{_d.get('zone_touch_count')}"),
+                    'zone_top':     round(float(_zone_top), 5),
+                    'zone_bottom':  round(float(_zone_bot), 5),
+                    'evaluated_at': _evaluated_at.isoformat() if _evaluated_at is not None else None,
+                    'features':     {k: round(float(v), 6) for k, v in _d.items()},
+                }
+                with open(_log_file, 'a') as _lf:
+                    _lf.write(json.dumps(_log_entry) + '\n')
+
+                # ── DISTRIBUTION TRACKING for zone_touch_count & h1_structure_shift ──
+                zone_touch = _d.get('zone_touch_count', 0)
+                h1_structure = _d.get('h1_structure_shift', 0)
+
+                # Log distribution every 100 signals (roughly hourly)
+                if hasattr(self, '_signal_count'):
+                    self._signal_count += 1
+                    if self._signal_count % 100 == 0:
+                        logger.info(f"Distribution snapshot ({self.symbol}, {self._signal_count} signals): "
+                                  f"zone_touch_count={zone_touch}, h1_structure_shift={h1_structure} "
+                                  f"(zero={1 if h1_structure==0 else 0})")
+                else:
+                    self._signal_count = 1
+        except Exception:
+            pass
+
+        X = row_df.values
+        if np.isnan(X).any() or np.isinf(X).any():
+            bad_features = {row_df.columns[i]: str(X[0][i])
+                          for i in range(len(row_df.columns))
+                          if np.isnan(X[0][i]) or np.isinf(X[0][i])}
+            logger.warning(f"NaN/Inf detected in features for {zone.get('id','unknown')} ({self.symbol}): {bad_features}")
+            return 0.5
+        try:
+            X_scaled = self.scaler.transform(X)
+
+            # ── Full weighted ensemble: XGB×0.50 + RF×0.35 + LR×0.15 ──────────
+            # Matches model_trainer.py evaluate_ensemble() exactly.
+            w = self._ensemble_weights
+            p_xgb = float(self.model.predict_proba(X_scaled)[0][1])
+
+            p_rf = None
+            p_lr = None
+            if self.rf_model is not None and self.lr_model is not None:
+                p_rf  = float(self.rf_model.predict_proba(X_scaled)[0][1])
+                p_lr  = float(self.lr_model.predict_proba(X_scaled)[0][1])
+                raw_prob = (p_xgb * w['xgb']) + (p_rf * w['rf']) + (p_lr * w['lr'])
+            elif self.rf_model is not None:
+                # LR missing — redistribute its weight to XGBoost
+                p_rf  = float(self.rf_model.predict_proba(X_scaled)[0][1])
+                raw_prob = p_xgb * (w['xgb'] + w['lr']) + p_rf * w['rf']
+            else:
+                # Only XGBoost available — use it alone
+                raw_prob = p_xgb
+
+            raw_prob = float(np.clip(raw_prob, 0.0, 1.0))
+            calibrated_prob = raw_prob
+
+            if getattr(self, '_calibrator', None) is not None:
+                try:
+                    if getattr(self, '_calibrator_kind', None) == 'isotonic':
+                        calibrated_prob = float(self._calibrator.predict(
+                            np.clip([raw_prob], 1e-6, 1 - 1e-6))[0])
+                    else:  # 'platt' — LogisticRegression, needs 2D input + predict_proba
+                        calibrated_prob = float(self._calibrator.predict_proba(
+                            np.clip([[raw_prob]], 1e-6, 1 - 1e-6))[0, 1])
+                except Exception as _cal_err:
+                    logger.warning(f"Calibrator application failed ({_cal_err}) — using raw probability")
+                    calibrated_prob = raw_prob
+            final_prob = float(np.clip(calibrated_prob, 0.0, 1.0))
+
+            # ── Model-agreement gate — DISABLED ─────────────────────────────────
+            # Diagnostic on the 2024-02-01+ test set (disagreement_diagnostic_v2.py)
+            # showed r=0.868 between bucket calibration error and disagreement, and
+            # gating at disagreement_std <= 0.10 took precision at threshold=0.65
+            # from 85.4% to 91.0%. But at the thresholds actually used in
+            # production (0.70+) the STEP 4 sweep showed the gate barely moved
+            # precision (e.g. 0.70: 89.6% no-gate vs 92.3% gated, n=154 vs n=143)
+            # — not worth the rejected signals. Gate disabled; disagreement_std
+            # is still computed and logged below for visibility only.
+            max_disagreement = getattr(self, 'max_disagreement', 0.10)
+            disagreement_std = None
+            gate_rejected = False
+            if p_rf is not None and p_lr is not None:
+                _probs = np.array([p_xgb, p_rf, p_lr])
+                disagreement_std = float(_probs.std())
+                # Gate disabled — no longer rejecting on disagreement_std.
+                # if disagreement_std > max_disagreement:
+                #     gate_rejected = True
+
+            # ── Detailed Logging of Ensemble Scoring ──────────────────────────
+            msg = (f"  🔮 Ensemble scoring for {self.symbol} {zone.get('type','unknown')} zone "
+                   f"at {zone.get('price_mid', 0.0):.5f} | XGB={p_xgb:.3f}")
+            if p_rf is not None:
+                msg += f" RF={p_rf:.3f}"
+            if p_lr is not None:
+                msg += f" LR={p_lr:.3f}"
+            msg += f" | Raw Ensem={raw_prob:.3f} | Calibrated={final_prob:.3f}"
+            if disagreement_std is not None:
+                msg += f" | disagreement_std={disagreement_std:.3f}"
+                if disagreement_std > max_disagreement:
+                    msg += f" (> {max_disagreement:.2f}, gate disabled — not rejected)"
+                else:
+                    msg += f" (<= {max_disagreement:.2f})"
+
+            if gate_rejected:
+                msg += (f" | ⛔ REJECTED (models disagreed): disagreement_std="
+                        f"{disagreement_std:.3f} > max {max_disagreement:.2f}")
+
+            logger.info(msg)
+            if self.debug:
+                print(msg)
+
+            if gate_rejected:
+                # Force below any realistic threshold so every downstream
+                # `prob >= self.prob_threshold` check rejects it naturally,
+                # without needing to touch each call site individually.
+                return 0.0
+
+            return final_prob
+        except Exception as exc:
+            print(f"  ❌ model.predict FAILED: {exc}")
+            logger.error(f"Model prediction failed for {zone.get('id','unknown')} ({self.symbol}, task={task}): {exc}", exc_info=True)
+            return 0.5
+            
+    
+    def predict_with_proper_features(self, zone: Dict, df: pd.DataFrame,
+                                      htf_context: Dict,
+                                      df_1h: Optional[pd.DataFrame] = None,
+                                      df_4h: Optional[pd.DataFrame] = None,
+                                      df_5m: Optional[pd.DataFrame] = None,
+                                      df_d1: Optional[pd.DataFrame] = None) -> float:
+        current_atr = df['atr'].iloc[-1]
+        if pd.isna(current_atr) or current_atr <= 0:
+            current_atr = self.pip_size * 10
+
+        if zone['type'] == 'demand':
+            entry = zone.get('price_high', zone['price_mid'])
+            risk  = max(entry - zone['price_low'], current_atr * self.min_risk_atr)
+            sl    = entry - risk
+        else:
+            entry = zone.get('price_low', zone['price_mid'])
+            risk  = max(zone['price_high'] - entry, current_atr * self.min_risk_atr)
+            sl    = entry + risk
+
+        # The old code set 0 for counter-trend zones instead of -1, silencing
+        # the model's counter-trend penalty for the entire 15-min pipeline.
+        # Now: aligned=1, counter-trend=-1, neutral/unknown=0 for both directions.
+        if 'htf_alignment' not in zone:
+            d1_trend = htf_context.get('daily_structure', {}).get('trend', 'neutral')
+            if d1_trend == 'neutral':
+                d1_trend = htf_context.get('h4_structure', {}).get('trend', 'neutral')
+            if zone['type'] == 'demand':
+                # demand: bullish=aligned(1), bearish=counter(-1), neutral=0
+                zone['htf_alignment'] = (1 if d1_trend == 'bullish'
+                                         else -1 if d1_trend == 'bearish'
+                                         else 0)
+            else:
+                # supply: bearish=aligned(1), bullish=counter(-1), neutral=0
+                zone['htf_alignment'] = (1 if d1_trend == 'bearish'
+                                         else -1 if d1_trend == 'bullish'
+                                         else 0)
+
+        # Use pre-fetched bars if supplied; fall back to live fetch only when
+        # called standalone (e.g. outside the main per-cycle batch path).
+        _df_1h = df_1h if df_1h is not None else self.fetch_bars(interval="1h",   outputsize=100)
+        _df_4h = df_4h if df_4h is not None else self.fetch_bars(interval="4h",   outputsize=100)
+        _df_5m = df_5m if df_5m is not None else self.fetch_bars(interval="5min", outputsize=60)
+        _df_d1 = df_d1 if df_d1 is not None else self.fetch_bars(interval="1day", outputsize=90)
+
+        return self._predict(zone, df, entry, sl,
+                             df_1h=_df_1h, df_4h=_df_4h, df_5m=_df_5m, df_d1=_df_d1)
+
+    def _ml_score_htf_zone(self, zone: Dict, df: pd.DataFrame, tf: str,
+                            htf_context: Optional[Dict] = None,
+                            zone_override: Optional[Dict] = None,
+                            df_1h: Optional[pd.DataFrame] = None,
+                            df_4h: Optional[pd.DataFrame] = None,
+                            df_5m: Optional[pd.DataFrame] = None,
+                            df_d1: Optional[pd.DataFrame] = None) -> float:
+        # Fast path: pre-built zone with all MTF features already injected
+        if zone_override is not None:
+            current_atr = df['atr'].iloc[-1]
+            if pd.isna(current_atr) or current_atr <= 0:
+                current_atr = self.pip_size * 15
+            zone_type = zone_override.get('type', 'demand')
+            entry = (zone_override['price_high'] if zone_type == 'demand'
+                     else zone_override['price_low'])
+            risk  = max(abs(entry - (zone_override['price_low'] if zone_type == 'demand'
+                                     else zone_override['price_high'])),
+                        current_atr * self.min_risk_atr)
+            sl = entry - risk if zone_type == 'demand' else entry + risk
+            _df_1h = df_1h if df_1h is not None else self.fetch_bars(interval="1h",   outputsize=100)
+            _df_4h = df_4h if df_4h is not None else self.fetch_bars(interval="4h",   outputsize=100)
+            _df_5m = df_5m if df_5m is not None else self.fetch_bars(interval="5min", outputsize=60)
+            _df_d1 = df_d1 if df_d1 is not None else self.fetch_bars(interval="1day", outputsize=30)
+            return self.apply_boost_ceiling(
+                self._predict(zone_override, df, entry, sl,
+                              df_1h=_df_1h, df_4h=_df_4h, df_5m=_df_5m, df_d1=_df_d1), 0)
+        current_atr = df['atr'].iloc[-1]
+        if pd.isna(current_atr) or current_atr <= 0:
+            current_atr = self.pip_size * 15
+
+        direction  = zone.get('direction', 'BUY')
+        zone_type  = 'demand' if direction == 'BUY' else 'supply'
+        zone_mid   = zone.get('mid', df['close'].iloc[-1])
+        zone_top   = zone.get('top',    zone_mid + current_atr * 0.5)
+        zone_bot   = zone.get('bottom', zone_mid - current_atr * 0.5)
+        actual_idx = zone.get('index', max(0, len(df) - int(len(df) * 0.2)))
+
+        d1_trend  = htf_context.get('daily_structure', {}).get('trend', 'neutral') if htf_context else 'neutral'
+        htf_align = 1 if (
+            (zone_type == 'demand' and d1_trend == 'bullish') or
+            (zone_type == 'supply' and d1_trend == 'bearish')
+        ) else 0
+
+        # so feature_builder gets a training-compatible value (not always 1).
+        overlap_count = 1
+        if htf_context:
+            all_htf = (htf_context.get('h1_fvgs', []) + htf_context.get('h4_fvgs', []) +
+                       htf_context.get('h1_order_blocks', []) + htf_context.get('h4_order_blocks', []))
+            for item in all_htf:
+                item_bot = item.get('bottom', item.get('price_low', 0))
+                item_top = item.get('top',    item.get('price_high', 0))
+                if item_bot < zone_top and item_top > zone_bot:
+                    overlap_count += 1
+
+        full_zone = {
+            'type': zone_type, 'price_mid': zone_mid, 'price_high': zone_top,
+            'price_low': zone_bot, 'strength': zone.get('strength', 1.0),
+            'confluence': overlap_count,  # integer, training-compatible
+            'index': actual_idx, 'htf_alignment': htf_align
+        }
+        if zone_type == 'demand':
+            entry = zone_top; risk = max(entry - zone_bot, current_atr * self.min_risk_atr); sl = entry - risk
+        else:
+            entry = zone_bot; risk = max(zone_top - entry, current_atr * self.min_risk_atr); sl = entry + risk
+
+        return self.apply_boost_ceiling(self._predict(full_zone, df, entry, sl,
+                                                       df_1h=df_1h, df_4h=df_4h,
+                                                       df_5m=df_5m, df_d1=df_d1), 0)
+
+    @staticmethod
+    def _json_safe(v):
+        """numpy/pandas scalars -> plain JSON types (json.dump(default=str) would stringify np.int64/np.bool_)."""
+        if isinstance(v, (bool, np.bool_)):
+            return bool(v)
+        if isinstance(v, (np.integer,)):
+            return int(v)
+        if isinstance(v, (np.floating,)):
+            f = float(v)
+            return f if np.isfinite(f) else None
+        if isinstance(v, float):
+            return v if np.isfinite(v) else None
+        if isinstance(v, (int, str)) or v is None:
+            return v
+        return str(v)
+
+    def _make_rescore_ctx(self, kind: str, tf: str, zone: Dict, df: pd.DataFrame,
+                          formation_idx, base_prob: float) -> Optional[Dict]:
+        """
+        Snapshot of EXACTLY what the model was fed at proposal time, stored on the signal so the
+        same score can be recomputed at arrival with fresh bars (rescore_at_arrival).
+        formation_time is the 4H bar the zone formed on; the zone's integer 'index' is a position
+        in a rolling frame that shifts every bar, so it is re-derived from this time at arrival.
+        """
+        try:
+            ft = df['time'].iloc[int(formation_idx)]
+            return {
+                'v': 1, 'kind': kind, 'tf': tf,
+                'zone': {k: self._json_safe(v) for k, v in zone.items()},
+                'formation_time': pd.Timestamp(ft).isoformat(),
+                'prob_at_proposal': round(float(base_prob), 4),
+            }
+        except Exception as e:
+            logger.debug(f"_make_rescore_ctx skipped ({kind}): {e}")
+            return None
+
+    def rescore_at_arrival(self, sig: Dict, now_broker: datetime) -> Dict:
+        """
+        Re-run the SAME model call the scan used (_ml_score_htf_zone with zone_override), but with
+        the arrival-dependent inputs refreshed from bars that are CLOSED as of `now_broker`:
+          - approach_distance / approach_momentum / candle_body_ratio  (15m, last closed bar)
+          - m5_micro_bos / m5_sweep_confirmation / m5_entry_candle_quality  (5m)
+          - h1_* confluence fields and D1 htf_alignment
+          - zone 'index' (re-derived from formation_time) so build_feature_row sees the same bar
+            semantics as the scan, and touch_index (computed inside _predict from the fresh 4H frame)
+        Formation-time properties (strength, confluence, touch_count) are kept as stored.
+        Scoring geometry is deliberately the scan's (entry at proximal edge, zone-based SL), NOT the
+        recomputed trade levels, so the model sees the same geometry it was trained on.
+
+        Fail-safe: returns {'ok': False, 'reason': ...} on ANY problem; callers keep the proposal score.
+        """
+        out: Dict = {'ok': False, 'reason': None}
+        ctx = sig.get('rescore_ctx')
+        if not ctx:
+            out['reason'] = 'no_rescore_ctx'
+            return out
+        try:
+            tf, kind   = ctx['tf'], ctx['kind']
+            zone       = dict(ctx['zone'])
+            direction  = sig.get('direction')
+            formation  = pd.Timestamp(ctx['formation_time'])
+
+            def _closed(frame, minutes):
+                if frame is None or len(frame) == 0:
+                    return frame
+                keep = (pd.to_datetime(frame['time']) + timedelta(minutes=minutes) <= now_broker).values
+                return frame[keep].reset_index(drop=True)
+
+            # Same frames / sizes the scan uses (generate_signals), so shared caches are hit live.
+            df_tf  = self.fetch_bars(interval=tf, outputsize=200)
+            df_15m = _closed(self.fetch_bars(interval="15min", outputsize=700), 15)
+            df_5m  = _closed(self.fetch_bars(interval="5min",  outputsize=60), 5)
+            df_1h  = self.fetch_bars(interval="1h",   outputsize=100)
+            df_d1  = self.fetch_bars(interval="1day", outputsize=90)
+            if df_d1 is not None and len(df_d1) > 0 and 'time' in df_d1.columns:
+                _today = pd.Timestamp(now_broker.date())
+                df_d1 = df_d1[pd.to_datetime(df_d1['time']).dt.normalize() < _today].copy()
+                if len(df_d1) == 0:
+                    df_d1 = None
+
+            if df_tf is None or len(df_tf) < 50:
+                out['reason'] = 'no_tf_bars'; return out
+            if df_15m is None or len(df_15m) < 5:
+                out['reason'] = 'no_15m_bars'; return out
+
+            # Re-derive the zone index exactly as the scan derived it.
+            if kind == 'OB':
+                _matched = (pd.to_datetime(df_15m['time']) <= formation).values
+                if not _matched.any():
+                    out['reason'] = 'formation_out_of_15m_window'; return out
+                zone['index'] = int(_matched.nonzero()[0][-1])
+            else:
+                _times = pd.to_datetime(df_tf['time'])
+                _pos = int(_times.searchsorted(formation))
+                if _pos >= len(_times) or _times.iloc[_pos] != formation:
+                    out['reason'] = 'formation_out_of_tf_window'; return out
+                zone['index'] = _pos
+
+            top, bot  = zone['price_high'], zone['price_low']
+            refreshed = ['index']
+            if 'approach_distance' in zone:
+                zone.update(self._get_15min_approach(top, bot, direction, df_15m))
+                refreshed += ['approach_distance', 'approach_momentum', 'candle_body_ratio']
+            if 'm5_micro_bos' in zone:
+                zone.update(self._check_5min_entry(top, bot, direction, df_5m))
+                refreshed += ['m5_micro_bos', 'm5_sweep_confirmation', 'm5_entry_candle_quality']
+            if 'h1_trend_alignment' in zone:
+                _h1 = self._check_1h_confluence(top, bot, direction, df_1h)
+                for _k in ('h1_trend_alignment', 'h1_structure_shift', 'h1_displacement', 'h1_liquidity_sweep'):
+                    zone[_k] = _h1[_k]
+                refreshed += ['h1_trend_alignment', 'h1_structure_shift', 'h1_displacement', 'h1_liquidity_sweep']
+            if 'htf_alignment' in zone:
+                zone['htf_alignment'] = self._check_d1_alignment(direction, df_d1)
+                refreshed.append('htf_alignment')
+
+            prob = float(self._ml_score_htf_zone(
+                zone, df_tf, tf, htf_context=None, zone_override=zone,
+                df_4h=df_tf, df_1h=df_1h, df_5m=df_5m, df_d1=df_d1))
+            out.update({
+                'ok': True, 'prob': prob, 'prob_pct': round(prob * 100, 1),
+                'prob_at_proposal_pct': round(float(ctx.get('prob_at_proposal', float('nan'))) * 100, 1),
+                'refreshed': refreshed,
+                # _predict returns exactly 0.5 when feature building fails; flag it rather than trust it.
+                'suspect_default_prob': bool(abs(prob - 0.5) < 1e-12),
+            })
+            return out
+        except Exception as e:
+            out['reason'] = f'error: {e}'
+            logger.warning(f"rescore_at_arrival failed for {sig.get('symbol')}: {e}")
+            return out
+
+    def apply_boost_ceiling(self, base: float, boost: float) -> float:
+        return min(base, 0.95)
+
+    def _find_swing_points(self, df: pd.DataFrame, lookback: int, pivot_width: int = 2) -> Tuple[List[float], List[float]]:
+        """
+        Real pivot detection: a bar's low is a swing low only if it's lower
+        than `pivot_width` bars on both sides (and likewise for highs).
+        Excludes the last `pivot_width` bars since they can't be confirmed
+        yet (no future bars to compare against).
+        Returns (swing_lows, swing_highs).
+        """
+        window = df.tail(lookback).reset_index(drop=True)
+        n = len(window)
+        swing_lows, swing_highs = [], []
+        for i in range(pivot_width, n - pivot_width):
+            lo = window['low'].iloc[i]
+            hi = window['high'].iloc[i]
+            left_lows   = window['low'].iloc[i - pivot_width:i]
+            right_lows  = window['low'].iloc[i + 1:i + 1 + pivot_width]
+            left_highs  = window['high'].iloc[i - pivot_width:i]
+            right_highs = window['high'].iloc[i + 1:i + 1 + pivot_width]
+            if lo < left_lows.min() and lo < right_lows.min():
+                swing_lows.append(lo)
+            if hi > left_highs.max() and hi > right_highs.max():
+                swing_highs.append(hi)
+        return swing_lows, swing_highs
+
+    def _calculate_dynamic_tp(self, direction: str, entry: float, zone_type: str,
+                              zone_size: float, zone_strength: float,
+                              htf_context: Optional[Dict], df: pd.DataFrame,
+                              fib_levels: Optional[Dict] = None) -> Tuple[float, float, Optional[str]]:
+        """
+        Mechanically calculates pair- and trade-specific Take-Profit target based on:
+          1. Pair baseline expansion profile (USD/JPY: 1.45, GBP/USD: 1.40, XAU/USD: 1.35, EUR/USD: 1.25)
+          2. HTF (D1 + 4H) trend alignment modifier (+0.20 if aligned, -0.15 if opposing)
+          3. Zone displacement strength modifier (+0.15 if strong, -0.10 if weak)
+          4. Opposing HTF structural clamping via _clamp_tp_to_structure
+        
+        Returns (clamped_tp, applied_multiplier, clamp_reason).
+        """
+        pair_baselines = {
+            'USD/JPY': 1.45,
+            'GBP/USD': 1.35,
+            'XAU/USD': 1.20,
+            'EUR/USD': 1.20,
+        }
+        m_pair = pair_baselines.get(self.symbol, 1.25)
+
+        d1_trend = 'neutral'
+        h4_trend = 'neutral'
+        if htf_context:
+            d1_trend = htf_context.get('d1_ema_trend', htf_context.get('d1_trend', 'neutral'))
+            h4_trend = htf_context.get('h4_structure', {}).get('trend', htf_context.get('htf_trend', 'neutral'))
+
+        is_buy = (direction == 'BUY')
+        d1_align = (d1_trend == 'bullish') if is_buy else (d1_trend == 'bearish')
+        h4_align = (h4_trend == 'bullish') if is_buy else (h4_trend == 'bearish')
+        d1_oppose = (d1_trend == 'bearish') if is_buy else (d1_trend == 'bullish')
+        h4_oppose = (h4_trend == 'bearish') if is_buy else (h4_trend == 'bullish')
+
+        if d1_align and h4_align:
+            delta_htf = 0.08
+        elif d1_oppose or h4_oppose:
+            delta_htf = -0.08
+        else:
+            delta_htf = 0.00
+
+        if zone_type == 'OB':
+            delta_str = 0.07 if zone_strength >= 3.5 else (-0.05 if zone_strength < 1.5 else 0.0)
+            base_multiplier = 1.5  # Standard OB baseline
+        else:  # FVG
+            delta_str = 0.07 if zone_strength >= 1.0 else (-0.05 if zone_strength < 0.7 else 0.0)
+            base_multiplier = 2.0  # Standard FVG baseline
+
+        m_total = max(1.0, round(m_pair + delta_htf + delta_str, 2))
+        effective_scale = base_multiplier * m_total
+
+        if is_buy:
+            tp_raw = entry + (zone_size * effective_scale)
+            if fib_levels and '0.5' in fib_levels:
+                tp_raw = max(fib_levels['0.5'], tp_raw)
+        else:
+            tp_raw = entry - (zone_size * effective_scale)
+            if fib_levels and '0.5' in fib_levels:
+                tp_raw = min(fib_levels['0.5'], tp_raw)
+
+        tp_clamped, clamp_reason = self._clamp_tp_to_structure(direction, entry, tp_raw, df, htf_context)
+        return tp_clamped, m_total, clamp_reason
+
+    def _clamp_tp_to_structure(self, direction: str, entry: float, tp_raw: float,
+                                df: pd.DataFrame, htf_context: Optional[Dict],
+                                swing_lookback: int = 30) -> Tuple[float, Optional[str]]:
+        """
+        Structure-aware TP clamp. tp_raw (from the reaction_size/fvg_size
+        multiplier) is a pure measured-move projection — it has no idea
+        whether a real opposing zone or swing point sits in the way.
+        This scans for the nearest such obstacle between entry and tp_raw
+        and pulls TP back to just short of it if one exists.
+
+        Candidates closer than `min_obstacle_dist` are ignored — a level a
+        few pips from entry isn't real structure, it's noise, and clamping
+        to it would gut the trade's RR to near zero.
+
+        Returns (clamped_tp, reason). reason is None if tp_raw was left
+        untouched (no meaningful obstacle found in the path).
+        """
+        atr = df['atr'].iloc[-1] if 'atr' in df.columns and not pd.isna(df['atr'].iloc[-1]) else self.pip_size * 15
+        # Roughly the minimum reward the RR floor would require anyway
+        # (risk floor ≈ 2.5×ATR, MIN_HTF_RR ≈ 1.2 → reward ≈ 3×ATR).
+        # Anything closer than this isn't a meaningful obstacle to clamp to.
+        min_obstacle_dist = atr * 3.0
+
+        candidates: List[float] = []
+
+        # 1) Opposing HTF zones (FVGs/OBs) whose near edge sits between
+        #    entry and tp_raw, and is far enough away to be real structure.
+        if htf_context:
+            all_zones = (htf_context.get('h1_fvgs', []) + htf_context.get('h4_fvgs', []) +
+                         htf_context.get('h1_order_blocks', []) + htf_context.get('h4_order_blocks', []))
+            opposing_type = 'bullish' if direction == 'SELL' else 'bearish'
+            for z in all_zones:
+                if z.get('type') != opposing_type:
+                    continue
+                near_edge = z.get('top') if direction == 'SELL' else z.get('bottom')
+                if near_edge is None:
+                    continue
+                if abs(near_edge - entry) < min_obstacle_dist:
+                    continue
+                if direction == 'SELL' and tp_raw < near_edge < entry:
+                    candidates.append(near_edge)
+                elif direction == 'BUY' and entry < near_edge < tp_raw:
+                    candidates.append(near_edge)
+
+        # 2) Real swing pivots (not just a rolling window min/max) in the
+        #    same path — catches obstacles the zone detectors missed.
+        try:
+            swing_lows, swing_highs = self._find_swing_points(df, swing_lookback)
+            if direction == 'SELL':
+                for sl in swing_lows:
+                    if tp_raw < sl < entry and abs(sl - entry) >= min_obstacle_dist:
+                        candidates.append(sl)
+            else:
+                for sh in swing_highs:
+                    if entry < sh < tp_raw and abs(sh - entry) >= min_obstacle_dist:
+                        candidates.append(sh)
+        except Exception:
+            pass
+
+        if not candidates:
+            return tp_raw, None
+
+        # Take the nearest obstacle (most conservative), leave a small buffer
+        # so TP sits just short of it rather than exactly on it.
+        buffer = atr * 0.15
+        if direction == 'SELL':
+            nearest = max(candidates)          # closest to entry = highest of the below-entry candidates
+            clamped = nearest + buffer
+        else:
+            nearest = min(candidates)          # closest to entry = lowest of the above-entry candidates
+            clamped = nearest - buffer
+
+        return clamped, f"clamped to nearest opposing structure at {nearest:.5f}"
+
+
+    #   tf_source:    4h_1h_confluence=5190 (90%),  4h=561 (10%),  15min=0
+    #   zone_sources: order_block=96%,  fvg=4%
+    # The old 15min demand/supply zone pipeline is SECONDARY — the model was
+    # never trained on raw 15min zones and scores them unreliably.
+
+    def _get_d1_trend_ema(self, df_d1) -> str:
+        """
+        Returns 'bullish', 'bearish', or 'neutral' from D1 close EMA20 vs EMA50.
+
+        This is the SAME calculation the model was actually trained on
+        (label_generator.calculate_htf_trend_alignment / smc_detector.
+        SMCDetector.get_d1_trend) — NOT the swing/structure-based
+        detect_market_structure_shift() trend that daily_structure['trend']
+        holds. Use this (not daily_structure) anywhere the intent is "D1 bias
+        as the model understands it" — e.g. the live hard-bias gate — so the
+        gate and the model's own probability score are reasoning about the
+        same D1 signal instead of two different, sometimes-disagreeing ones.
+
+        Requires >= 50 closed D1 bars, else 'neutral' (matches
+        _check_d1_alignment / get_d1_trend exactly).
+        """
+        if df_d1 is None or len(df_d1) < 50:
+            return 'neutral'
+        try:
+            ema20 = float(df_d1['close'].ewm(span=20, adjust=False).mean().iloc[-1])
+            ema50 = float(df_d1['close'].ewm(span=50, adjust=False).mean().iloc[-1])
+        except Exception:
+            return 'neutral'
+        if ema20 > ema50:
+            return 'bullish'
+        elif ema20 < ema50:
+            return 'bearish'
+        return 'neutral'
+
+    def _check_d1_alignment(self, direction: str, df_d1) -> int:
+        """
+        Returns 1 if the D1 EMA20/50 trend aligns with the zone direction,
+        else 0 (counter-trend OR D1 data unavailable).
+
+        Mirrors smc_detector.SMCDetector.get_d1_trend() / label_generator's
+        calculate_htf_trend_alignment() exactly, so the live htf_alignment
+        feature matches what the model was trained on:
+          - binary {0, 1}, NOT {-1, 0, 1}
+          - computed from D1 close EMA20 vs EMA50, not from H1 data
+          - requires >= 50 D1 bars, else neutral (0)
+        """
+        d1_trend = self._get_d1_trend_ema(df_d1)  # 'bullish' / 'bearish' / 'neutral'
+        if direction == 'BUY':
+            return 1 if d1_trend == 'bullish' else 0
+        else:
+            return 1 if d1_trend == 'bearish' else 0
+
+    def _check_1h_confluence(self, zone_top: float, zone_bot: float,
+                              direction: str, df_1h) -> Dict:
+        result = {
+            'h1_trend_alignment': 0,
+            'h1_structure_shift': 0,
+            'h1_displacement':    0.0,
+            'h1_liquidity_sweep': 0,
+            'confirmed':          False,
+        }
+        if df_1h is None or len(df_1h) < 20:
+            return result
+
+        try:
+            sub = df_1h.copy()
+
+            # ── 1H ATR (Wilder 14-period on true range) ───────────────────────
+            high  = sub['high']; low = sub['low']; close = sub['close']
+            tr    = pd.concat([
+                high - low,
+                (high - close.shift(1)).abs(),
+                (low  - close.shift(1)).abs(),
+            ], axis=1).max(axis=1)
+            atr_1h = float(tr.rolling(14).mean().iloc[-1])
+            if not np.isfinite(atr_1h) or atr_1h <= 0:
+                atr_1h = float(tr.mean()) or 1e-6
+
+            # ── h1_trend_alignment : {-1, 0, 1} ──────────────────────────────
+            # Training threshold: 0.0001 band around EMA crossover (1.0001 / 0.9999)
+            ema20 = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
+            ema50 = float(close.ewm(span=50, adjust=False).mean().iloc[-1])
+            if ema20 > ema50 * 1.0001:
+                raw_trend = 1       # 1H bullish
+            elif ema20 < ema50 * 0.9999:
+                raw_trend = -1      # 1H bearish
+            else:
+                raw_trend = 0       # flat / neutral
+
+            # Align to zone direction so 1=aligned, -1=counter, 0=neutral for both
+            if direction == 'BUY':
+                result['h1_trend_alignment'] = raw_trend           # demand: bullish=1
+            else:
+                result['h1_trend_alignment'] = -raw_trend          # supply: bearish=1
+
+            window       = sub.tail(30).reset_index(drop=True)
+            swing_period = 3
+            swing_highs, swing_lows = [], []
+            for i in range(swing_period, len(window) - swing_period):
+                bar = window.iloc[i]
+                if (bar['high'] > window.iloc[i - swing_period:i]['high'].max() and
+                        bar['high'] > window.iloc[i + 1:i + swing_period + 1]['high'].max()):
+                    swing_highs.append({'i': i, 'price': bar['high']})
+                if (bar['low'] < window.iloc[i - swing_period:i]['low'].min() and
+                        bar['low'] < window.iloc[i + 1:i + swing_period + 1]['low'].min()):
+                    swing_lows.append({'i': i, 'price': bar['low']})
+
+            last_close = float(window['close'].iloc[-1])
+            if swing_highs and last_close > swing_highs[-1]['price']:
+                result['h1_structure_shift'] = 1    # bullish BOS
+            elif swing_lows and last_close < swing_lows[-1]['price']:
+                result['h1_structure_shift'] = -1   # bearish BOS
+
+            # ── h1_displacement : ATR-normalised max body, last 20 bars ───────
+            # Training: max(|close-open|) / atr_1h  capped at 10.0
+            # Dimensionless ratio, ~0.5–3.0 for normal bars.
+            recent_20  = sub.tail(20)
+            body_sizes = (recent_20['close'] - recent_20['open']).abs()
+            h1_disp    = float(body_sizes.max() / atr_1h) if atr_1h > 0 else 0.0
+            result['h1_displacement'] = round(min(h1_disp, 10.0), 4)
+
+            # ── h1_liquidity_sweep : swept swing high/low + reclaim ──────────
+            # FIX (v11): v10 fixed the window/lookback but the flag was still
+            # near-constant (98.7%) — most detected sweeps were real but
+            # economically trivial. MIN_SWEEP_ATR=0.20 chosen from the
+            # measured excursion-magnitude distribution across all 4 symbols
+            # (median ~0.18-0.19×ATR) — see smc_detector.py for the full
+            # write-up. Kept in sync with that function exactly.
+            MIN_SWEEP_ATR = 0.20
+            check_window = sub.tail(60).reset_index(drop=True)
+            sp = 10
+            for i in range(sp, len(check_window)):
+                bar     = check_window.iloc[i]
+                prev_lo = check_window.iloc[max(0, i - sp):i]['low'].min()
+                prev_hi = check_window.iloc[max(0, i - sp):i]['high'].max()
+                if direction == 'BUY' and bar['low'] < prev_lo and bar['close'] > prev_lo:
+                    if (prev_lo - bar['low']) / atr_1h >= MIN_SWEEP_ATR:
+                        result['h1_liquidity_sweep'] = 1
+                        break
+                if direction == 'SELL' and bar['high'] > prev_hi and bar['close'] < prev_hi:
+                    if (bar['high'] - prev_hi) / atr_1h >= MIN_SWEEP_ATR:
+                        result['h1_liquidity_sweep'] = 1
+                        break
+
+            result['confirmed'] = bool(
+                result['h1_trend_alignment'] != 0 or result['h1_structure_shift'] != 0)
+            return result
+
+        except Exception as e:
+            logger.warning(f"_check_1h_confluence failed: {e}")
+            return result
+
+    def _check_5min_entry(self, zone_top: float, zone_bot: float,
+                           direction: str, df_5m) -> Dict:
+        result = {
+            'm5_micro_bos':            0,
+            'm5_sweep_confirmation':   0,
+            'm5_entry_candle_quality': 0.0,
+        }
+        if df_5m is None or len(df_5m) < 20:
+            return result
+
+        try:
+            import numpy as np
+            import pandas as pd
+
+            zone_type = 'demand' if direction == 'BUY' else 'supply'
+            # using df_5m.tail(20) at the TOUCH MOMENT — meaning the BOS/sweep had
+            # already happened (it was what caused the 15min signal). Live, we score
+            # inside the zone. Both features default to 0 → z=-2.5 each.
+            recent = df_5m.tail(60).reset_index(drop=True)
+
+            # ── ATR on 5M ────────────────────────────────────────────────────
+            hi = recent['high']; lo = recent['low']; cl = recent['close']
+            tr = pd.concat([
+                hi - lo,
+                (hi - cl.shift(1)).abs(),
+                (lo - cl.shift(1)).abs(),
+            ], axis=1).max(axis=1)
+            atr_5m = float(tr.rolling(7).mean().iloc[-1])
+            if not np.isfinite(atr_5m) or atr_5m <= 0:
+                atr_5m = self.pip_size * 5
+
+            # ── m5_micro_bos — swing-high/low BOS (sp=10) ────────────────────
+            # FIX 2 (v10): sp widened 3 -> 10 (see feature_builder.py for
+            # full reasoning — was near-constant at 99.7% true with sp=3).
+            sp = 10
+            for i in range(sp, len(recent) - 1):
+                bar = recent.iloc[i]
+                if zone_type == 'demand':
+                    prev_hi = recent.iloc[max(0, i - sp):i]['high'].max()
+                    if bar['close'] > prev_hi:
+                        result['m5_micro_bos'] = 1
+                        break
+                else:
+                    prev_lo = recent.iloc[max(0, i - sp):i]['low'].min()
+                    if bar['close'] < prev_lo:
+                        result['m5_micro_bos'] = 1
+                        break
+
+            # ── m5_sweep_confirmation — wick-beyond + close-back (lookback=10) ─
+            # FIX 2 (v10): lookback widened 4 -> 10, matching feature_builder.py.
+            _sweep_lb = 10
+            for i in range(_sweep_lb, len(recent)):
+                bar     = recent.iloc[i]
+                prev_lo = recent.iloc[max(0, i - _sweep_lb):i]['low'].min()
+                prev_hi = recent.iloc[max(0, i - _sweep_lb):i]['high'].max()
+                if zone_type == 'demand':
+                    if bar['low'] < prev_lo and bar['close'] > prev_lo:
+                        result['m5_sweep_confirmation'] = 1
+                        break
+                else:
+                    if bar['high'] > prev_hi and bar['close'] < prev_hi:
+                        result['m5_sweep_confirmation'] = 1
+                        break
+
+            # ── m5_entry_candle_quality — composite score on last 5 bars ─────
+            last_5 = recent.tail(5).reset_index(drop=True)
+            score  = 0.0
+            last   = last_5.iloc[-1]
+            prev   = last_5.iloc[-2] if len(last_5) >= 2 else last_5.iloc[-1]
+            body   = abs(last['close'] - last['open'])
+            rng    = last['high'] - last['low']
+
+            # 1. Engulfing
+            prev_body = abs(prev['close'] - prev['open'])
+            if body > prev_body and rng > 0:
+                score += 0.25
+
+            # 2. Displacement (body ≥ 60% of ATR)
+            if atr_5m > 0 and body / atr_5m >= 0.6:
+                score += 0.25
+
+            # 3. Strong close (top/bottom 30% of range in zone direction)
+            if rng > 0:
+                if zone_type == 'demand' and (last['close'] - last['low']) / rng >= 0.7:
+                    score += 0.25
+                elif zone_type == 'supply' and (last['high'] - last['close']) / rng >= 0.7:
+                    score += 0.25
+
+            # 4. Rejection wick (counter-directional wick > body)
+            if rng > 0 and body > 0:
+                if zone_type == 'demand':
+                    lower_wick = min(last['open'], last['close']) - last['low']
+                    if lower_wick > body:
+                        score += 0.25
+                else:
+                    upper_wick = last['high'] - max(last['open'], last['close'])
+                    if upper_wick > body:
+                        score += 0.25
+
+            result['m5_entry_candle_quality'] = round(score, 4)
+
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"_check_5min_entry failed: {e}")
+
+        return result
+
+    def _get_15min_approach(self, zone_top: float, zone_bot: float,
+                             direction: str, df_15m) -> Dict:
+        result = {
+            'approach_distance':  0.0,
+            'approach_momentum':  0.0,
+            'candle_body_ratio':  0.0,
+        }
+        if df_15m is None or len(df_15m) < 5:
+            return result
+
+        current_price = df_15m['close'].iloc[-1]
+        # where zone_edge = price_high for demand (proximal top), price_low for supply.
+        # The old code used zone_mid which gives a different value that the scaler
+        # maps to a different position in feature space.
+        if direction == 'BUY':
+            zone_edge = zone_top   # proximal edge for demand = top of zone
+        else:
+            zone_edge = zone_bot   # proximal edge for supply = bottom of zone
+        result['approach_distance'] = min(abs(current_price - zone_edge) / self.pip_size, 50.0)
+
+        if 'atr' in df_15m.columns and len(df_15m) >= 5:
+            atr = df_15m['atr'].iloc[-1]
+            if atr and atr > 0:
+                momentum = ((df_15m['close'].iloc[-1] - df_15m['close'].iloc[-5])
+                            / atr)
+                result['approach_momentum'] = round(float(momentum), 4)
+
+        last = df_15m.iloc[-1]
+        body = abs(last['close'] - last['open'])
+        wick = last['high'] - last['low']
+        result['candle_body_ratio'] = round(body / wick, 4) if wick > 0 else 0.0
+        return result
+
+    def _calculate_touch_count(self, zone: Dict, df_15m: Optional[pd.DataFrame]) -> int:
+        """
+        Mirror of label_generator.calculate_zone_touch_count().
+        Counts distinct price visits to the proximal edge within ATR/2 threshold
+        in the 500-bar window BEFORE the zone index, on 15min bars.
+        Uses 20-bar skip after each touch to avoid double-counting.
+        This matches exactly what the model was trained on.
+        """
+        if df_15m is None or len(df_15m) < 10:
+            return 1
+
+        zone_type = zone.get('type', 'demand')
+        proximal  = zone.get('price_high') if zone_type == 'demand' else zone.get('price_low')
+        if proximal is None:
+            return 1
+
+        # Use zone index if available, else last bar
+        zone_index = min(int(zone.get('index', len(df_15m) - 1)), len(df_15m) - 1)
+        lookback   = 500
+        start      = max(0, zone_index - lookback)
+        touch_count = 0
+        i = start
+
+        atr_col = 'atr' if 'atr' in df_15m.columns else None
+
+        while i < zone_index:
+            bar = df_15m.iloc[i]
+            if atr_col:
+                atr_val = float(bar[atr_col]) if pd.notna(bar[atr_col]) else self.pip_size * 10
+            else:
+                atr_val = self.pip_size * 10
+            threshold = atr_val * 0.5
+
+            if zone_type == 'demand':
+                touched = float(bar['low']) <= proximal + threshold
+            else:
+                touched = float(bar['high']) >= proximal - threshold
+
+            if touched:
+                touch_count += 1
+                i += 20   # skip to avoid double-counting same visit
+            else:
+                i += 1
+
+        return max(1, touch_count)
+
+    def htf_trade_detect(self, tf: str = "4h", htf_context: Optional[Dict] = None,
+                          df_4h:  Optional[pd.DataFrame] = None,
+                          df_15m: Optional[pd.DataFrame] = None,
+                          df_5m:  Optional[pd.DataFrame] = None,
+                          df_1h:  Optional[pd.DataFrame] = None,
+                          df_d1:  Optional[pd.DataFrame] = None) -> List[Dict]:
+        df = df_4h if df_4h is not None else self.fetch_bars(interval=tf, outputsize=200)
+        if df is None or len(df) < 50:
+            return []
+
+        # The 4H candle close is the price at the END of a 4-hour bar — often
+        # hours old. Using it caused the bias gate and dist filter to run on a
+        # frozen price. 15min bars have a 15-minute close which is always live.
+        _df_15m = df_15m if df_15m is not None else self.fetch_bars(interval="15min", outputsize=700)
+        _df_5m  = df_5m  if df_5m  is not None else self.fetch_bars(interval="5min",  outputsize=60)
+        _df_1h  = df_1h  if df_1h  is not None else self.fetch_bars(interval="1h",    outputsize=100)
+        _df_d1  = df_d1  if df_d1  is not None else self.fetch_bars(interval="1day",  outputsize=90)
+
+        # ── CLOSED-D1 GATE ────────────────────────────────────────────────────
+        # Strip the still-forming D1 candle so every D1-based calculation
+        # (h4_trend gate, _check_d1_alignment, d1_premium_discount, daily_structure)
+        # only ever sees FULLY CLOSED daily bars — matching what label_generator.py
+        # should use during training (fix applied there too in calculate_htf_trend_alignment).
+        # A D1 bar's 'time' field = its open time (00:00 UTC).
+        # The bar is only complete once the NEXT day has opened.
+        # We drop any bar whose open time == today's UTC date.
+        if _df_d1 is not None and len(_df_d1) > 0 and 'time' in _df_d1.columns:
+            _today_utc = pd.Timestamp(datetime.utcnow().date())
+            _df_d1 = _df_d1[pd.to_datetime(_df_d1['time']).dt.normalize() < _today_utc].copy()
+            if len(_df_d1) == 0:
+                _df_d1 = None  # no closed bars at all (shouldn't happen)
+        # ─────────────────────────────────────────────────────────────────────
+
+        if _df_15m is not None and len(_df_15m) > 0:
+            current_price = _df_15m['close'].iloc[-1]
+        else:
+            current_price = df['close'].iloc[-1]  # fallback only
+
+        current_atr   = df['atr'].iloc[-1]
+        fvgs          = self.htf_analyzer.detect_fvg(df, tf)
+        obs           = self.htf_analyzer.detect_order_blocks(df, tf)
+        fib_levels    = self.htf_analyzer.calculate_fibonacci_levels(df, 100)
+
+        # Derive h4_trend for the hard bias gate.
+        # Prefer a fresh detect_market_structure_shift on the passed df;
+        # fall back to whatever htf_context already holds.
+        _h4_struct = self.htf_analyzer.detect_market_structure_shift(df)
+        h4_trend   = _h4_struct.get('trend', 'neutral')
+        if h4_trend == 'neutral' and htf_context:
+            h4_trend = htf_context.get('h4_structure', {}).get('trend', 'neutral')
+
+        # ── D1 & 4H HARD BIAS AGREEMENT GATE ──────────────────────────────────
+        # Both D1 and 4H must agree (or neither can oppose the trade direction).
+        # - For BUY: Neither D1 (EMA or Structure) nor 4H can be bearish.
+        # - For SELL: Neither D1 (EMA or Structure) nor 4H can be bullish.
+        _d1_trend_structure = htf_context.get('daily_structure', {}).get('trend', 'neutral') if htf_context else 'neutral'
+        _d1_trend   = htf_context.get('d1_ema_trend', 'neutral') if htf_context else 'neutral'
+        # ─────────────────────────────────────────────────────────────────────
+
+        # D1 Premium / Discount gate calculation
+        _d1_pd = 0
+        if _df_d1 is not None and len(_df_d1) >= 20:
+            _tail60  = _df_d1.tail(60)
+            _d1_high = float(np.percentile(_tail60["high"], 95))
+            _d1_low  = float(np.percentile(_tail60["low"],   5))
+            _d1_rng  = _d1_high - _d1_low
+            _d1_pos  = (current_price - _d1_low) / _d1_rng if _d1_rng > 0 else 0.5
+            if _d1_rng > 0:
+                if _d1_pos > 0.6:
+                    _d1_pd = 1   # premium
+                elif _d1_pos < 0.4:
+                    _d1_pd = -1  # discount
+
+        htf_setups       = []
+        # Respect dynamic scan distance based on current ATR — separate
+        # distances per zone type since OBs form 2-3x ATR away by
+        # construction while FVGs sit much closer (see get_scan_distance).
+        MAX_DIST_PIPS_FVG = self.get_scan_distance(current_atr, self.symbol, zone_type="FVG")
+        MAX_DIST_PIPS_OB  = self.get_scan_distance(current_atr, self.symbol, zone_type="OB")
+        MAX_DIST_PIPS     = MAX_DIST_PIPS_FVG  # kept for any other legacy reference to this name
+        MIN_HTF_RR   = 1.2
+        MAX_HTF_RR   = 6.0 if self.symbol == 'XAU/USD' else 10.0
+        MIN_HTF_STRENGTH = 0.5  # lowered from 0.8 — 0.8 kills valid zones in low-vol sessions
+
+        if self.debug:
+            print(f"\n  🔍 HTF [{self.symbol}|{tf}] current_price={current_price:.5f} "
+                  f"ATR={current_atr:.5f}  FVGs={len(fvgs)}  OBs={len(obs)}  "
+                  f"scan_dist_fvg={MAX_DIST_PIPS_FVG:.1f}p scan_dist_ob={MAX_DIST_PIPS_OB:.1f}p")
+        htf_fvg_rejected = {'dist': 0, 'confs': 0, 'direction': 0, 'rr': 0, 'strength': 0, 'prob': 0, 'd1_pd': 0}
+        htf_ob_rejected  = {'dist': 0, 'confs': 0, 'direction': 0, 'rr': 0, 'strength': 0, 'prob': 0, 'd1_pd': 0}
+
+        # ATR tolerance for direction filter: zones whose mid is within 1 ATR of
+        # current price are still valid candidates (price is approaching them).
+        atr_tol = current_atr * 1.0
+
+        def _build_setup(zone_obj, zone_type_str, direction, entry, sl, tp_target,
+                         risk, reward, rr, base_prob, conf_str, confirmations):
+            final_prob = base_prob
+            z_top = round(zone_obj.get('top', zone_obj.get('price_high', entry)), 5)
+            z_bot = round(zone_obj.get('bottom', zone_obj.get('price_low', sl)), 5)
+
+            # Two-Stage Execution Architecture:
+            # If current price is already inside the zone, initialize as IN_ZONE; otherwise ARMED.
+            if direction == 'BUY':
+                is_in_zone = (current_price <= z_top and current_price >= z_bot - (2 * self.pip_size))
+            else:
+                is_in_zone = (current_price >= z_bot and current_price <= z_top + (2 * self.pip_size))
+            init_stage = ZoneState.IN_ZONE if is_in_zone else ZoneState.ARMED
+
+            return {
+                'timestamp':    datetime.utcnow().isoformat(),
+                'symbol':       self.symbol,
+                'timeframe':    tf,
+                'type':         zone_type_str,
+                'strategy':     'CONTINUATION' if self.is_continuation_strategy else 'REVERSION',
+                'direction':    direction,
+                'entry':        round(entry, 5),
+                'sl':           round(sl, 5),
+                'tp':           round(tp_target, 5),
+                'risk_pips':    round(risk / self.pip_size, 1),
+                'reward_pips':  round(reward / self.pip_size, 1),
+                'risk_reward':  f"1:{rr:.1f}",
+                'rr':           f"1:{rr:.1f}",
+                'probability':  round(final_prob * 100, 1),
+                'base_probability': round(base_prob * 100, 1),
+                'confluence':   conf_str,
+                'confirmations': confirmations,
+                'distance_pips': round(abs(current_price - entry) / self.pip_size, 1),
+                # FIX: 'd1_trend' now reports the EMA20/50 value that actually
+                # gates trades and matches what the model was trained on (see
+                # _hard_bias above). The old swing/structure-based value is
+                # preserved separately as 'd1_structure_trend' — it's still
+                # informative but is no longer what decides BUY/SELL blocking.
+                'd1_trend':     htf_context.get('d1_ema_trend', 'neutral') if htf_context else 'unknown',
+                'd1_structure_trend': htf_context.get('daily_structure', {}).get('trend', 'neutral') if htf_context else 'unknown',
+                'zone_strength': round(zone_obj.get('strength', 0), 2),
+                # FIX: 'htf_trend' was silently sourced from h1_trend (a 1H EMA20/50
+                # crossover) despite the name implying 4H. Point it at the real 4H
+                # structure trend so d1_trend/htf_trend alignment analysis is
+                # actually comparing D1 vs 4H, as intended. The old 1H value is
+                # preserved below under its own honest field name.
+                'htf_trend':    htf_context.get('h4_structure', {}).get('trend', 'unknown') if htf_context else 'unknown',
+                '1h_trend':     htf_context.get('h1_trend', 'unknown') if htf_context else 'unknown',
+                # Zone body boundaries — required by PriceZoneMonitor for Step 3 body check
+                'zone_top':     z_top,
+                'zone_bottom':  z_bot,
+                'zone_mid':     round((z_top + z_bot) / 2.0, 5),
+                'stage':        init_stage,
+                'status':       init_stage.lower(),
+                'sweep_extreme': round(current_price if is_in_zone else entry, 5),
+                'bars_in_zone': 1 if is_in_zone else 0,
+            }
+
+        # FVGs
+        for fvg in fvgs:
+            if abs(current_price - fvg['mid']) / self.pip_size > MAX_DIST_PIPS_FVG:
+                htf_fvg_rejected['dist'] += 1; continue
+            future = df.iloc[fvg['index'] + 1:]
+            if len(future) < 2:
+                continue
+            if fvg['type'] == 'bullish':
+                confs = sum(1 for i in range(min(5, len(future))) if future.iloc[i]['low'] >= fvg['bottom'])
+            else:
+                confs = sum(1 for i in range(min(5, len(future))) if future.iloc[i]['high'] <= fvg['top'])
+            if confs < 2:
+                htf_fvg_rejected['confs'] += 1; continue
+
+            direction = 'BUY' if fvg['type'] == 'bullish' else 'SELL'
+            # ── Entry/SL: 3/4-toward-near-edge entry, SL past the true edge ────
+            # Old logic entered at fvg['mid'] (halfway INTO the gap) with SL at
+            # the far edge. That let a bar wick through the near edge and keep
+            # going before entry was even touched — large entry_slippage_pips,
+            # and once filled that deep, large sl_overflow_pips on the way out
+            # (FVG-1.78 / FVG-1.05 / FVG-0.54 losses).
+            # A prior fix moved entry all the way to the near edge but
+            # (bug) recomputed SL as an offset from the new entry using the
+            # OLD half-gap risk number — which silently dragged SL in from the
+            # zone's real far edge to its midpoint, a level with no structural
+            # meaning. That's why win rate dropped even though slippage improved.
+            # Corrected version: entry sits 3/4 of the way from the far edge
+            # toward the near edge (meaningfully shallower than mid, without
+            # fully chasing the edge). SL stays anchored to the REAL far edge
+            # — the zone's actual invalidation point — plus a small ATR buffer
+            # so an ordinary wick past the edge doesn't stop the trade out.
+            _gap      = abs(fvg['top'] - fvg['bottom'])
+            _atr_val  = df['atr'].iloc[-1] if 'atr' in df.columns else (self.pip_size * 10)
+            is_gold   = ('XAU' in self.symbol.upper() or 'GOLD' in self.symbol.upper())
+            is_jpy    = ('JPY' in self.symbol.upper())
+            if is_gold:
+                _atr_buf = max(3.50, _atr_val * 0.35)
+                if direction == 'BUY':
+                    entry = fvg['bottom'] + 0.85 * _gap   # 85% toward near edge for Gold BUY (shallow pullback)
+                    sl    = fvg['bottom'] - _atr_buf
+                else:
+                    entry = fvg['top'] - 0.85 * _gap
+                    sl    = fvg['top'] + _atr_buf
+            elif is_jpy:
+                _atr_buf = max(4.0 * self.pip_size, _atr_val * 0.35)
+                if direction == 'BUY':
+                    entry = fvg['bottom'] + 0.75 * _gap
+                    sl    = fvg['bottom'] - _atr_buf
+                else:
+                    entry = fvg['top'] - 0.75 * _gap
+                    sl    = fvg['top'] + _atr_buf
+            else:
+                _atr_buf = max(3.0 * self.pip_size, _atr_val * 0.35)
+                if direction == 'BUY':
+                    entry = fvg['bottom'] + 0.75 * _gap   # 3/4 toward near edge (top)
+                    sl    = fvg['bottom'] - _atr_buf      # past the real far edge, wick-buffered
+                else:
+                    entry = fvg['top'] - 0.75 * _gap      # 3/4 toward near edge (bottom)
+                    sl    = fvg['top'] + _atr_buf         # past the real far edge, wick-buffered
+
+            # ── D1/4H HARD BIAS AGREEMENT BLOCK (HTF FVG) ─────────────────────
+            # BUY requires non-bearish D1 (EMA & structure) and 4H.
+            # SELL requires non-bullish D1 (EMA & structure) and 4H.
+            # Gated behind require_htf_bias_gate (default False) -- see
+            # ProductionForexPredictor.__init__ for why: no training-side
+            # counterpart, confirmed by direct search of the training files.
+            if self.require_htf_bias_gate and direction == 'SELL' and (_d1_trend == 'bullish' or _d1_trend_structure == 'bullish' or h4_trend == 'bullish'):
+                htf_fvg_rejected['direction'] += 1
+                if self.debug:
+                    print(f"     ⛔ HTF FVG HARD BLOCK: SELL blocked — D1/4H bias conflict (d1_ema={_d1_trend} d1_struct={_d1_trend_structure} h4={h4_trend})")
+                continue
+            if self.require_htf_bias_gate and direction == 'BUY' and (_d1_trend == 'bearish' or _d1_trend_structure == 'bearish' or h4_trend == 'bearish'):
+                htf_fvg_rejected['direction'] += 1
+                if self.debug:
+                    print(f"     ⛔ HTF FVG HARD BLOCK: BUY blocked — D1/4H bias conflict (d1_ema={_d1_trend} d1_struct={_d1_trend_structure} h4={h4_trend})")
+                continue
+
+            # ── D1 Premium / Discount Gate (HTF FVG) ───────────────────────────
+            if self.require_htf_bias_gate and _d1_pd == 1 and direction == 'BUY':
+                if h4_trend != 'bullish':
+                    htf_fvg_rejected['d1_pd'] += 1
+                    if self.debug:
+                        print(f"     ⛔ HTF FVG D1 PREMIUM BLOCK: BUY blocked — price in D1 premium and 4H={h4_trend}")
+                    continue
+            if self.require_htf_bias_gate and _d1_pd == -1 and direction == 'SELL':
+                if h4_trend == 'bullish':
+                    htf_fvg_rejected['d1_pd'] += 1
+                    if self.debug:
+                        print(f"     ⛔ HTF FVG D1 DISCOUNT BLOCK: SELL blocked — price in D1 discount and 4H is bullish")
+                    continue
+
+            # Bullish FVG: mid must be below current price (support below price).
+            # Bearish FVG: mid must be above current price (resistance above price).
+            # Same fix as OB direction filter — use mid + ATR tolerance.
+            if direction == 'BUY'  and fvg['mid'] > current_price + atr_tol: htf_fvg_rejected['direction'] += 1; continue
+            if direction == 'SELL' and fvg['mid'] < current_price - atr_tol: htf_fvg_rejected['direction'] += 1; continue
+
+            tp_target, _m_mult, _clamp_reason = self._calculate_dynamic_tp(
+                direction=direction,
+                entry=entry,
+                zone_type='FVG',
+                zone_size=fvg['size'],
+                zone_strength=fvg.get('strength', 0.8),
+                htf_context=htf_context,
+                df=df,
+                fib_levels=fib_levels
+            )
+            if self.debug:
+                print(f"     🎯 FVG Dynamic TP (mult={_m_mult:.2f}): {tp_target:.5f}" + (f" ({_clamp_reason})" if _clamp_reason else ""))
+
+            risk   = abs(entry - sl)
+            reward = abs(tp_target - entry)
+            rr     = reward / risk if risk > 0 else 2.0
+            if not (MIN_HTF_RR <= rr <= MAX_HTF_RR):
+                htf_fvg_rejected['rr'] += 1; continue
+            if fvg.get('strength', 0) < MIN_HTF_STRENGTH:
+                htf_fvg_rejected['strength'] += 1; continue
+
+            # FIX: previously forced 'h4_fvg_zone': True here, based on the
+            # pre-correction belief that h4_fvg_inside=1 was a positive signal
+            # the model wasn't getting enough credit for. Two things we now
+            # know make that wrong:
+            #   1) The diagnostic (train vs test groupby on the corrected,
+            #      leakage-fixed label_generator output) shows h4_fvg_inside=1
+            #      correlates with a MUCH LOWER reversion win rate, and this
+            #      holds consistently in both the train and test periods —
+            #      it's a real, generalizable pattern, not noise.
+            #   2) Structurally, a pure FVG-sourced zone can never legitimately
+            #      get h4_fvg_inside=1 in training — smc_detector.py's
+            #      fvg_overlap computation only ever applies to order_block-
+            #      sourced zones (a zone can't "confirm" itself). Forcing it
+            #      True here put every live HTF FVG signal into a feature
+            #      combination the model never actually saw in training.
+            # Leaving 'h4_fvg_zone' unset lets feature_builder's
+            # zone.get("h4_fvg_zone", False) fallback apply, matching what
+            # training actually saw for FVG-sourced zones.
+            # FIX (2026-08-18 replay audit — feature parity): previously this
+            # dict only carried direction/type/prices/strength/index, while
+            # the OB branch below computes and injects real 'confluence',
+            # 'htf_alignment', and 'touch_count'. Missing keys silently fall
+            # back to hard defaults inside feature_builder.build_feature_row
+            # (confluence=1, htf_alignment=0/neutral, touch_count=1 vs a
+            # training mean of ~11.24) regardless of the FVG's actual
+            # context — an inconsistency between how the two zone types are
+            # scored, not a deliberate modeling choice. (Note: h1_trend_
+            # alignment/h1_structure_shift/h1_displacement/h1_liquidity_sweep
+            # and the m5_* features are NOT affected by this — feature_builder
+            # already computes those live from df_1h/df_5m when absent from
+            # the zone dict, for both FVGs and OBs alike.)
+            # 'h4_fvg_zone'/'fvg_overlap' are deliberately left OFF for FVGs
+            # per the fix above this block — that one's correct as-is.
+            _fvg_real_overlap = 1
+            if htf_context:
+                _all_htf_items = (htf_context.get('h1_fvgs', []) +
+                                   htf_context.get('h4_fvgs', []) +
+                                   htf_context.get('h1_order_blocks', []) +
+                                   htf_context.get('h4_order_blocks', []))
+                _fvg_top = fvg.get('top', fvg.get('price_high', entry))
+                _fvg_bot = fvg.get('bottom', fvg.get('price_low', sl))
+                for _item in _all_htf_items:
+                    _item_bot = _item.get('bottom', _item.get('price_low', 0))
+                    _item_top = _item.get('top',    _item.get('price_high', 0))
+                    if _item_bot < _fvg_top and _item_top > _fvg_bot:
+                        _fvg_real_overlap += 1
+
+            fvg_zone_for_model = {
+                'direction':   direction,
+                'type':        'demand' if direction == 'BUY' else 'supply',
+                'price_high':  fvg.get('top',    fvg.get('price_high', entry)),
+                'price_low':   fvg.get('bottom', fvg.get('price_low',  sl)),
+                'price_mid':   fvg.get('mid',    fvg.get('price_mid',  entry)),
+                'strength':    fvg['strength'],
+                'index':       fvg.get('index', len(df) - 1),
+                'confluence':    _fvg_real_overlap,
+                'htf_alignment': self._check_d1_alignment(direction, _df_d1),
+                'touch_count':   self._calculate_touch_count(
+                                      {'type': 'demand' if direction == 'BUY' else 'supply',
+                                       'price_high': fvg.get('top', fvg.get('price_high', entry)),
+                                       'price_low':  fvg.get('bottom', fvg.get('price_low', sl)),
+                                       'index': fvg.get('index', len(df) - 1)},
+                                      _df_15m),
+            }
+            base_prob = self._ml_score_htf_zone(
+                fvg_zone_for_model, df, tf, htf_context=htf_context,
+                zone_override=fvg_zone_for_model,
+                df_4h=df, df_1h=_df_1h, df_5m=_df_5m, df_d1=_df_d1)
+            # ML probability gate: respects self.prob_threshold (default 0.60 for reversion)
+            _ml_gate = self.prob_threshold if getattr(self, 'prob_threshold', None) is not None else 0.60
+
+            if base_prob < _ml_gate:
+                if self.debug:
+                    # STRAT-TAG DEBUG FIX
+                    _stag = "CONT" if self.is_continuation_strategy else "REV "
+                    print(f"    ❌ [{self.symbol}|{_stag}] FVG prob={base_prob:.3f} < gate={_ml_gate:.2f}"
+                          f"  dir={direction}"
+                          f"  strength={fvg.get('strength', 0):.2f}"
+                          f"  idx={fvg.get('index', '?')}")
+                htf_fvg_rejected['prob'] += 1; continue
+
+            _fvg_setup = _build_setup(fvg, 'FVG', direction, entry, sl, tp_target,
+                                      risk, reward, rr, base_prob,
+                                      f"FVG-{fvg['strength']:.2f}", confs)
+            _fvg_setup['rescore_ctx'] = self._make_rescore_ctx(
+                'FVG', tf, fvg_zone_for_model, df, fvg.get('index', len(df) - 1), base_prob)
+            htf_setups.append(_fvg_setup)
+
+        # Order Blocks
+        for ob in obs:
+            if abs(current_price - ob['mid']) / self.pip_size > MAX_DIST_PIPS_OB:
+                htf_ob_rejected['dist'] += 1; continue
+            future = df.iloc[ob['index'] + 1:]
+            if len(future) < 2:
+                continue
+            if ob['type'] == 'bullish':
+                confs = sum(1 for i in range(min(5, len(future))) if future.iloc[i]['low'] >= ob['bottom'])
+            else:
+                confs = sum(1 for i in range(min(5, len(future))) if future.iloc[i]['high'] <= ob['top'])
+            if confs < 2:
+                htf_ob_rejected['confs'] += 1; continue
+
+            direction = 'BUY' if ob['type'] == 'bullish' else 'SELL'
+
+            # ── D1/4H HARD BIAS AGREEMENT BLOCK (HTF OB) ──────────────────────
+            # BUY requires non-bearish D1 (EMA & structure) and 4H.
+            # SELL requires non-bullish D1 (EMA & structure) and 4H.
+            # Gated behind require_htf_bias_gate -- see __init__.
+            if self.require_htf_bias_gate and direction == 'SELL' and (_d1_trend == 'bullish' or _d1_trend_structure == 'bullish' or h4_trend == 'bullish'):
+                htf_ob_rejected['direction'] += 1
+                if self.debug:
+                    print(f"     ⛔ HTF OB HARD BLOCK: SELL blocked — D1/4H bias conflict (d1_ema={_d1_trend} d1_struct={_d1_trend_structure} h4={h4_trend})")
+                continue
+            if self.require_htf_bias_gate and direction == 'BUY' and (_d1_trend == 'bearish' or _d1_trend_structure == 'bearish' or h4_trend == 'bearish'):
+                htf_ob_rejected['direction'] += 1
+                if self.debug:
+                    print(f"     ⛔ HTF OB HARD BLOCK: BUY blocked — D1/4H bias conflict (d1_ema={_d1_trend} d1_struct={_d1_trend_structure} h4={h4_trend})")
+                continue
+
+            # ── D1 Premium / Discount Gate (HTF OB) ────────────────────────────
+            if self.require_htf_bias_gate and _d1_pd == 1 and direction == 'BUY':
+                if h4_trend != 'bullish':
+                    htf_ob_rejected['d1_pd'] += 1
+                    if self.debug:
+                        print(f"     ⛔ HTF OB D1 PREMIUM BLOCK: BUY blocked — price in D1 premium and 4H={h4_trend}")
+                    continue
+            if self.require_htf_bias_gate and _d1_pd == -1 and direction == 'SELL':
+                if h4_trend == 'bullish':
+                    htf_ob_rejected['d1_pd'] += 1
+                    if self.debug:
+                        print(f"     ⛔ HTF OB D1 DISCOUNT BLOCK: SELL blocked — price in D1 discount and 4H is bullish")
+                    continue
+
+            _atr_val  = df['atr'].iloc[-1] if 'atr' in df.columns else (self.pip_size * 10)
+            is_gold   = ('XAU' in self.symbol.upper() or 'GOLD' in self.symbol.upper())
+            is_jpy    = ('JPY' in self.symbol.upper())
+            if is_gold:
+                _atr_buf = max(3.50, _atr_val * 0.35)
+            elif is_jpy:
+                _atr_buf = max(4.0 * self.pip_size, _atr_val * 0.35)
+            else:
+                _atr_buf = max(3.0 * self.pip_size, _atr_val * 0.35)
+            if direction == 'BUY':
+                entry = ob['top']               # proximal body edge for demand
+                sl    = ob['bottom'] - _atr_buf # distal wick + minimal ATR buffer
+            else:
+                entry = ob['bottom']            # proximal body edge for supply
+                sl    = ob['top'] + _atr_buf    # distal wick + minimal ATR buffer
+
+            # Direction filter uses ob['mid'] — correctly identifies zone side
+            # relative to price without being confused by the candle wick
+            if direction == 'BUY'  and ob['mid'] > current_price + atr_tol: htf_ob_rejected['direction'] += 1; continue
+            if direction == 'SELL' and ob['mid'] < current_price - atr_tol: htf_ob_rejected['direction'] += 1; continue
+
+            tp_raw, _m_mult, _clamp_reason = self._calculate_dynamic_tp(
+                direction=direction,
+                entry=entry,
+                zone_type='OB',
+                zone_size=ob['reaction_size'],
+                zone_strength=ob.get('strength', 2.0),
+                htf_context=htf_context,
+                df=df
+            )
+            if self.debug:
+                print(f"     🎯 OB Dynamic TP (mult={_m_mult:.2f}): {tp_raw:.5f}" + (f" ({_clamp_reason})" if _clamp_reason else ""))
+
+            # For non-Gold pairs, clamp TP so RR never exceeds MAX_HTF_RR ceiling
+            # Gold is untouched — its reaction_size already produces valid RR naturally
+            if self.symbol != 'XAU/USD' and abs(entry - sl) > 0:
+                max_reward = abs(entry - sl) * MAX_HTF_RR * 0.95   # 5% buffer under ceiling
+                if direction == 'BUY':
+                    tp_target = min(tp_raw, entry + max_reward)
+                else:
+                    tp_target = max(tp_raw, entry - max_reward)
+            else:
+                tp_target = tp_raw
+
+            risk   = abs(entry - sl)
+            reward = abs(tp_target - entry)
+            rr     = reward / risk if risk > 0 else 1.5
+
+            if not (MIN_HTF_RR <= rr <= MAX_HTF_RR):
+                htf_ob_rejected['rr'] += 1; continue
+            if ob.get('strength', 0) < MIN_HTF_STRENGTH:
+                htf_ob_rejected['strength'] += 1; continue
+
+            # ── Step 2: 1H confluence (90% of training required 4H+1H) ───────
+            h1_conf = self._check_1h_confluence(ob['top'], ob['bottom'], direction, _df_1h)
+            # Only hard-reject if 1H trend is CONFIRMED OPPOSITE (not merely neutral/flat).
+            # trend_alignment=0 + structure_shift=0 in a quiet session = neutral, not opposing.
+            # We still pass the h1 features to the model — it will discount them appropriately.
+            h1_trend_str = htf_context.get('h1_trend', 'neutral') if htf_context else 'neutral'
+            if self.debug and not h1_conf['confirmed']:
+                print(f"     ℹ️  OB passing with neutral 1H (trend={h1_conf['h1_trend_alignment']} "
+                      f"struct={h1_conf['h1_structure_shift']}) — letting model decide")
+
+            # ── Step 3: 15min approach features ──────────────────────────────
+            approach = self._get_15min_approach(ob['top'], ob['bottom'], direction, _df_15m)
+
+            m5_conf      = self._check_5min_entry(ob['top'], ob['bottom'], direction, _df_5m)
+            # 5M hard gate REMOVED — training labeled every zone touch regardless
+            # of 5M state. m5_micro_bos / m5_sweep_confirmation flow to the model
+            # as soft features; the 0.65 probability threshold does the filtering.
+
+            # ── Step 5: Build full zone dict matching training schema exactly ─
+            # Injects pre-computed MTF features so build_feature_row receives
+            # training-compatible values (not recomputed from wrong TF bars).
+            real_overlap = 1
+            fvg_overlap_flag = False   # FIX A: track whether this OB overlaps any 4H FVG
+            if htf_context:
+                all_htf_items = (htf_context.get('h1_fvgs', []) +
+                                 htf_context.get('h4_fvgs', []) +
+                                 htf_context.get('h1_order_blocks', []) +
+                                 htf_context.get('h4_order_blocks', []))
+                h4_fvgs_only  = htf_context.get('h4_fvgs', [])
+                for item in all_htf_items:
+                    item_bot = item.get('bottom', item.get('price_low', 0))
+                    item_top = item.get('top',    item.get('price_high', 0))
+                    if item_bot < ob['top'] and item_top > ob['bottom']:
+                        real_overlap += 1
+                # Check specifically against 4H FVGs for fvg_overlap
+                for fvg_item in h4_fvgs_only:
+                    fb = fvg_item.get('bottom', fvg_item.get('price_low', 0))
+                    ft = fvg_item.get('top',    fvg_item.get('price_high', 0))
+                    if fb < ob['top'] and ft > ob['bottom']:
+                        fvg_overlap_flag = True
+                        break
+            # Convert 4H OB index → 15min bar index via timestamp matching.
+            # ob['index'] is a position in the 4H df. build_feature_row uses
+            # zone['index'] to look up ema_trend/rsi/distance_from_ema20 from
+            # the 15min df. Without conversion, 4H index=150 maps to 15min bar
+            # 150 = only ~37 hours into data — completely wrong formation bar.
+            _ob_15m_index = len(_df_15m) - 1 if _df_15m is not None else len(df) - 1
+            if _df_15m is not None and 'time' in df.columns and 'time' in _df_15m.columns:
+                try:
+                    _ob_4h_time = df['time'].iloc[ob.get('index', len(df) - 1)]
+                    _matched = (_df_15m['time'] <= _ob_4h_time)
+                    if _matched.any():
+                        _ob_15m_index = int(_matched.values.nonzero()[0][-1])
+                except Exception:
+                    pass
+            full_ob_zone = {
+                'type':                    'demand' if direction == 'BUY' else 'supply',
+                'price_high':              ob['top'],
+                'price_low':               ob['bottom'],
+                'price_mid':               ob['mid'],
+                'strength':                ob.get('strength', 1.0),
+                'confluence':              real_overlap,
+                'index':                   _ob_15m_index,  # converted: 4H index → 15min index
+                'htf_alignment':           self._check_d1_alignment(direction, _df_d1),
+                # 1H features — zone-aligned values from _check_1h_confluence()
+                # (h1_trend_alignment is already direction-flipped; do not flip again)
+                'h1_trend_alignment':      h1_conf['h1_trend_alignment'],
+                'h1_structure_shift':      h1_conf['h1_structure_shift'],
+                'h1_displacement':         h1_conf['h1_displacement'],
+                'h1_liquidity_sweep':      h1_conf['h1_liquidity_sweep'],
+                # 5min entry trigger features
+                'm5_micro_bos':            m5_conf['m5_micro_bos'],
+                'm5_sweep_confirmation':   m5_conf['m5_sweep_confirmation'],
+                'm5_entry_candle_quality': m5_conf['m5_entry_candle_quality'],
+                # 15min approach features
+                'approach_distance':       approach['approach_distance'],
+                'approach_momentum':       approach['approach_momentum'],
+                'candle_body_ratio':       approach['candle_body_ratio'],
+                'tf_source':               tf,
+                # low <= z_high AND high >= z_low (price entered zone range at all).
+                # The old criterion used close strictly inside the OB box, which gives
+                # 0–3 for a fresh OB. Training mean=11.24, so value=1 → z=-1.80.
+                # Also use tail(200) (all available 4H bars) not tail(50) to match the
+                # historical depth that produced mean=11.24.
+                'touch_count':             self._calculate_touch_count(
+                                               {'type': 'demand' if direction == 'BUY' else 'supply',
+                                                'price_high': ob['top'], 'price_low': ob['bottom'],
+                                                'index': _ob_15m_index},
+                                               _df_15m),
+                # when this OB's price range intersects a 4H FVG — matching training
+                # where any zone inside a 4H FVG was labeled with h4_fvg_inside=1.
+                'fvg_overlap':             fvg_overlap_flag,
+            }
+             # ── TRAIN/LIVE PARITY: skip zones outside the training range ──────
+            # label_generator.py drops every training row with zone_touch_count
+            # > MAX_TOUCH_COUNT (20) — the model has ZERO examples above that.
+            # Scoring these live forces XGB/RF/LR to extrapolate independently
+            # past their training boundary, which is why they disagree wildly
+            # here specifically (see disagreement_std spikes on touch=21-25
+            # zones in the live logs).
+            _MAX_TOUCH_COUNT = 1000000   # touch filter DISABLED (was 20) - keep equal to label_generator
+            if full_ob_zone['touch_count'] > _MAX_TOUCH_COUNT:
+                htf_ob_rejected['strength'] += 1  # reuse existing counter bucket
+                if self.debug:
+                    print(f"    ⛔ OB skipped — touch_count={full_ob_zone['touch_count']} "
+                          f"> {_MAX_TOUCH_COUNT} (outside training range, exhausted zone)")
+                continue
+               
+            base_prob = self._ml_score_htf_zone(
+                {'direction': direction, 'strength': ob['strength'],
+                 'index': ob.get('index', len(df) - 1),
+                 'mid': ob['mid'], 'top': ob['top'], 'bottom': ob['bottom']},
+                df, tf, htf_context=htf_context, zone_override=full_ob_zone,
+                df_4h=df, df_1h=_df_1h, df_5m=_df_5m, df_d1=_df_d1)
+            # ML probability gate: respects self.prob_threshold (default 0.60 for reversion)
+            _ml_gate = self.prob_threshold if getattr(self, 'prob_threshold', None) is not None else 0.60
+
+            if base_prob < _ml_gate:
+                if self.debug:
+                    # STRAT-TAG DEBUG FIX
+                    _stag = "CONT" if self.is_continuation_strategy else "REV "
+                    print(f"    ❌ [{self.symbol}|{_stag}] OB  prob={base_prob:.3f} < gate={_ml_gate:.2f}"
+                          f"  dir={direction}"
+                          f"  strength={ob.get('strength', 0):.2f}"
+                          f"  idx={ob.get('index', '?')}"
+                          f"  mid={ob.get('mid', 0):.5f}")
+                htf_ob_rejected['prob'] += 1; continue
+
+            conf_label = (f"OB-{ob['strength']:.2f} "
+                          f"1H={'✅' if h1_conf['confirmed'] else '❌'} "
+                          f"5m={'✅' if m5_conf['m5_micro_bos'] else '⏳'}")
+            _ob_setup = _build_setup(ob, 'OB', direction, entry, sl, tp_target,
+                                     risk, reward, rr, base_prob,
+                                     conf_label, confs)
+            _ob_setup['rescore_ctx'] = self._make_rescore_ctx(
+                'OB', tf, full_ob_zone, df, ob.get('index', len(df) - 1), base_prob)
+            htf_setups.append(_ob_setup)
+
+        if self.debug:
+            _stag = "CONT" if self.is_continuation_strategy else "REV "
+            print(f"         [{self.symbol}|{_stag}] FVG rejects → {htf_fvg_rejected}")
+            print(f"         [{self.symbol}|{_stag}] OB  rejects → {htf_ob_rejected}")
+            print(f"         [{self.symbol}|{_stag}] HTF passing before bias filter: {len(htf_setups)}")
+
+        if htf_context:
+            h1 = htf_context.get('h1_trend', 'neutral')
+            if h1 == 'bullish':
+                # Only keep BUY setups where the zone entry is below current price
+                htf_setups = [s for s in htf_setups
+                              if s['direction'] == 'BUY' and s['entry'] < current_price]
+            elif h1 == 'bearish':
+                # Only keep SELL setups where the zone entry is above current price
+                htf_setups = [s for s in htf_setups
+                              if s['direction'] == 'SELL' and s['entry'] > current_price]
+
+        if self.debug:
+            print(f"         HTF after bias filter: {len(htf_setups)}")
+
+        return htf_setups
+
+
+    def generate_signals(self) -> Dict:
+        self.stats['total_iterations'] += 1
+
+        _bars: Dict[str, Optional[pd.DataFrame]] = {
+            '15min/200': self.fetch_bars(interval="15min", outputsize=700),
+            '1h/100':    self.fetch_bars(interval="1h",    outputsize=100),
+            '4h/200':    self.fetch_bars(interval="4h",    outputsize=200),
+            '4h/100':    self.fetch_bars(interval="4h",    outputsize=100),
+            '5min/60':   self.fetch_bars(interval="5min",  outputsize=60),
+            '1day/90':   self.fetch_bars(interval="1day",  outputsize=90),
+        }
+
+        # FIX: drop today's still-forming D1 candle at the source, once, so
+        # every consumer of _bars['1day/90'] downstream (get_htf_context,
+        # htf_trade_detect's own D1 fetch fallback, predict_with_proper_
+        # features → the model's d1_premium_discount/htf_trend_alignment/
+        # d1_ema_distance features, and the D1 premium/discount hard gate)
+        # sees the same closed-bar-only D1 data. Previously only some of
+        # these paths applied their own closed-bar filter (get_htf_context,
+        # htf_trade_detect did; predict_with_proper_features's feature calls
+        # and the main-path premium/discount gate did not) — meaning the
+        # model's live D1 features could include a partial, still-forming
+        # day that never exists in the historical/training data (every bar
+        # in a stored historical dataset is, by definition, already closed).
+        # That's a live/train distribution mismatch on top of being simply
+        # inconsistent within the live pipeline itself.
+        _df_1d_raw = _bars['1day/90']
+        if _df_1d_raw is not None and len(_df_1d_raw) > 0 and 'time' in _df_1d_raw.columns:
+            _today_utc0 = pd.Timestamp(datetime.utcnow().date())
+            _df_1d_closed = _df_1d_raw[pd.to_datetime(_df_1d_raw['time']).dt.normalize() < _today_utc0].copy()
+            _bars['1day/90'] = _df_1d_closed if len(_df_1d_closed) > 0 else None
+
+        df = _bars['15min/200']
+        if df is None or len(df) < 50:
+            strat = "CONT" if self.is_continuation_strategy else "REV "
+            bars  = len(df) if df is not None else 0
+            print(f"  ❌ [{self.symbol}|{strat}] 15min fetch returned {bars} bars (need ≥50) — skipping cycle")
+            return {'15min_signals': [], 'htf_signals': [], 'stats': {}}
+
+        current_price = df['close'].iloc[-1]
+        current_atr   = df['atr'].iloc[-1]
+        current_time  = datetime.utcnow()
+
+        # Update zone tracker distance threshold dynamically based on 4H ATR
+        df_4h = _bars['4h/200']
+        if df_4h is not None and len(df_4h) > 0 and 'atr' in df_4h.columns:
+            h4_atr = df_4h['atr'].iloc[-1]
+        else:
+            h4_atr = current_atr * 4  # fallback: scale 15m ATR
+            
+        # Feed zone_tracker with the maximum zone scan distance (OB multiplier)
+        # so active Order Blocks waiting for retracement are not prematurely purged.
+        dynamic_dist = self.get_scan_distance(h4_atr, self.symbol, zone_type="OB")
+        self.zone_tracker.distance_threshold_pips = dynamic_dist
+
+        expired_count = self.zone_tracker.cleanup_expired(current_time, current_price)
+        htf_context   = self.get_htf_context(
+            df_1h   = _bars['1h/100'],
+            df_4h_c = _bars['4h/100'],
+            df_4h   = _bars['4h/200'],
+            df_1d   = _bars['1day/90'],
+        )
+
+        htf_raw = self.htf_trade_detect("4h", htf_context=htf_context,
+                                          df_4h  = _bars['4h/200'],
+                                          df_15m = _bars['15min/200'],
+                                          df_5m  = _bars['5min/60'],
+                                          df_1h  = _bars['1h/100'],
+                                          df_d1  = _bars['1day/90'])
+        if self.debug:
+            print(f"     [HTF] 4H OB signals before prob filter: {len(htf_raw)}")
+        # here with zero output — causing the "1 before filter, 0 after" mystery in USD/JPY.
+        htf_prob_filtered = []
+        for _s in htf_raw:
+            _p = float(_s.get('probability', 0))
+            if _p >= self.prob_threshold * 100:
+                htf_prob_filtered.append(_s)
+            elif self.debug:
+                print(f"     ⛔ HTF prob filter dropped: {_s.get('direction')} "
+                      f"{_s.get('type')} @ {_s.get('entry')} "
+                      f"prob={_p:.1f}% < threshold={self.prob_threshold * 100:.1f}%")
+
+        # ── Load open trades for open-trade guard ────────────────────────────
+        # Covers BOTH triggered (open position) and pending (untriggered,
+        # still-watched) signals — without the pending half, tightening the
+        # signal-ID bucket (needed to stop a real dedup bug) could let
+        # several near-identical pending signals stack up in the same area
+        # before any of them ever triggers.
+        _open_trades: List[Dict] = []
+        _signals_path = Path("signals/all_signals.json")
+        if _signals_path.exists():
+            try:
+                with open(_signals_path) as _f:
+                    _all = json.load(_f)
+                    _open_trades = [
+                        _s for _s in _all
+                        if _s.get('symbol') == self.symbol
+                        and _s.get('status') in ('triggered', 'pending')
+                    ]
+            except Exception as _e:
+                logger.warning(f"open-trade guard: could not read signals — {_e}")
+        # ─────────────────────────────────────────────────────────────────────
+
+        # Deduplicate HTF
+        htf_signals = []
+        for s in htf_prob_filtered:
+            sig_key  = (f"{s.get('timeframe')}|{s.get('direction')}|"
+                        f"{s.get('entry'):.5f}|{s.get('sl'):.5f}")
+
+            # ── OPEN-TRADE GUARD ─────────────────────────────────────────────
+            # Block re-firing if a triggered (open) trade already exists on
+            # this symbol+direction within 2×ATR. Prevents doubling exposure
+            # on the same zone after TTL expiry from the zone tracker.
+            _entry_candidate = s.get('entry', 0)
+            _dir_candidate   = s.get('direction')
+            _guard_hit = False
+            for _ot in _open_trades:
+                if _ot.get('direction') != _dir_candidate:
+                    continue
+                _dist = abs(float(_ot.get('entry', 0)) - _entry_candidate) / self.pip_size
+                if _dist < current_atr / self.pip_size * 2:
+                    _guard_hit = True
+                    if self.debug:
+                        print(f"     ⛔ OPEN-TRADE GUARD: {_dir_candidate} @ {_entry_candidate:.5f} "
+                              f"blocked — {_ot.get('status')} signal exists @ {_ot.get('entry')} "
+                              f"(dist={_dist:.1f}p, status={_ot.get('status')})")
+                    break
+            if _guard_hit:
+                self.stats['total_duplicates'] += 1
+                continue
+            # ────────────────────────────────────────────────────────────────
+
+            is_dup, _ = self.zone_tracker.is_duplicate(sig_key, current_time, current_price)
+            # FIX #5: zone_tracker.is_duplicate() keys on exact entry/sl (5dp),
+            # so two near-identical zones a fraction of a pip apart (e.g. the
+            # observed EUR/USD pair firing one second apart on 2026-07-27 with
+            # entries 0.00016 apart) both pass as "different" zones. Add a
+            # proximity-bucketed cooldown check as a second layer.
+            if not is_dup and self._is_duplicate_zone_signal(
+                    self.symbol, s.get('direction'), s.get('entry', 0)):
+                is_dup = True
+            if not is_dup:
+                self.zone_tracker.add_zone(sig_key, {
+                    'price_mid': s.get('entry'),
+                    'type': 'demand' if s.get('direction') == 'BUY' else 'supply'
+                })
+                htf_signals.append(s)
+            else:
+                self.stats['total_duplicates'] += 1
+
+        # Conflict suppressor
+        def _suppress_conflicts(signals, cur_atr, h1_trend, pip_size):
+            min_sep = cur_atr / pip_size
+            buys    = [s for s in signals if s['direction'] == 'BUY']
+            sells   = [s for s in signals if s['direction'] == 'SELL']
+            remove  = set()
+            for b in buys:
+                for s in sells:
+                    if abs(b['entry'] - s['entry']) / pip_size < min_sep:
+                        if h1_trend == 'bullish':   remove.add(id(s))
+                        elif h1_trend == 'bearish': remove.add(id(b))
+                        else:                       remove.add(id(b)); remove.add(id(s))
+            return [s for s in signals if id(s) not in remove]
+
+        htf_signals = _suppress_conflicts(
+            htf_signals, current_atr, htf_context.get('h1_trend', 'neutral'), self.pip_size)
+
+        zones_raw = self._detect_zones_with_validation(df, htf_context)
+        zones     = self._htf_direction_filter(zones_raw, htf_context, current_price)
+
+        # ── DIAGNOSTIC ──────────────────────────────────────────────────────
+        strat_tag = "CONT" if self.is_continuation_strategy else "REV "
+        
+        current_bar_time = df['time'].iloc[-1]
+        if self.last_15min_bar_time != current_bar_time:
+            self.tracked_zones_15min   = zones.copy()
+            self.last_15min_bar_time   = current_bar_time
+
+        continuation_zones = []
+        if self.enable_continuation and self.tracked_zones_15min:
+            df_5min = _bars['5min/60']
+            if df_5min is not None and len(df_5min) >= 20:
+                for zone in self.tracked_zones_15min:
+                    flip = self.detect_zone_flip(zone, df_5min, current_atr)
+                    if flip:
+                        cz = zone.copy()
+                        cz['flip_info']       = flip
+                        cz['is_continuation'] = True
+                        cz['type']            = 'demand' if flip['flip_direction'] == 'BUY' else 'supply'
+                        cz['price_mid']       = flip['flip_level']
+                        cz['distance_pips']   = abs(current_price - flip['flip_level']) / self.pip_size
+                        continuation_zones.append(cz)
+
+        if continuation_zones:
+            continuation_zones = self._htf_direction_filter(continuation_zones, htf_context, current_price)
+
+        all_zones = zones + continuation_zones
+
+        # ── ARCHITECTURE GATE: raw fresh 15min zones are never emitted as signals ──
+        # training_labels_clean.parquet: tf_source = 4h_1h_confluence=90%, 4h=10%, 15min=0%
+        # Model was never trained on raw 15min zones — live WR confirmed ~7%.
+        # Only HTF_SMC signals (4H OBs/FVGs confirmed by 1H) and CONTINUATION
+        # zones (15min zones that flipped — a different, scored setup, not a
+        # raw fresh zone) are valid 15min-path outputs.
+        #
+        # NOTE: this used to be an unconditional early `return` here that fired
+        # on every call (whether htf_signals was empty or not), which meant the
+        # entire gate/scoring block below — and therefore every continuation
+        # signal — was unreachable dead code. Fixed so we only take the early
+        # exit when there is truly nothing left to score.
+        all_zones = [z for z in all_zones if z.get('is_continuation', False)]
+
+        if not htf_signals and not all_zones:
+            print(f"     ⚠️  No HTF signals and no continuation zones this cycle — returning empty")
+            return {'15min_signals': [], 'htf_signals': [], 'stats': {
+                'duplicates': 0, 'rejected': 0,
+                'expired': expired_count, 'active_zones': self.zone_tracker.get_active_count()
+            }}
+
+        if self.use_htf_analysis and all_zones:
+            all_fvgs = (htf_context.get('h1_fvgs', []) +
+                        htf_context.get('h4_fvgs', []) +
+                        htf_context.get('daily_fvgs', []))
+            all_obs  = (htf_context.get('h1_order_blocks', []) +
+                        htf_context.get('h4_order_blocks', []) +
+                        htf_context.get('daily_order_blocks', []))
+            fib_lvls = {**htf_context.get('h1_fib_levels', {}),
+                        **htf_context.get('h4_fib_levels', {})}
+            all_htf_items = all_fvgs + all_obs   # used for real overlap count below
+            for zone in all_zones:
+                conf_dict = self.htf_analyzer.check_confluence(
+                    zone, all_fvgs, all_obs, fib_lvls, current_price)
+                zone['htf_confluence'] = conf_dict          # display / gate use only
+
+                # this zone's price range — identical to the HTF-OB path at
+                # htf_trade_detect() lines ~2247–2259.
+                z_top = zone.get('price_high', zone.get('price_mid', current_price))
+                z_bot = zone.get('price_low',  zone.get('price_mid', current_price))
+                real_overlap = 1  # minimum 1 (the zone itself)
+                for item in all_htf_items:
+                    item_bot = item.get('bottom', item.get('price_low', 0))
+                    item_top = item.get('top',    item.get('price_high', 0))
+                    if item_bot < z_top and item_top > z_bot:
+                        real_overlap += 1
+                zone['confluence'] = real_overlap  # int ≥1, training-compatible
+                assert isinstance(zone['confluence'], int), \
+                    f"confluence must be int, got {type(zone['confluence'])}"
+
+        before_conf = len(all_zones)
+        if self.use_htf_analysis and all_zones:
+            all_zones = [z for z in all_zones
+                         if z.get('htf_confluence', {}).get('score', 0) >= self.min_confluence_score]
+
+        # ── DIAGNOSTIC ───────────────────────────────────────────────────────
+        conf_scores = [z.get('htf_confluence', {}).get('score', 0) for z in (zones + continuation_zones)]
+        print(f"     [4] After confluence gate (≥{self.min_confluence_score}): {len(all_zones)} / {before_conf}")
+        if conf_scores:
+            print(f"         Confluence scores: min={min(conf_scores)} max={max(conf_scores)} avg={sum(conf_scores)/len(conf_scores):.1f}")
+        # ── END DIAGNOSTIC ───────────────────────────────────────────────────
+
+        # Dedup 15-min zones
+        new_zones = []
+        dup_count = 0
+        for zone in all_zones:
+            sig = self.zone_tracker.get_canonical_signature(zone, self.symbol)
+            is_dup, _ = self.zone_tracker.is_duplicate(sig, current_time, current_price)
+            if is_dup:
+                dup_count += 1
+            else:
+                new_zones.append(zone)
+        self.stats['total_candidates'] += len(all_zones)
+        self.stats['total_duplicates'] += dup_count
+        all_zones = new_zones
+
+        # ── DIAGNOSTIC ───────────────────────────────────────────────────────
+        print(f"     [5] After dedup:               {len(all_zones)}  (dups={dup_count})")
+        # ── END DIAGNOSTIC ───────────────────────────────────────────────────
+
+        signals             = []
+        observation_signals = []   # zones blocked by gates — saved for study
+        rejected_cnt = 0
+        reject_reasons = {'5min_refine': 0, 'prob_low': 0, 'risk_range': 0,
+                          'h4_bias': 0, 'd1_premium_discount': 0, 'zone_close': 0,
+                          'zone_dedupe': 0}
+
+        def _make_obs_signal(zone, gate_reason):
+            """Build a lightweight observation signal dict for a gate-blocked zone."""
+            z_entry = zone.get('price_high') if zone['type'] == 'demand' else zone.get('price_low', zone.get('price_mid'))
+            z_sl    = zone.get('price_low')  if zone['type'] == 'demand' else zone.get('price_high', zone.get('price_mid'))
+            z_atr   = current_atr if current_atr else self.pip_size * 10
+            z_risk  = max(abs((z_entry or current_price) - (z_sl or current_price)), z_atr * self.min_risk_atr)
+            z_tp    = ((z_entry or current_price) + z_risk * 2.0
+                       if zone['type'] == 'demand'
+                       else (z_entry or current_price) - z_risk * 2.0)
+            return {
+                'timestamp':        current_time.strftime('%Y-%m-%d %H:%M:%S') + ' UTC',
+                'date':             current_time.strftime('%Y-%m-%d'),
+                'time':             current_time.strftime('%H:%M:%S'),
+                'symbol':           self.symbol,
+                'timeframe':        '15min',
+                'model_version':    'v7',
+                'strategy':         'CONTINUATION' if self.is_continuation_strategy else 'REVERSION',
+                'signal_type':      'observation',
+                'direction':        'BUY' if zone['type'] == 'demand' else 'SELL',
+                'entry':            round(z_entry or current_price, 5),
+                'sl':               round(z_sl    or current_price, 5),
+                'tp':               round(z_tp, 5),
+                'risk_pips':        round(z_risk / self.pip_size, 1),
+                'zone_strength':    round(zone.get('strength', 0), 2),
+                'distance_pips':    round(zone.get('distance_pips', 0), 1),
+                'confluence_score': zone.get('htf_confluence', {}).get('score', 0),
+                'zone_type':        zone['type'],
+                'gate_blocked_by':  gate_reason,
+                'h4_trend':         h4_trend,
+                'd1_zone':          ('premium' if _d1_pd == 1 else 'discount' if _d1_pd == -1 else 'equilibrium'),
+                'd1_position':      round(_d1_pos, 3),
+                'status':           'observation',
+            }
+
+        # ── v7 HARD GATE 1: D1 Bias (primary) with 4H fallback ─────────────────
+        # Recompute h4_structure fresh from live 4H bars every cycle.
+        # the trend label could be hours old and wrong side of a structure flip.
+        _df_4h_bias = _bars['4h/200']
+        if _df_4h_bias is not None and len(_df_4h_bias) > 20:
+            _fresh_h4_struct = self.htf_analyzer.detect_market_structure_shift(_df_4h_bias)
+            h4_trend = _fresh_h4_struct.get('trend', 'neutral')
+        else:
+            h4_trend = htf_context.get('h4_structure', {}).get('trend', 'neutral')
+
+        # FIX: this gate previously used h4_trend as the ONLY hard bias check —
+        # D1 was never consulted here at all, even though D1 is supposed to be
+        # the top of the bias hierarchy (D1 → 4H zones → 1H confirm → 5M entry).
+        # This is why ~56% of historical signals showed d1_trend='neutral' in
+        # the log yet still fired freely in either direction: the daily bias
+        # field was informational only on this path, not an actual gate.
+        #
+        # D1 SOURCE: uses d1_ema_trend (EMA20/50 crossover, cached on
+        # htf_context by get_htf_context) — the SAME calculation the model was
+        # trained on (see label_generator.calculate_htf_trend_alignment /
+        # smc_detector.get_d1_trend) — rather than the swing/structure-based
+        # daily_structure['trend']. Those two D1 definitions can disagree;
+        # gating on the EMA version keeps the live filter and the model's own
+        # probability score reasoning about the same D1 signal.
+        # daily_structure['trend'] is still computed and exported separately
+        # below for human-readable logging, it's just not used to gate anymore.
+        # _bars['1day/90'] is closed-bar-filtered once at the top of
+        # generate_signals() now — see the fix there. No re-filtering needed.
+        _df_d1_gate = _bars['1day/90']
+        _d1_trend_structure = htf_context.get('daily_structure', {}).get('trend', 'neutral') if htf_context else 'neutral'
+        _d1_trend  = htf_context.get('d1_ema_trend', 'neutral') if htf_context else 'neutral'
+
+        # ── v7 HARD GATE 2: D1 Premium / Discount ─────────────────────────────
+        _d1_pd = 0  # default: equilibrium (no gate)
+        if _df_d1_gate is not None and len(_df_d1_gate) >= 20:
+            _tail60  = _df_d1_gate.tail(60)
+            _d1_high = float(np.percentile(_tail60["high"], 95))
+            _d1_low  = float(np.percentile(_tail60["low"],   5))
+            _d1_rng  = _d1_high - _d1_low
+            _d1_pos  = (current_price - _d1_low) / _d1_rng if _d1_rng > 0 else 0.5
+
+            # ── D1 GATE DIAGNOSTIC ────────────────────────────────────────────
+            print(f"\n  📊 D1 GATE DIAGNOSTIC ({len(_tail60)} bars, 60-day window):")
+            print(f"     Bars in tail-60:")
+            for _, row in _tail60[['time', 'high', 'low', 'close']].iterrows():
+                marker = " ◀ MAX" if row['high'] == _tail60['high'].max() else \
+                         " ◀ MIN" if row['low']  == _tail60['low'].min()  else ""
+                print(f"       {row['time']}  H={row['high']:.5f}  "
+                      f"L={row['low']:.5f}  C={row['close']:.5f}{marker}")
+            print(f"     → Raw  max={_tail60['high'].max():.5f}  "
+                  f"min={_tail60['low'].min():.5f}")
+            print(f"     → P95  high={_d1_high:.5f}  P5 low={_d1_low:.5f}  "
+                  f"range={_d1_rng:.5f}")
+            print(f"     → Price={current_price:.5f}  "
+                  f"Position={_d1_pos:.3f}  "
+                  f"Zone={'🔴 PREMIUM' if _d1_pos > 0.6 else '🟢 DISCOUNT' if _d1_pos < 0.4 else '🟡 EQUILIBRIUM'}")
+            # ── END DIAGNOSTIC ────────────────────────────────────────────────
+
+            if _d1_rng > 0:
+                if _d1_pos > 0.6:
+                    _d1_pd = 1   # premium
+                elif _d1_pos < 0.4:
+                    _d1_pd = -1  # discount
+
+        for zone in all_zones:
+            is_cont  = zone.get('is_continuation', False)
+            flip_info = zone.get('flip_info')
+
+            # ── Apply D1/4H bias agreement gate — HARD BLOCK ──────────────────
+            # BUY requires non-bearish D1 (EMA & structure) and 4H.
+            # SELL requires non-bullish D1 (EMA & structure) and 4H.
+            # Gated behind require_htf_bias_gate -- see __init__.
+            if self.require_htf_bias_gate and zone['type'] == 'supply' and (_d1_trend == 'bullish' or _d1_trend_structure == 'bullish' or h4_trend == 'bullish'):
+                rejected_cnt += 1
+                reject_reasons['d1_premium_discount'] += 1
+                observation_signals.append(_make_obs_signal(zone, 'd1_4h_bias_conflict_blocks_sell'))
+                msg = f"  ⛔ D1/4H BIAS HARD BLOCK: supply (SELL) zone at {zone.get('price_mid', 0.0):.5f} blocked — bias conflict (d1_ema={_d1_trend} d1_struct={_d1_trend_structure} h4={h4_trend})"
+                logger.info(msg)
+                if self.debug:
+                    print(msg)
+                continue
+            elif self.require_htf_bias_gate and zone['type'] == 'demand' and (_d1_trend == 'bearish' or _d1_trend_structure == 'bearish' or h4_trend == 'bearish'):
+                rejected_cnt += 1
+                reject_reasons['d1_premium_discount'] += 1
+                observation_signals.append(_make_obs_signal(zone, 'd1_4h_bias_conflict_blocks_buy'))
+                msg = f"  ⛔ D1/4H BIAS HARD BLOCK: demand (BUY) zone at {zone.get('price_mid', 0.0):.5f} blocked — bias conflict (d1_ema={_d1_trend} d1_struct={_d1_trend_structure} h4={h4_trend})"
+                logger.info(msg)
+                if self.debug:
+                    print(msg)
+                continue
+            _h4_counter_trend_penalty = 0.0
+
+            if self.require_htf_bias_gate and _d1_pd == 1 and zone['type'] == 'demand':
+                # Price in D1 premium — block demand unless 4H is also bullish
+                # (if 4H bearish, demand here is doubly counter-trend → block)
+                if h4_trend != 'bullish':
+                    rejected_cnt += 1
+                    reject_reasons['d1_premium_discount'] += 1
+                    observation_signals.append(_make_obs_signal(zone, 'd1_premium_blocks_demand'))
+                    msg = f"  ⛔ D1 PREMIUM GATE: demand (BUY) zone at {zone.get('price_mid', 0.0):.5f} blocked — price in D1 premium and 4H={h4_trend}"
+                    logger.info(msg)
+                    if self.debug:
+                        print(msg)
+                    continue
+            if self.require_htf_bias_gate and _d1_pd == -1 and zone['type'] == 'supply':
+                # Price in D1 discount — only block supply when 4H is also bullish
+                # (counter-trend sell). If 4H is bearish, supply in D1 discount
+                # is a valid continuation sell — do NOT block it.
+                if h4_trend == 'bullish':
+                    rejected_cnt += 1
+                    reject_reasons['d1_premium_discount'] += 1
+                    observation_signals.append(_make_obs_signal(zone, 'd1_discount_blocks_supply'))
+                    msg = f"  ⛔ D1 DISCOUNT GATE: supply (SELL) zone at {zone.get('price_mid', 0.0):.5f} blocked — price in D1 discount but 4H is bullish (counter-trend)"
+                    logger.info(msg)
+                    if self.debug:
+                        print(msg)
+                    continue
+                elif h4_trend == 'neutral':
+                    pass  # neutral 4H = no strong bias, let ML model decide
+                # h4_trend == 'bearish': fall through — with-trend continuation sell, allow it
+
+            if 'm5_micro_bos' not in zone:
+                _m5_dir = 'BUY' if zone['type'] == 'demand' else 'SELL'
+                _m5_conf = self._check_5min_entry(
+                    zone.get('price_high', zone.get('price_mid', 0)),
+                    zone.get('price_low',  zone.get('price_mid', 0)),
+                    _m5_dir,
+                    _bars['5min/60'],
+                )
+                zone['m5_micro_bos']            = _m5_conf['m5_micro_bos']
+                zone['m5_sweep_confirmation']   = _m5_conf['m5_sweep_confirmation']
+                zone['m5_entry_candle_quality'] = _m5_conf['m5_entry_candle_quality']
+
+            if 'fvg_overlap' not in zone and 'h4_fvg_zone' not in zone:
+                # FIX: smc_detector.py's training-side fvg_overlap computation
+                # only ever applies to order_block-sourced zones (a zone can't
+                # confirm itself). This live fallback was missing that guard —
+                # an FVG-sourced zone's own price range will typically overlap
+                # itself (or a near-duplicate) in _h4_fvgs, recreating the same
+                # circularity via geometry instead of an explicit flag. Only
+                # compute this for OB-sourced zones, matching training exactly.
+                if 'order_block' in zone.get('sources', []):
+                    _h4_fvgs = htf_context.get('h4_fvgs', [])
+                    _z_top   = zone.get('price_high', zone.get('price_mid', 0))
+                    _z_bot   = zone.get('price_low',  zone.get('price_mid', 0))
+                    zone['fvg_overlap'] = any(
+                        not (fvg.get('top', fvg.get('price_high', 0)) < _z_bot or
+                             fvg.get('bottom', fvg.get('price_low', 0)) > _z_top)
+                        for fvg in _h4_fvgs
+                    )
+                else:
+                    zone['fvg_overlap'] = False
+
+            if 'htf_alignment' not in zone:
+                if zone['type'] == 'demand':
+                    zone['htf_alignment'] = (1  if h4_trend == 'bullish'
+                                             else -1 if h4_trend == 'bearish'
+                                             else 0)
+                else:
+                    zone['htf_alignment'] = (1  if h4_trend == 'bearish'
+                                             else -1 if h4_trend == 'bullish'
+                                             else 0)
+
+            base_probability = self.predict_with_proper_features(
+                zone, df, htf_context,
+                df_1h = _bars['1h/100'],
+                df_4h = _bars['4h/100'],
+                df_5m = _bars['5min/60'],
+                df_d1 = _bars['1day/90'],
+            )
+            probability      = base_probability
+
+            zone_key = f"{self.symbol}_{zone.get('type','')}_{round(zone.get('price_mid', 0), 4)}"
+            history  = self.zone_history.get(zone_key, {})
+            if 'last_outcome' in history:
+                zone['prev_zone_outcome']    = history['last_outcome']
+                zone['time_since_last_touch'] = min(
+                    (datetime.utcnow() - history['last_touch']).total_seconds() / 3600,
+                    2000)
+            # staleness_penalty REMOVED — no training equivalent.
+            # zone_age_bars IS a model feature (v9) — the model learns its effect
+            # directly. Post-hoc subtraction here would double-penalise old zones.
+            # Matches feature_builder._compute_raw_features: (len(df)-1) - zone_index.
+            zone_age_bars = len(df) - 1 - zone.get('index', len(df) - 1)
+
+            # NOTE: confluence boost removed — was never validated in backtesting.
+            # Raw base_probability is used directly. The model already learned
+            # confluence via the zone_confluence feature during training.
+
+            # NOTE: multi-touch boost/penalty removed — unvalidated post-hoc adjustment.
+            # touch_count effect is already captured by zone_touch_count feature in model.
+
+            if is_cont and flip_info:
+                probability = self.apply_boost_ceiling(probability, self.continuation_prob_boost)
+
+            # zone geometry instead of hard-rejecting the zone.
+            # This was killing every zone in low-volatility / early-session periods.
+            refinement = None
+            if self.use_5min_refinement and not is_cont:
+                refinement = self.refine_entry_with_5min(
+                    zone, current_price, current_atr, df_5min=_bars['5min/60'])
+
+                # GUARD: discard refinement if price already inside the zone.
+                # A micro swing found behind price is noise, not confirmation.
+                # Fall back to zone geometry which uses the proximal body edge.
+                if refinement is not None:
+                    already_inside = (
+                        (zone['type'] == 'demand' and current_price <= zone['price_high']) or
+                        (zone['type'] == 'supply' and current_price >= zone['price_low'])
+                    )
+                    if already_inside:
+                        refinement = None
+                        if self.debug:
+                            print(f"    ⚠️  Refinement discarded — price already inside zone")
+
+                if refinement is None:
+                    pass
+                else:
+                    probability = self.apply_boost_ceiling(probability, refinement['confidence_boost'])
+
+            # (4H counter-trend penalty removed — counter-trend zones are hard-blocked above)
+
+            d1_trend = htf_context.get('daily_structure', {}).get('trend', 'neutral')
+            counter_trend = (
+                (zone['type'] == 'demand' and d1_trend == 'bearish') or
+                (zone['type'] == 'supply' and d1_trend == 'bullish')
+            ) if d1_trend != 'neutral' else False
+
+            _hour = datetime.utcnow().hour
+            # Calibration audit confirmed: the 0.60–0.70 bucket was overconfident (predicted ~65%
+            # vs ~39% actual win rate, below 1:1.5 breakeven). Setting threshold >= 0.70 filters
+            # out the underperforming 0.60–0.70 bucket while preserving the validated 0.70+ edge
+            # (test set precision: 89.6% at 0.70+).
+            _base_threshold = self.prob_threshold if getattr(self, 'prob_threshold', None) is not None else 0.60
+            effective_threshold = _base_threshold + (0.03 if counter_trend else 0.0)
+            if base_probability < 0.55 or probability < effective_threshold:
+                rejected_cnt += 1
+                reject_reasons['prob_low'] += 1
+                msg = (f"  ⛔ Zone rejected (low prob): base_prob={base_probability:.3f} "
+                       f"prob={probability:.3f} threshold={effective_threshold:.3f} "
+                       f"type={zone['type']} dist={zone['distance_pips']:.1f}p")
+                logger.info(msg)
+                if self.debug:
+                    print(msg)
+                continue
+
+            entry, sl, tp, actual_rr = self.calculate_realistic_levels(
+                zone, current_atr, current_price, refinement, htf_context)
+
+            risk_pips   = abs(entry - sl) / self.pip_size
+            reward_pips = abs(tp   - entry) / self.pip_size
+            # Symbol-adaptive risk limits: gold has wider natural ranges
+            _is_gold    = 'XAU' in self.symbol.upper() or 'GOLD' in self.symbol.upper()
+            _max_risk   = 300.0 if _is_gold else 50.0
+            _min_risk   = 5.0   if _is_gold else 2.0
+            if risk_pips < _min_risk or risk_pips > _max_risk or reward_pips > 2000:
+                rejected_cnt += 1
+                reject_reasons['risk_range'] += 1
+                msg = f"  ⛔ Zone rejected (risk range): risk={risk_pips:.1f}p reward={reward_pips:.1f}p (allowed min={_min_risk} max={_max_risk})"
+                logger.info(msg)
+                if self.debug:
+                    print(msg)
+                continue
+
+            sig = self.zone_tracker.get_canonical_signature(zone, self.symbol)
+            zone['probability'] = probability
+            self.zone_tracker.add_zone(sig, zone)
+
+            signal = {
+                'timestamp':       current_time.strftime('%Y-%m-%d %H:%M:%S') + ' UTC',
+                'date':            current_time.strftime('%Y-%m-%d'),
+                'time':            current_time.strftime('%H:%M:%S'),
+                'symbol':          self.symbol,
+                'timeframe':       '15min',
+                'model_version':   'v7',
+                'signal_type':     'real',
+                'strategy':        'CONTINUATION' if self.is_continuation_strategy else 'REVERSION',
+                'direction':       'BUY' if zone['type'] == 'demand' else 'SELL',
+                'trade_type':      'continuation' if is_cont else 'fresh_zone',
+                'entry':           round(entry, 5),
+                'sl':              round(sl, 5),
+                'tp':              round(tp, 5),
+                'risk_pips':       round(risk_pips, 1),
+                'reward_pips':     round(reward_pips, 1),
+                'risk_reward':     f"1:{actual_rr:.1f}",
+                'rr':              f"1:{actual_rr:.1f}",
+                'zone_top':        round(zone.get('price_high', entry), 5),
+                'zone_bottom':     round(zone.get('price_low',  sl),    5),
+                'probability':     round(probability * 100, 1),
+                'base_probability': round(base_probability * 100, 1),
+                'zone_strength':   round(zone['strength'], 2),
+                'distance_pips':   round(zone['distance_pips'], 1),
+                'stale':           zone['distance_pips'] > 15,
+                # FIX: 'htf_trend' was silently sourced from h1_trend (1H EMA
+                # crossover) despite the name implying a higher timeframe. This
+                # block already computes a genuine 4H trend a few lines below
+                # ('h4_trend') — point 'htf_trend' at that instead, and keep the
+                # 1H value under its own honest field name so nothing is lost.
+                'htf_trend':       htf_context.get('h4_structure', {}).get('trend', 'unknown'),
+                '1h_trend':        htf_context.get('h1_trend', 'unknown'),
+                'validated':       zone.get('validated', False),
+                '5min_refined':    refinement is not None,
+                'confluence_score': zone.get('htf_confluence', {}).get('score', 0),
+                'counter_trend':   counter_trend,
+                # FIX: 'd1_trend' now reports _d1_trend (EMA20/50) — the value
+                # that actually gates this signal (see _hard_bias above) and
+                # matches what the model was trained on. Swing-structure value
+                # preserved separately as 'd1_structure_trend'.
+                'd1_trend':        _d1_trend,
+                'd1_structure_trend': _d1_trend_structure,
+                'h4_trend':        htf_context.get('h4_structure', {}).get('trend', 'neutral'),
+                'zone_age_bars':   zone_age_bars,
+                # FIX: 'touch_count' referenced an undefined local variable —
+                # confirmed via full-file search, it was never assigned
+                # anywhere in this function's scope. Replaced with the same
+                # _calculate_touch_count() call already used correctly in the
+                # HTF FVG/OB path, so both paths compute this consistently
+                # and match what the model was actually trained on.
+                'touch_count':     self._calculate_touch_count(zone, df),
+                'session':         _canonical_get_session(self._current_time().hour),
+            }
+            if is_cont and flip_info:
+                signal['continuation_details'] = {
+                    'original_type': flip_info['original_type'],
+                    'flipped_to':    flip_info['new_type'],
+                    'flip_level':    round(flip_info['flip_level'], 5)
+                }
+
+            if self.require_zone_close and not self.is_continuation_strategy:
+                z_top      = signal['zone_top']
+                z_bot      = signal['zone_bottom']
+                zone_width = abs(z_top - z_bot)
+                _atr       = signal.get('atr', current_atr)
+                recent5    = df.tail(5)   # df = _bars['15min/200']
+
+                # Skip for tight zones — close inside is physically improbable
+                if zone_width < _atr * 0.5:
+                    pass  # zone too tight — skip close requirement
+                else:
+                    # Accept either: close inside zone, OR wick penetration into zone
+                    if zone['type'] == 'supply':
+                        touched = any(
+                            (z_bot <= c <= z_top) or (h >= z_bot)
+                            for c, h in zip(recent5['close'], recent5['high'])
+                        )
+                    else:  # demand
+                        touched = any(
+                            (z_bot <= c <= z_top) or (l <= z_top)
+                            for c, l in zip(recent5['close'], recent5['low'])
+                        )
+                    if not touched:
+                        if self.debug:
+                            print(f"     ⛔ REVERSION zone rejected (require_zone_close): "
+                                  f"no close or wick touch of [{z_bot:.5f} – {z_top:.5f}] "
+                                  f"in last 5 bars (width={zone_width/self.pip_size:.1f}p, "
+                                  f"ATR={_atr/self.pip_size:.1f}p)")
+                        rejected_cnt += 1
+                        reject_reasons['zone_close'] += 1
+                        continue
+
+            # FIX #5: proximity-bucketed dedup guard — suppress re-firing the
+            # same symbol/direction/price-level within the cooldown window.
+            if self._is_duplicate_zone_signal(self.symbol, signal.get('direction'), signal.get('entry', 0)):
+                rejected_cnt += 1
+                reject_reasons['zone_dedupe'] += 1
+                if self.debug:
+                    print(f"     ⛔ DEDUP: {signal.get('direction')} @ {signal.get('entry'):.5f} "
+                          f"suppressed — same zone fired within {self.zone_dedupe_cooldown_minutes}min")
+                continue
+
+            signals.append(signal)
+
+        self.stats['total_new_zones'] += len(signals)
+        self.stats['total_rejected']  += rejected_cnt
+        signals = sorted(signals, key=lambda x: x['probability'], reverse=True)[:5]
+
+        # Save observation signals (gate-blocked) to their own file
+        if observation_signals:
+            save_signals_to_single_file(observation_signals, "signals/observation_signals.json")
+
+        # ── Conflict filter: remove opposing signals within 1 ATR of each other
+        # Keeps highest probability signal when BUY and SELL are at same price level
+        h1_trend = htf_context.get('h1_trend', 'neutral')
+        signals  = _suppress_conflicts(signals, current_atr, h1_trend, self.pip_size)
+
+        # ── DIAGNOSTIC SUMMARY ──────────────────────────────────────────────
+        print(f"     [6] After prob/risk filters:   {len(signals)}")
+        print(f"         Reject reasons → 5min_refine={reject_reasons['5min_refine']} "
+              f"prob_low={reject_reasons['prob_low']} risk_range={reject_reasons['risk_range']} "
+              f"zone_close={reject_reasons['zone_close']}")
+        print(f"     ✅ Final signals: {len(signals)} (15min) + {len(htf_signals)} (HTF)")
+        # ── END DIAGNOSTIC ───────────────────────────────────────────────────
+
+        return {
+            '15min_signals':      signals,
+            'htf_signals':        htf_signals,
+            'observation_signals': observation_signals,
+            'stats': {
+                'duplicates':        dup_count,
+                'rejected':          rejected_cnt,
+                'expired':           expired_count,
+                'active_zones':      self.zone_tracker.get_active_count(),
+                'observation_count': len(observation_signals),
+            }
+        }
+
+
+
+class WeeklyPlanScheduler:
+
+    def __init__(self, predictors: List['ProductionForexPredictor'],
+                 output_file: str = "signals/weekly_plan.json"):
+        self.predictors  = predictors
+        self.output_file = Path(output_file)
+
+    def generate(self):
+        print(f"\n{'═'*80}")
+        print(f"📆 WEEKLY PLAN — {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+        print(f"{'═'*80}")
+
+        weekly_context = {}
+        for pred in self.predictors:
+            try:
+                ctx = pred.get_htf_context()
+                # Weekly high/low from 1D
+                df_1d = pred.fetch_bars(interval="1day", outputsize=7)
+                if df_1d is not None and len(df_1d) >= 5:
+                    ctx['weekly_high'] = df_1d.tail(5)['high'].max()
+                    ctx['weekly_low']  = df_1d.tail(5)['low'].min()
+                weekly_context[pred.symbol] = {
+                    'h1_trend':      ctx.get('h1_trend', 'neutral'),
+                    'daily_structure': ctx.get('daily_structure', {}),
+                    'weekly_high':   ctx.get('weekly_high'),
+                    'weekly_low':    ctx.get('weekly_low'),
+                    'daily_pivot':   ctx.get('daily_pivot'),
+                    'h4_fvg_count':  len(ctx.get('h4_fvgs', [])),
+                    'h4_ob_count':   len(ctx.get('h4_order_blocks', [])),
+                    'generated_at':  datetime.utcnow().isoformat(),
+                    'valid_until':   (datetime.utcnow() + timedelta(days=5)).isoformat()
+                }
+                print(f"  {pred.symbol:<10} trend={ctx.get('h1_trend','?'):<10} "
+                      f"D1={ctx.get('daily_structure',{}).get('trend','?'):<10} "
+                      f"4H FVGs={len(ctx.get('h4_fvgs',[])):<4} "
+                      f"4H OBs={len(ctx.get('h4_order_blocks',[]))}")
+            except Exception as e:
+                logger.warning(f"WeeklyPlan: error for {pred.symbol} — {e}")
+
+        self.output_file.parent.mkdir(exist_ok=True)
+        with open(self.output_file, 'w') as f:
+            json.dump(_convert_numpy(weekly_context), f, indent=2)
+
+        print(f"\n✅ Weekly plan saved → {self.output_file}")
+        return weekly_context
+
+
+class PriceZoneMonitor:
+
+    def __init__(self, predictors: List['ProductionForexPredictor'],
+                 signals_file: str = "signals/all_signals.json",
+                 alert_callback=None,
+                 approach_log_file: str = "logs/pre_entry_approach_log.jsonl",
+                 final_log_file: str = "logs/final_signals.jsonl"):
+        self.predictors        = predictors
+        self.signals_file      = Path(signals_file)
+        self.alert_callback    = alert_callback or self._default_alert
+        self.alerted_signals   = set()
+        self.zone_cfg          = ZoneArrivalConfig()
+        # Signals we've already logged an "approaching" (pre-touch) sample for,
+        # so we don't spam the log every 15min cycle while price hovers nearby.
+        self._approach_logged  = set()
+        # sig_id -> time of the last CLOSED 15m bar already run through the arrival engine,
+        # so a zone is evaluated exactly once per closed bar (bars_in_zone counts bars, not cycles).
+        self._last_eval_bar    = {}
+        self.approach_log_file = Path(approach_log_file)
+        self.approach_log_file.parent.mkdir(parents=True, exist_ok=True)
+        # Dual-tracking log: every trigger writes BOTH the original proposed
+        # signal and the recomputed final signal (or a skip record), linked
+        # by original_signal_id, so we can later measure whether the
+        # recompute step actually improves outcomes vs. the raw signal.
+        self.final_log_file    = Path(final_log_file)
+        self.final_log_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # Thresholds for the trigger-time recompute (see _recompute_final_signal).
+        # Kept as attributes (not magic numbers inline) so they're easy to
+        # retune once more live data comes in — current values are carried
+        # over from the replay_2026-08-20_130934 read (16 triggered signals,
+        # 7 win / 9 loss), not yet validated at scale.
+        #
+        # Replaces the old binary "consec>=2 -> skip" gate with a graduated
+        # exhaustion score built from 5 touch-bar metrics (win_avg vs
+        # loss_avg on that run):
+        #   touch_rejection_wick_atr      0.23 / 1.35  (5.9x — strongest)
+        #   consecutive_directional_bars  0.43 / 1.44  (3.4x)
+        #   touch_bar_size_atr            1.50 / 3.01  (2.0x)
+        #   pre_touch_bar_size_atr        1.15 / 1.97  (1.7x)
+        #   approach_velocity_30m_atr     2.03 / 3.28  (1.6x)
+        # Weights roughly track that separation; caps are roughly loss_avg
+        # so a "typical bad touch" scores ~1.0 on that component alone.
+        # Reweighted 2026-08-24 after checking 3 "adjusted_never_filled" replay
+        # signals against real EUR/USD & USD/JPY bars. consecutive_directional_bars
+        # was maxing out at the minimum qualifying streak (2 bars, cap=2.0), so it
+        # contributed the same 0.25 to every case regardless of severity -- zero
+        # discriminative value, 25% of total weight. touch_rejection_wick_atr was
+        # the feature that actually separated the one case that should NOT have
+        # been adjusted (wick=0.81, unadjusted trade hit TP) from the two that
+        # correctly were (wick=1.85-1.98, unadjusted trades hit SL). Moved weight
+        # off consec onto wick, widened the consec cap so it stops saturating on
+        # a bare 2-bar streak, and raised the mid threshold to match. Validated
+        # against only 3 signals -- rerun replay and check the win-rate breakdown
+        # by tier before trusting this beyond that sample.
+        self.exhaustion_weights = {
+            "touch_rejection_wick_atr":      0.45,
+            "consecutive_directional_bars":  0.15,
+            "touch_bar_size_atr":            0.20,
+            "pre_touch_bar_size_atr":        0.10,
+            "approach_velocity_30m_atr":     0.10,
+        }
+        self.exhaustion_caps = {
+            "touch_rejection_wick_atr":      1.4,
+            "consecutive_directional_bars":  3.0,
+            "touch_bar_size_atr":            3.0,
+            "pre_touch_bar_size_atr":        2.0,
+            "approach_velocity_30m_atr":     3.5,
+        }
+        self.exhaustion_mid_threshold  = 0.70   # raised from 0.58 -- backtested +34.50R vs +27.89R (2026-09-10)
+        self.exhaustion_high_threshold = 0.85   # raised from 0.75
+        self.accel_bar_size_atr_min  = 2.0   # 5min bar range / atr_5min above this = "knife"
+        self.accel_body_ratio_min    = 0.70  # and a solid (low-wick) body
+        self.accel_score_bonus       = 0.30  # score bump when the 5min knife check fires
+        self.sl_pad_base_atr    = 0.40   # flat SL cushion, in ATR units, regardless of wick size
+        self.sl_pad_wick_atr    = 0.60   # extra SL cushion proportional to the observed rejection wick
+        self.entry_push_vel_atr = 0.35   # entry push proportional to approach velocity
+        self.tier_scale = {"mid": 1.0, "high": 1.75}  # how much harder "high" pushes than "mid"
+        self.min_rr_floor = 1.5          # same floor concept as MIN_RR in the TP-construction code
+
+        # How long to wait for price to reach a pushed entry before it's
+        # abandoned as "adjusted but never filled". A flat 6h window was
+        # penalizing lower-volatility pairs: in the 2026-08-24 replay,
+        # EUR/USD expired 2/2 adjusted signals and USD/JPY 1/4, while
+        # XAU/USD and GBP/USD filled every adjusted signal (2/2, 1/1) —
+        # gold's absolute pip moves retrace into a pushed limit fast
+        # enough that 6h is generous, but EUR/USD/GBP/USD/JPY often need
+        # longer to travel the same ATR-relative distance back. Override
+        # per symbol (same pattern as zone_ttl_overrides in the replay
+        # engine); falls back to adjust_fill_window_hours if a symbol
+        # isn't listed.
+        self.adjust_fill_window_hours = 6.0
+        self.adjust_fill_window_overrides = {
+            "EUR/USD": 13.5,
+            "GBP/USD": 13.5,
+            "USD/JPY": 13.0,
+            "XAU/USD": 12.0,
+        }
+
+        # Cap on how far entry can be pushed, in ATR units, regardless of
+        # how high approach_velocity_30m_atr runs. Without this, a very
+        # fast approach can push the entry further than the pair typically
+        # retraces within the fill window at all.
+        self.max_entry_push_atr = {
+            "EUR/USD": 0.5,
+            "GBP/USD": 0.6,
+            "USD/JPY": 0.6,
+            "XAU/USD": 0.5,
+        }
+        self.max_entry_push_atr_default = 0.6
+
+    def _fill_window_hours(self, symbol: str) -> float:
+        """Per-symbol override of adjust_fill_window_hours, falling back to
+        the flat default for any symbol not explicitly tuned."""
+        return self.adjust_fill_window_overrides.get(symbol, self.adjust_fill_window_hours)
+
+    def _exhaustion_score(self, features: Dict) -> float:
+        """Weighted composite of touch-bar exhaustion metrics, ~0 (clean
+        touch) to ~1.5+ (severe). See exhaustion_weights/caps above."""
+        score = 0.0
+        for key, weight in self.exhaustion_weights.items():
+            val = features.get(key, 0.0) or 0.0
+            cap = self.exhaustion_caps[key]
+            score += weight * min(val / cap, 1.5)
+        return round(score, 4)
+
+    def _default_alert(self, signal: Dict):
+        emoji = "🟢" if signal['direction'] == 'BUY' else "🔴"
+        tag   = f" (ADJUSTED — {signal.get('tier')})" if signal.get('adjusted') else ""
+        fill_note = " [LIMIT — awaiting fill]" if signal.get('pending_fill') else ""
+        adv = signal.get('advisor', {})
+        if adv:
+            tier_str = adv.get('tier', 'primary' if adv.get('qualified') else 'skip').upper()
+            if adv.get('qualified'):
+                adv_tag = f" | 📢 ADVICE: TAKE [{tier_str}] [met: {', '.join(adv.get('conditions_met', []))}]"
+            else:
+                adv_tag = " | 📢 ADVICE: SKIP (Low conviction / Toxic filter)"
+        else:
+            adv_tag = ""
+        print(f"\n🚨 ZONE HIT{tag} → {emoji} {signal['symbol']} {signal['direction']}{fill_note} "
+              f"| Entry: {signal['entry']} | SL: {signal['sl']} | TP: {signal['tp']} "
+              f"| Prob: {signal['probability']}%{adv_tag}")
+        if signal.get('adjusted'):
+            print(f"    ↳ original was Entry: {signal.get('original_entry')} | "
+                  f"SL: {signal.get('original_sl')} | TP: {signal.get('original_tp')} "
+                  f"— {signal.get('adjustment_reason')}")
+
+    @staticmethod
+    def _compute_pre_entry_features(df, direction: str, pip_size: float) -> Dict:
+        """Same 8 features as backtest_replay.simulate_trigger_and_outcome's
+        approach_metrics, computed on live bars so live logs are directly
+        comparable to backtest results. `df` is 15min bars, most-recent bar
+        last (df.iloc[-1] = "now").
+        """
+        out = {}
+        try:
+            hi, lo, cl = df['high'], df['low'], df['close']
+            tr = pd.concat([hi - lo, (hi - cl.shift(1)).abs(), (lo - cl.shift(1)).abs()], axis=1).max(axis=1)
+            atr_15m = float(tr.rolling(14).mean().iloc[-1])
+            if not np.isfinite(atr_15m) or atr_15m <= 0:
+                atr_15m = pip_size * 10 if pip_size else 0.0010
+
+            b_touch = df.iloc[-1]
+            b_1ago  = df.iloc[-2] if len(df) >= 2 else b_touch
+            b_2ago  = df.iloc[-3] if len(df) >= 3 else b_1ago
+
+            if direction == 'BUY':
+                approach_vel_atr = (b_2ago['open'] - b_touch['low']) / atr_15m
+                touch_wick_atr   = (b_touch['close'] - b_touch['low']) / atr_15m
+            else:
+                approach_vel_atr = (b_touch['high'] - b_2ago['open']) / atr_15m
+                touch_wick_atr   = (b_touch['high'] - b_touch['close']) / atr_15m
+
+            pre_bar_range  = b_1ago['high'] - b_1ago['low']
+            pre_bar_size_atr = pre_bar_range / atr_15m
+            pre_body_ratio   = abs(b_1ago['close'] - b_1ago['open']) / (pre_bar_range + 1e-9)
+
+            touch_bar_range   = b_touch['high'] - b_touch['low']
+            touch_bar_size_atr = touch_bar_range / atr_15m
+            touch_body_ratio   = abs(b_touch['close'] - b_touch['open']) / (touch_bar_range + 1e-9)
+
+            consec = 0
+            for k in range(1, min(7, len(df))):
+                prev_b = df.iloc[-1 - k]
+                is_dir = (prev_b['close'] < prev_b['open']) if direction == 'BUY' else (prev_b['close'] > prev_b['open'])
+                if is_dir:
+                    consec += 1
+                else:
+                    break
+
+            out = {
+                "atr_15m":                     round(float(atr_15m), 6),
+                "approach_velocity_30m_atr":   round(float(approach_vel_atr), 3),
+                "pre_touch_bar_size_atr":      round(float(pre_bar_size_atr), 3),
+                "pre_touch_body_ratio":        round(float(pre_body_ratio), 3),
+                "touch_bar_size_atr":          round(float(touch_bar_size_atr), 3),
+                "touch_body_ratio":            round(float(touch_body_ratio), 3),
+                "touch_rejection_wick_atr":    round(float(touch_wick_atr), 3),
+                "consecutive_directional_bars": int(consec),
+            }
+        except Exception as e:
+            out = {"approach_metrics_error": str(e)}
+        return out
+
+    def _append_approach_log(self, event: str, sig: Dict, features: Dict,
+                              extra: Optional[Dict] = None):
+        """Append one JSONL record so approaching/touch samples accumulate
+        across live cycles for later hypothesis testing (e.g. via the same
+        pandas analysis used on the backtest replay output)."""
+        record = {
+            "logged_at": datetime.utcnow().isoformat(),
+            "event":     event,   # "approaching" (pre-touch) or "touch" (zone entered)
+            "symbol":    sig.get('symbol'),
+            "direction": sig.get('direction'),
+            "entry":     sig.get('entry'),
+            "sl":        sig.get('sl'),
+            "tp":        sig.get('tp'),
+            "probability": sig.get('probability'),
+            **features,
+        }
+        if extra:
+            record.update(extra)
+        try:
+            with open(self.approach_log_file, 'a') as f:
+                f.write(json.dumps(record) + "\n")
+        except Exception as e:
+            logger.warning(f"PriceMonitor: failed to write approach log — {e}")
+
+    def _recompute_final_signal(self, sig: Dict, sig_id: str, features: Dict,
+                                 zone_top: float, zone_bottom: float,
+                                 pred: 'ProductionForexPredictor') -> Dict:
+        """Stage-3 trigger-time recompute. Runs once price is inside the zone.
+
+        Decision, in order:
+          1. Compute _exhaustion_score() from the touch-bar metrics
+             (touch_rejection_wick_atr, consecutive_directional_bars,
+             touch_bar_size_atr, pre_touch_bar_size_atr,
+             approach_velocity_30m_atr). Add accel_score_bonus if the 5-min
+             bar right now is an accelerating "knife" (large range + solid
+             body vs 5min ATR) — this folds the old separate 5min-accel
+             check into the same score instead of it being independent.
+          2. score < exhaustion_mid_threshold  -> "unchanged", take as proposed.
+          3. score < exhaustion_high_threshold -> "adjust_mid": recompute
+             entry, SL, and TP, pushed/padded by tier_scale["mid"].
+          4. score >= exhaustion_high_threshold -> "adjust_high": same
+             recompute, pushed/padded harder by tier_scale["high"].
+
+        Both adjust tiers push the entry FURTHER in the direction price was
+        already moving when it touched the zone (wait for more of the
+        apparent sweep to happen before filling — this becomes a LIMIT order
+        at a price not yet reached, not a market fill) and pad the SL beyond
+        the observed rejection wick, since sl_overflow on real losses
+        (avg 8.6 pips, wick-correlated in the 16-trade replay read) is what
+        this is meant to absorb. TP is recomputed off the new risk distance
+        to hold the original R:R (floored at min_rr_floor), not left
+        floating.
+
+        Returns a dict: {"action": "unchanged"|"adjust_mid"|"adjust_high",
+                          "reason": str, "score": float,
+                          "final_signal": dict|None}
+        """
+        direction = sig.get('direction', 'BUY')
+        pip_size  = pred.pip_size
+
+        score = self._exhaustion_score(features)
+
+        # 5-min intrabar acceleration check. Deliberately NOT reusing the
+        # 15-min ATR here — 5-min bars need their own ATR (see
+        # refine_entry_with_5min elsewhere in this file for the same pattern).
+        accel_detected = False
+        try:
+            df5 = pred.fetch_bars(interval="5min", outputsize=30)
+            if df5 is not None and len(df5) >= 15:
+                hi5, lo5, cl5 = df5['high'], df5['low'], df5['close']
+                tr5 = pd.concat([hi5 - lo5, (hi5 - cl5.shift(1)).abs(), (lo5 - cl5.shift(1)).abs()], axis=1).max(axis=1)
+                atr_5m = float(tr5.rolling(14).mean().iloc[-1])
+                if not np.isfinite(atr_5m) or atr_5m <= 0:
+                    atr_5m = pip_size * 5
+
+                b = df5.iloc[-1]
+                bar_range = b['high'] - b['low']
+                if bar_range > 0:
+                    bar_size_atr = bar_range / atr_5m
+                    body_ratio   = abs(b['close'] - b['open']) / bar_range
+                    if bar_size_atr >= self.accel_bar_size_atr_min and body_ratio >= self.accel_body_ratio_min:
+                        accel_detected = True
+        except Exception as e:
+            logger.debug(f"PriceMonitor: 5min accel check failed for {sig_id} — {e}")
+
+        if accel_detected:
+            score = round(score + self.accel_score_bonus, 4)
+
+        if score < self.exhaustion_mid_threshold:
+            return {"action": "unchanged", "reason": f"score={score:.2f} — clean touch",
+                    "score": score, "final_signal": None}
+
+        tier  = "mid" if score < self.exhaustion_high_threshold else "high"
+        scale = self.tier_scale[tier]
+
+        orig_entry = float(sig['entry'])
+        orig_sl    = float(sig['sl'])
+        orig_tp    = float(sig['tp'])
+        atr_15m    = features.get("atr_15m") or (pip_size * 10)
+
+        sign = 1.0 if direction == "SELL" else -1.0  # push further into the direction price was already running
+
+        symbol = sig.get('symbol', '')
+        is_gold = ('XAU' in symbol.upper() or 'GOLD' in symbol.upper())
+        is_jpy  = ('JPY' in symbol.upper())
+
+        # ── Wick Damping: if touch candle already formed a strong rejection wick, reduce entry push ──
+        touch_wick_atr = features.get("touch_rejection_wick_atr", 0.0) or 0.0
+        wick_damping = max(0.10, 1.0 - 0.60 * min(touch_wick_atr, 1.5))
+
+        entry_push = self.entry_push_vel_atr * features.get("approach_velocity_30m_atr", 0.0) * atr_15m * scale * wick_damping
+        
+        # Apply strict per-pair cap scaled by tier
+        if is_gold:
+            max_push = atr_15m * 0.50 * scale if atr_15m and atr_15m > 0 else 5.0 * scale
+        elif is_jpy:
+            max_push = 6.0 * pip_size * scale
+        elif 'GBP' in symbol.upper():
+            max_push = 6.0 * pip_size * scale
+        else:
+            max_push = 4.0 * pip_size * scale
+
+        push_was_capped = entry_push > max_push
+        entry_push = min(entry_push, max_push)
+
+        # Minimal baseline buffer to prevent minor sweep wick-outs
+        if is_gold:
+            baseline_sl_pad = 0.35 * atr_15m if atr_15m and atr_15m > 0 else 3.50
+        elif is_jpy:
+            baseline_sl_pad = 4.0 * pip_size
+        else:
+            baseline_sl_pad = 3.0 * pip_size
+
+        # ── Dynamic SL padding: combine base ATR cushion with observed rejection wick ──
+        dyn_sl_pad = (self.sl_pad_base_atr + self.sl_pad_wick_atr * touch_wick_atr) * atr_15m
+        # Prevent risk compression: SL pad must at least cover entry_push + baseline buffer,
+        # and absorb incoming momentum wicks (dyn_sl_pad).
+        sl_pad = max(baseline_sl_pad, dyn_sl_pad, entry_push + baseline_sl_pad)
+
+        new_entry = orig_entry + sign * entry_push
+        new_sl    = orig_sl + sign * sl_pad
+        new_risk  = abs(new_entry - new_sl)
+        if new_risk <= 0:
+            return {"action": "unchanged", "reason": "degenerate risk after recompute — kept original",
+                    "score": score, "final_signal": None}
+
+        # Preserve structural target if it provides adequate R:R (>= self.min_rr_floor),
+        # otherwise recompute off new risk to maintain the floor.
+        struct_reward = abs(orig_tp - new_entry)
+        struct_rr = struct_reward / new_risk if new_risk > 0 else 0.0
+        if struct_rr >= self.min_rr_floor:
+            new_tp = orig_tp
+            new_reward = struct_reward
+            final_rr = struct_rr
+        else:
+            new_reward = new_risk * self.min_rr_floor
+            new_tp = new_entry - sign * new_reward
+            final_rr = self.min_rr_floor
+
+        final_signal = dict(sig)
+        final_signal.update({
+            "entry":       round(new_entry, 5),
+            "sl":          round(new_sl, 5),
+            "tp":          round(new_tp, 5),
+            "risk_pips":   round(new_risk / pip_size, 1),
+            "reward_pips": round(new_reward / pip_size, 1),
+            "risk_reward": f"1:{final_rr:.1f}",
+            "rr":          f"1:{final_rr:.1f}",
+            "adjusted":    True,
+            "tier":        tier,
+            "adjustment_reason": f"score={score:.2f} ({tier}) — entry pushed {entry_push / pip_size:.1f}p (wick_damped)"
+                                  f"{' (capped)' if push_was_capped else ''}, "
+                                  f"SL buffered {sl_pad / pip_size:.1f}p, TP preserved/held R:R {final_rr:.1f}",
+            "original_signal_id": sig_id,
+            "original_entry":  orig_entry,
+            "original_sl":      orig_sl,
+            "original_tp":      orig_tp,
+            "original_risk_pips": sig.get('risk_pips'),
+            # This is now a LIMIT order at a price the market hasn't reached
+            # yet, not a market-fill at current price — see check() below,
+            # which persists this back into signals_file with status still
+            # 'pending' so outcome tracking waits for the fill instead of
+            # assuming it happened immediately.
+            "pending_fill":         True,
+            "fill_deadline":        (datetime.utcnow() + timedelta(hours=self._fill_window_hours(symbol))).isoformat(),
+        })
+        return {
+            "action": f"adjust_{tier}",
+            "reason": final_signal["adjustment_reason"],
+            "score": score,
+            "final_signal": final_signal,
+        }
+
+    def _append_dual_signal_log(self, sig_id: str, original_sig: Dict,
+                                 decision: Dict, features: Dict):
+        """Persist original + final side by side (or the skip decision) so
+        outcomes can later be compared: did the recompute step actually help,
+        or would the raw original have done just as well / better?"""
+        record = {
+            "logged_at":           datetime.utcnow().isoformat(),
+            "original_signal_id":  sig_id,
+            "action":              decision["action"],
+            "reason":              decision["reason"],
+            "original_signal":     {k: original_sig.get(k) for k in
+                                     ("symbol", "direction", "entry", "sl", "tp",
+                                      "risk_pips", "reward_pips", "risk_reward", "probability")},
+            "final_signal":        decision.get("final_signal"),
+            "trigger_features":    features,
+        }
+        try:
+            with open(self.final_log_file, 'a') as f:
+                f.write(json.dumps(record) + "\n")
+        except Exception as e:
+            logger.warning(f"PriceMonitor: failed to write final signal log — {e}")
+
+    def check(self):
+        if not self.signals_file.exists():
+            return
+
+        try:
+            with open(self.signals_file, 'r') as f:
+                all_sigs = json.load(f)
+        except Exception as e:
+            logger.warning(f"PriceMonitor: could not load signals — {e}"); return
+
+        # Watch zones awaiting entry or confirmation in the Two-Stage Architecture
+        plan = [s for s in all_sigs if s.get('status') in ('pending', 'armed', 'in_zone') or s.get('stage') in (ZoneState.ARMED, ZoneState.IN_ZONE)]
+
+        # Group predictors by symbol for current-price lookup
+        pred_map = {p.symbol: p for p in self.predictors}
+        now      = datetime.utcnow()
+
+        for sig in plan:
+            sig_id = f"{sig.get('symbol')}_{sig.get('strategy', 'REVERSION')}_{sig.get('entry')}_{sig.get('sl')}"
+            # If already alerted AND qualified (TAKE), do not re-alert or re-process.
+            # If previously evaluated as SKIP but still in zone, allow re-checking on new
+            # candles so a developing rejection wick (>= 1.5 ATR) can upgrade it to TAKE.
+            if sig_id in self.alerted_signals and sig.get('advisor_qualified'):
+                continue
+
+            # Check validity window
+            try:
+                valid_until = datetime.fromisoformat(sig.get('valid_until', ''))
+                if now > valid_until:
+                    continue
+            except Exception:
+                pass
+
+            symbol = sig.get('symbol')
+            pred   = pred_map.get(symbol)
+            if pred is None:
+                continue
+
+            # outputsize=100 (not 30) so ATR(14), consecutive-directional-bar lookback,
+            # and signal_advisor's h4_slope (which requires completed 15m bars)
+            # have sufficient history, matching the backtest replay's window.
+            df = pred.fetch_bars(interval="15min", outputsize=100)
+            if df is None or len(df) == 0:
+                continue
+
+            current_price = df['close'].iloc[-1]
+            bar_low       = df['low'].iloc[-1]
+            bar_high      = df['high'].iloc[-1]
+            direction     = sig.get('direction', 'BUY')
+
+            # Zone boundaries stored in the signal (added in _build_setup)
+            zone_top = float(sig.get('zone_top',  sig.get('entry', 0) + pred.pip_size))
+            zone_bot = float(sig.get('zone_bottom', sig.get('entry', 0) - pred.pip_size))
+
+            if direction == 'BUY':
+                in_zone = (bar_low  <= zone_top and
+                           current_price >= zone_bot - pred.pip_size * 2)
+            else:
+                in_zone = (bar_high >= zone_bot and
+                           current_price <= zone_top + pred.pip_size * 2)
+
+            if in_zone:
+                features = self._compute_pre_entry_features(df, direction, pred.pip_size)
+                atr_15m  = features.get("atr_15m", pred.pip_size * 10)
+                touch_wick_atr = features.get("touch_rejection_wick_atr", 0.0)
+
+                # ── UNIFIED ADVISOR: evaluate at zone touch (Primary OR-71 + Promoted SKIP) ──
+                if _advisor_advise is not None:
+                    try:
+                        df5 = pred.fetch_bars("5min", outputsize=100)
+                        df4h = pred.fetch_bars("4h", outputsize=100)
+                        touch_time = df['time'].iloc[-1]
+                        planned_rr = sig.get('risk_reward') or sig.get('rr')
+                        consec_bars = features.get("consecutive_directional_bars")
+                        sig['advisor'] = _advisor_advise(
+                            direction, df, df5, df4h, touch_time, touch_wick_atr,
+                            risk_reward=planned_rr, consecutive_bars=consec_bars
+                        )
+                        adv_tier = sig['advisor'].get('tier', 'skip')
+                        sig['advisor_qualified'] = sig['advisor'].get('qualified', False)
+                        sig['advisor_tier'] = adv_tier
+                        sig['advisor_advice'] = sig['advisor'].get('advice', '')
+                        logger.info(
+                            f"📢 [{symbol}] Advisor: {sig['advisor']['advice']} [{adv_tier.upper()}] | "
+                            f"{sig['advisor']['values']} | met={sig['advisor']['conditions_met']}"
+                        )
+                    except Exception as _adv_err:
+                        sig['advisor'] = {'error': str(_adv_err), 'qualified': False, 'tier': 'skip', 'advice': 'SKIP (error)'}
+                        sig['advisor_qualified'] = False
+                        sig['advisor_tier'] = 'skip'
+                        sig['advisor_advice'] = 'SKIP (error)'
+
+                logger.info(
+                    f"🎯 [{symbol}] ZONE TOUCH DYNAMICS (30m pre-entry): "
+                    f"vel_30m={features.get('approach_velocity_30m_atr')}x ATR | "
+                    f"pre_bar={features.get('pre_touch_bar_size_atr')}x ATR "
+                    f"(body={features.get('pre_touch_body_ratio')}) | "
+                    f"rejection_wick={touch_wick_atr}x ATR | "
+                    f"consec={features.get('consecutive_directional_bars')} bars"
+                )
+                self._append_approach_log(
+                    "touch", sig, features,
+                    extra={"trigger_price": bar_low if direction == 'BUY' else bar_high}
+                )
+
+                # ── Optional Active Gating: ADVISOR_GATE ──────────────────────
+                if ADVISOR_GATE and not sig.get('advisor_qualified', False):
+                    logger.info(
+                        f"🚫 [{symbol}] ADVISOR GATE: Trade blocked/skipped (conviction too low: {sig.get('advisor_advice')}). "
+                        f"Conditions missing: {sig.get('advisor', {}).get('missing_inputs', [])}"
+                    )
+                    sig['status'] = 'skip_low_conviction'
+                    sig['advisor_blocked'] = True
+                    try:
+                        with open(self.signals_file, 'w') as f:
+                            json.dump(all_sigs, f, indent=2, default=str)
+                    except Exception as e:
+                        logger.warning(f"PriceMonitor: failed to persist blocked signal {sig_id} — {e}")
+                    continue
+
+                # ── Stage 3: trigger-time recompute ──────────────────────────
+                decision = self._recompute_final_signal(sig, sig_id, features, zone_top, zone_bot, pred)
+                decision["advisor"] = sig.get("advisor")
+                self._append_dual_signal_log(sig_id, sig, decision, features)
+
+                was_already_alerted = sig_id in self.alerted_signals
+                was_already_qualified = sig.get('_last_alerted_qualified', False)
+                self.alerted_signals.add(sig_id)
+
+                if decision["action"] == "unchanged":
+                    try:
+                        with open(self.signals_file, 'w') as f:
+                            json.dump(all_sigs, f, indent=2, default=str)
+                    except Exception as e:
+                        logger.warning(f"PriceMonitor: failed to persist unchanged signal {sig_id} — {e}")
+                    # Alert on first zone hit, or upgrade alert when qualified TAKE forms
+                    if not was_already_alerted or (sig.get('advisor_qualified') and not was_already_qualified):
+                        sig['_last_alerted_qualified'] = sig.get('advisor_qualified', False)
+                        self.alert_callback(sig)
+                    continue
+
+                final_sig = decision["final_signal"]
+                if final_sig is None:
+                    try:
+                        with open(self.signals_file, 'w') as f:
+                            json.dump(all_sigs, f, indent=2, default=str)
+                    except Exception as e:
+                        logger.warning(f"PriceMonitor: failed to persist signal {sig_id} — {e}")
+                    if not was_already_alerted or (sig.get('advisor_qualified') and not was_already_qualified):
+                        sig['_last_alerted_qualified'] = sig.get('advisor_qualified', False)
+                        self.alert_callback(sig)
+                    continue
+
+                logger.info(
+                    f"🔧 [{symbol}] SIGNAL ADJUSTED ({decision.get('score')}, {final_sig.get('tier')}) — "
+                    f"{decision['reason']} | orig entry {sig['entry']} -> final entry {final_sig['entry']} "
+                    f"| orig sl {sig['sl']} -> final sl {final_sig['sl']} "
+                    f"| orig tp {sig['tp']} -> final tp {final_sig['tp']} "
+                    f"(risk {sig.get('risk_pips')}p -> {final_sig.get('risk_pips')}p)"
+                )
+
+                sig['entry']       = final_sig['entry']
+                sig['sl']          = final_sig['sl']
+                sig['tp']          = final_sig['tp']
+                sig['risk_pips']   = final_sig.get('risk_pips')
+                sig['reward_pips'] = final_sig.get('reward_pips')
+                sig['risk_reward'] = final_sig.get('risk_reward')
+                sig['rr']          = final_sig.get('rr')
+                sig['adjusted']         = True
+                sig['tier']             = final_sig.get('tier')
+                sig['adjustment_reason']= final_sig.get('adjustment_reason')
+                sig['original_entry']   = final_sig.get('original_entry')
+                sig['original_sl']      = final_sig.get('original_sl')
+                sig['original_tp']      = final_sig.get('original_tp')
+                sig['pending_fill']     = True
+                sig['fill_deadline']    = final_sig.get('fill_deadline')
+                sig['timestamp'] = now.isoformat()
+
+                try:
+                    with open(self.signals_file, 'w') as f:
+                        json.dump(all_sigs, f, indent=2, default=str)
+                except Exception as e:
+                    logger.warning(f"PriceMonitor: failed to persist adjusted signal {sig_id} — {e}")
+
+                if not was_already_alerted or (sig.get('advisor_qualified') and not was_already_qualified):
+                    sig['_last_alerted_qualified'] = sig.get('advisor_qualified', False)
+                    self.alert_callback(sig)
+                continue
+
+            # ── Pre-touch "approaching" sample ───────────────────────────────
+            if sig_id not in self._approach_logged:
+                try:
+                    proximal_edge = zone_top if direction == 'BUY' else zone_bot
+                    hi, lo, cl = df['high'], df['low'], df['close']
+                    tr = pd.concat([hi - lo, (hi - cl.shift(1)).abs(), (lo - cl.shift(1)).abs()], axis=1).max(axis=1)
+                    atr_now = float(tr.rolling(14).mean().iloc[-1])
+                    if not np.isfinite(atr_now) or atr_now <= 0:
+                        atr_now = pred.pip_size * 10
+                    distance_atr  = abs(current_price - proximal_edge) / atr_now
+
+                    if distance_atr <= 0.5:
+                        app_feats = self._compute_pre_entry_features(df, direction, pred.pip_size)
+                        self._append_approach_log(
+                            "approaching", sig, app_feats,
+                            extra={"distance_to_zone_atr": round(distance_atr, 3),
+                                   "current_price": float(current_price)},
+                        )
+                        self._approach_logged.add(sig_id)
+                except Exception as e:
+                    logger.debug(f"PriceMonitor: approach-sample skipped for {sig_id} — {e}")
+
+
+
+def check_signal_outcomes(predictors: List['ProductionForexPredictor'],
+                           signals_file: str = "signals/all_signals.json"):
+    sym_predictor = {}
+    for p in predictors:
+        if p.symbol not in sym_predictor:
+            sym_predictor[p.symbol] = p
+
+    tracker = SignalOutcomeTrackerV2(signals_file)
+    result  = tracker.check_outcomes_by_symbol(sym_predictor)
+    if result.get('updated', 0) > 0:
+        print(f"  📊 Outcomes updated: TP={result['hit_tp']} SL={result['hit_sl']} "
+              f"Expired={result['expired']} | Win rate: {result['win_rate_pct']}%")
+    return result
+
+
+def _get_current_price(pred: 'ProductionForexPredictor') -> Optional[float]:
+    """Best-effort current price lookup for a symbol using its predictor's
+    own bar fetcher (same one PriceZoneMonitor uses)."""
+    try:
+        df = pred.fetch_bars(interval="15min", outputsize=5)
+        if df is None or len(df) == 0:
+            return None
+        return float(df['close'].iloc[-1])
+    except Exception as e:
+        logger.warning(f"_get_current_price: fetch failed for {pred.symbol} — {e}")
+        return None
+
+
+def apply_news_filter_to_active_signals(news_filter: ForexFactoryNewsFilter,
+                                        predictors: Optional[List['ProductionForexPredictor']] = None,
+                                        signals_file: str = "signals/all_signals.json",
+                                        window_minutes: int = 30):
+    path = Path(signals_file)
+    if not path.exists():
+        return
+
+    try:
+        with open(path) as f:
+            signals = json.load(f)
+    except Exception as e:
+        logger.warning(f"apply_news_filter_to_active_signals: load failed — {e}")
+        return
+
+    pred_map = {p.symbol: p for p in predictors} if predictors else {}
+    now_utc  = datetime.now(timezone.utc)
+    updated  = False
+
+    # Backfill: signals flagged for closure before the news_status field was
+    # introduced only have the older action=='close' marker. Without this,
+    # they'd never surface in the persistent summary below, since the branch
+    # that sets news_status intentionally skips re-processing already-closed
+    # signals (to avoid re-spamming the same closure warning every cycle).
+    for sig in signals:
+        if (sig.get('status') in ('triggered', 'active')
+                and sig.get('action') == 'close'
+                and sig.get('news_status') is None):
+            sig['news_status'] = 'flagged_for_closure'
+            updated = True
+
+    # Clear sweep: a news-flagged trade should stop being treated as a news
+    # risk the moment the actual news window (window_minutes around the
+    # event) closes — not after some arbitrary timer. Check the real window
+    # directly via is_news_active() for each flagged symbol; if it's no
+    # longer active, the acute risk has passed, so drop the flag. You're
+    # handling the real broker-side position yourself, so this is just
+    # about keeping the log/JSON accurate — not a trade action.
+    for sig in signals:
+        if sig.get('news_status') == 'flagged_for_closure':
+            symbol = sig.get('symbol')
+            is_news, _ = news_filter.is_news_active(symbol, window_minutes=window_minutes)
+            if not is_news:
+                _entry_str = f"{sig.get('entry'):.5f}" if sig.get('entry') is not None else "?"
+                print(f"✅ [{symbol} {sig.get('direction')} @ {_entry_str}] News window closed — flag cleared.")
+                sig['action']      = None
+                sig['news_status'] = None
+                updated = True
+
+    for sig in signals:
+        status = sig.get('status')
+        # Only process active (pending or triggered) signals
+        if status in ('pending', 'triggered', 'active') or sig.get('triggered', False) and status not in ('hit_tp', 'hit_sl', 'expired'):
+            symbol = sig.get('symbol')
+            # Check if news is active for this symbol (currencies)
+            is_news, news_event = news_filter.is_news_active(symbol, window_minutes=window_minutes)
+            if is_news:
+                triggered = sig.get('triggered', False)
+
+                # Case 1: Pending (not yet filled) — no position risk yet, and
+                # direction of the news reaction can't be known in advance, so
+                # it's safest to just drop the pending zone.
+                if not triggered or status == 'pending':
+                    sig['status'] = 'expired'
+                    if sig.get('original_sl') is None:
+                        sig['original_sl'] = sig.get('sl')   # preserve for record/slippage tracking
+                    sig['note']   = f"expired due to news risk: '{news_event['title']}' ({news_event['country']})"
+                    _dir = sig.get('direction', '?')
+                    _entry_str = f"{sig.get('entry'):.5f}" if sig.get('entry') is not None else "?"
+                    print(f"⚠️  [{symbol} {_dir} @ {_entry_str}] PENDING SIGNAL EXPIRED due to news risk: '{news_event['title']}'")
+                    updated = True
+
+                # Case 2: Triggered (already running) — a real position exists.
+                elif triggered or status == 'triggered':
+                    event_time = news_event.get('time_utc')
+                    news_already_released = event_time is not None and event_time <= now_utc
+
+                    direction     = sig.get('direction')
+                    entry         = sig.get('entry')
+                    current_price = _get_current_price(pred_map[symbol]) if symbol in pred_map else None
+
+                    favorable = None
+                    if news_already_released and current_price is not None and entry is not None and direction in ('BUY', 'SELL'):
+                        if direction == 'BUY':
+                            favorable = current_price >= entry   # moving up, toward TP
+                        else:  # SELL
+                            favorable = current_price <= entry   # moving down, toward TP
+
+                    if favorable:
+                        # News has already hit and price is moving toward TP —
+                        # leave the trade alone, just log it for visibility.
+                        if sig.get('action') == 'close':
+                            sig['action'] = None
+                        sig.pop('news_status', None)
+                        sig['news_risk'] = True
+                        sig['note'] = (f"news released: '{news_event['title']}' ({news_event['country']}) — "
+                                       f"price moving in favor of {direction}, holding")
+                        _entry_str = f"{entry:.5f}" if entry is not None else "?"
+                        print(f"ℹ️  [{symbol} {direction} @ {_entry_str}] News released ('{news_event['title']}') "
+                              f"but price is moving in your favor ({direction}) — no action needed.")
+                        updated = True
+                    else:
+                        # Either the news hasn't happened yet (direction unknown,
+                        # so be conservative) or it has and price is moving
+                        # against the position — flag for closure either way.
+                        if sig.get('action') != 'close':
+                            sig['action']       = 'close'
+                            sig['news_risk']    = True
+                            # Distinct from 'triggered' so it can't be mistaken for a
+                            # resolved outcome (hit_tp/hit_sl) if something downstream
+                            # stamps resolved_at on any signal carrying action=close.
+                            sig['news_status']  = 'flagged_for_closure'
+                            if sig.get('original_sl') is None:
+                                sig['original_sl'] = sig.get('sl')   # preserve for record/slippage tracking
+                            reason = ("price moving against position after news release"
+                                      if news_already_released and favorable is False
+                                      else "upcoming high-impact news — outcome unknown")
+                            sig['note'] = (f"close trade - risk of news: '{news_event['title']}' "
+                                           f"({news_event['country']}) — {reason}")
+                            _entry_str = f"{entry:.5f}" if entry is not None else "?"
+                            print(f"🚨 [{symbol} {direction} @ {_entry_str}] ACTIVE TRADE FLAGGED FOR CLOSURE — "
+                                  f"{reason} ('{news_event['title']}')")
+                            updated = True
+
+    if updated:
+        try:
+            with open(path, "w") as f:
+                json.dump(signals, f, indent=2)
+            print("💾 Saved news-restricted signal updates to all_signals.json")
+        except Exception as e:
+            logger.error(f"apply_news_filter_to_active_signals: save failed — {e}")
+
+    # ── Persistent status summary ──────────────────────────────────────────
+    # The transition logs above only fire when something *changes* this
+    # cycle, so a trade flagged for closure two cycles ago goes silent even
+    # though it's still sitting there unresolved. Print the full current
+    # state every cycle so nothing gets missed just because nothing changed.
+    still_flagged = [s for s in signals
+                      if s.get('status') in ('triggered', 'active')
+                      and s.get('news_status') == 'flagged_for_closure']
+    if still_flagged:
+        print(f"\n📋 Trades still flagged for closure (news risk):")
+        for s in still_flagged:
+            _entry_str = f"{s.get('entry'):.5f}" if s.get('entry') is not None else "?"
+            print(f"   • [{s.get('symbol')} {s.get('direction')} @ {_entry_str}] {s.get('note', '')}")
+
+
+def run_dual_strategy(symbols: Optional[List[str]] = None):
+    # One API key per pair — each key handles ~480 calls/day (well under 800 free limit).
+    # REV and CONT for the same pair share a key because the shared bar cache means
+    # they never double-fetch; the per-key rate limiter still enforces 7 calls/min.
+    PAIR_API_KEYS = {
+        "EUR/USD": os.getenv("TWELVE_KEY_EURUSD", "ea3e4fce074e403f8cd4c83dd0035643"),
+        "GBP/USD": os.getenv("TWELVE_KEY_GBPUSD", "2522b470eba249f88d2e29575035914e"),
+        "USD/JPY": os.getenv("TWELVE_KEY_USDJPY", "5bb48b4211144b92a4487ce7c63d1b7a"),
+        "XAU/USD": os.getenv("TWELVE_KEY_XAUUSD", "63a513bb7eb848748d28d3deb64c1b59"),
+    }
+    # Fallback key if a symbol not in the dict above is passed
+    _FALLBACK_KEY = os.getenv("TWELVE_KEY_EURUSD", "ea3e4fce074e403f8cd4c83dd0035643")
+
+    # Register spare key(s) any symbol can dynamically borrow from when its
+    # own primary key's 7-call/min budget is full. Add more TWELVE_KEY_SPARE_N
+    # entries here later if you get more keys.
+    _register_spare_keys([
+        os.getenv("TWELVE_KEY_SPARE_1", "152db33cd9e64bd4976cbbc0264bc753"),
+    ])
+
+    if symbols is None:
+        symbols = ["EUR/USD", "GBP/USD", "USD/JPY", "XAU/USD"]
+
+    SYMBOL_PARAMS = {
+        "EUR/USD": dict(max_distance_pips_rev=25.0, max_distance_pips_cont=15.0, zone_distance_threshold=50.0,  min_strength_atr=0.35),
+        "GBP/USD": dict(max_distance_pips_rev=25.0, max_distance_pips_cont=15.0, zone_distance_threshold=50.0,  min_strength_atr=0.35),
+        "USD/JPY": dict(max_distance_pips_rev=25.0, max_distance_pips_cont=15.0, zone_distance_threshold=50.0,  min_strength_atr=0.35),
+        "XAU/USD": dict(max_distance_pips_rev=80.0, max_distance_pips_cont=50.0, zone_distance_threshold=150.0, min_strength_atr=0.40),
+    }
+    # Fallback for any symbol not listed above
+    DEFAULT_PARAMS = dict(max_distance_pips_rev=25.0, max_distance_pips_cont=15.0, zone_distance_threshold=50.0, min_strength_atr=0.35)
+
+    print("\n╔════════════════════════════════════════════════════════════════╗")
+    print("║   DUAL STRATEGY MONITOR V7 — SCHEDULED + MULTI-PAIR          ║")
+    print(f"║   Pairs: {', '.join(symbols):<52}║")
+    print("╚════════════════════════════════════════════════════════════════╝\n")
+
+    all_predictors: List[ProductionForexPredictor] = []
+
+    for sym in symbols:
+        p   = SYMBOL_PARAMS.get(sym, DEFAULT_PARAMS)
+        key = PAIR_API_KEYS.get(sym, _FALLBACK_KEY)
+        rev  = ProductionForexPredictor(
+            api_key=key,
+            model_path="models/model_v6_reversion.pkl",
+            scaler_path="models/scaler_v6_reversion.pkl",
+            encoders_path="models/encoders_v6_reversion.pkl",
+            stats_path="models/training_stats_v6_reversion.pkl",
+            symbol=sym,
+            prob_threshold=0.40,
+            max_rr=8.0, min_risk_atr=2.5, max_distance_pips=p['max_distance_pips_rev'],  # min_risk_atr: 1.5→2.5
+            min_strength_atr=0.50, use_5min_refinement=True,
+            refine_max_dist_multiplier=2.0, enable_continuation=False,
+            use_htf_analysis=True, min_confluence_score=1,
+            require_htf_bias_gate=False,
+            zone_ttl_hours=48.0, zone_distance_threshold=p['zone_distance_threshold'],
+            htf_fvg_min_gap_atr=0.3, htf_ob_min_reaction_atr=1.0,
+            is_continuation_strategy=False, require_zone_close=True, debug=True
+        )
+        cont = ProductionForexPredictor(
+            api_key=key,
+            model_path="models/model_v6_continuation.pkl",
+            scaler_path="models/scaler_v6_continuation.pkl",
+            encoders_path="models/encoders_v6_continuation.pkl",
+            stats_path="models/training_stats_v6_continuation.pkl",
+            symbol=sym,
+            prob_threshold=0.55,  # wired to match backtest_replay.py's validated cont threshold (was 0.60)
+            max_rr=10.0, min_risk_atr=2.5, max_distance_pips=p['max_distance_pips_cont'],  # min_risk_atr: 1.5→2.5
+            min_strength_atr=0.50, use_5min_refinement=True,
+            refine_max_dist_multiplier=2.0, enable_continuation=True,
+            use_htf_analysis=True, min_confluence_score=1,
+            require_htf_bias_gate=False,
+            zone_ttl_hours=48.0, zone_distance_threshold=p['zone_distance_threshold'],
+            htf_fvg_min_gap_atr=0.3, htf_ob_min_reaction_atr=1.0,
+            is_continuation_strategy=True, debug=True
+        )
+        all_predictors.extend([rev, cont])
+
+    weekly_scheduler = WeeklyPlanScheduler(all_predictors)
+    price_monitor    = PriceZoneMonitor(all_predictors)
+    news_filter      = ForexFactoryNewsFilter()
+
+    # Schedule weekly plan on Sunday 20:00 UTC
+    schedule.every().sunday.at("20:00").do(weekly_scheduler.generate)
+
+    # Run weekly plan on startup if it's Sunday, otherwise load any existing one
+    if datetime.utcnow().weekday() == 6:
+        weekly_scheduler.generate()
+
+    print(f"\n🕐 15-min price monitor active | Ctrl-C to stop\n")
+
+    iteration = 0
+    rev_predictor  = all_predictors[0]   # first symbol reversion — used for outcome tracking
+    cont_predictor = all_predictors[1] if len(all_predictors) > 1 else rev_predictor
+
+    try:
+        while True:
+            iteration    += 1
+            cycle_start   = time.monotonic()
+            cycle_time    = datetime.utcnow()
+
+            print(f"\n{'═'*100}")
+            print(f"CYCLE #{iteration} │ {cycle_time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+            print(f"{'═'*100}")
+
+            # Run pending scheduled jobs (weekly plan generation)
+            schedule.run_pending()
+
+            # Price monitor: check if any pending zone (from all_signals.json) has been touched
+            price_monitor.check()
+
+            # Still run full signal generation every cycle for live signals
+            # (the sole source of truth — saves to all_signals.json, which
+            # PriceZoneMonitor also reads to watch pending zones)
+            for i in range(0, len(all_predictors), 2):
+                rev_p  = all_predictors[i]
+                cont_p = all_predictors[i + 1] if i + 1 < len(all_predictors) else None
+
+                # ── News Filter Gate ──
+                is_news, news_event = news_filter.is_news_active(rev_p.symbol, window_minutes=30)
+                if is_news:
+                    print(f"\n⚠️  [{rev_p.symbol}] NEWS FILTER ACTIVE: High-impact news event '{news_event['title']}' "
+                          f"({news_event['country']}) is scheduled at {news_event['time_utc']} UTC. "
+                          f"Skipping signal generation for this pair to avoid news-driven volatility.\n")
+                    continue
+
+                # Pre-warm shared cache for this symbol before both predictors run.
+                # REV and CONT will hit cache instead of making duplicate API calls.
+                try:
+                    rev_p.pre_warm_cache()
+                except Exception as e:
+                    logger.warning(f"Cycle pre_warm_cache failed for {rev_p.symbol}: {e}")
+
+                rev_result  = rev_p.generate_signals()
+                cont_result = cont_p.generate_signals() if cont_p else {'15min_signals': [], 'htf_signals': [], 'stats': {}}
+
+                rev_15min  = rev_result.get('15min_signals', [])
+                rev_htf    = rev_result.get('htf_signals', [])
+                rev_stats  = rev_result.get('stats', {})
+                cont_15min = cont_result.get('15min_signals', [])
+                cont_htf   = cont_result.get('htf_signals', [])
+                cont_stats = cont_result.get('stats', {})
+
+                sym = rev_p.symbol
+                print(f"\n[{sym}] Rev(15m:{len(rev_15min)} HTF:{len(rev_htf)}) | "
+                      f"Cont(15m:{len(cont_15min)} HTF:{len(cont_htf)}) | "
+                      f"Dup:{rev_stats.get('duplicates',0)+cont_stats.get('duplicates',0)} | "
+                      f"Active:{rev_stats.get('active_zones',0)+cont_stats.get('active_zones',0)}")
+
+                all_15min = []
+                for sig in rev_15min:  sig['strategy'] = 'REVERSION';    all_15min.append(sig)
+                for sig in cont_15min: sig['strategy'] = 'CONTINUATION'; all_15min.append(sig)
+
+                if all_15min:
+                    print(f"\n┌─ 15-MIN SIGNALS [{sym}] ({len(all_15min)}) " + "─"*60 + "┐")
+                    print("│ Time  │ Strat        │ Type    │ Dir  │ Entry    │ SL       │ TP       │ Risk │ R:R   │ Prob │ Conf │")
+                    print("├" + "─"*107 + "┤")
+                    for sig in sorted(all_15min, key=lambda x: x['probability'], reverse=True):
+                        emoji    = "🟢" if sig['direction'] == 'BUY' else "🔴"
+                        t_type   = "CONT" if sig.get('trade_type') == 'continuation' else "FRESH"
+                        refined  = "✓"   if sig.get('5min_refined') else ""
+                        ct_warn  = "⚠️CT" if sig.get('counter_trend') else "   "
+                        print(f"│ {sig['timestamp']} │ {sig['strategy']:<12} │ {t_type:<7} │ "
+                              f"{emoji} {sig['direction']:<2} │ {sig['entry']:<8.5f} │ {sig['sl']:<8.5f} │ "
+                              f"{sig['tp']:<8.5f} │ {sig['risk_pips']:>4.1f}p │ {sig['rr']:<5} │ "
+                              f"{sig['probability']:>4.1f}% │ {sig.get('confluence_score',0)}/10 {refined} {ct_warn} │")
+                    print("└" + "─"*107 + "┘")
+
+                for sig in rev_htf:  sig.setdefault('strategy', 'REVERSION')
+                for sig in cont_htf: sig.setdefault('strategy', 'CONTINUATION')
+
+                all_htf = list({
+                    (s.get('strategy', 'REVERSION'), s['timeframe'], s['direction'], s['entry'], s['sl']): s
+                    for s in rev_htf + cont_htf
+                }.values())
+
+                if all_htf:
+                    print(f"\n┌─ HTF SMC SIGNALS [{sym}] ({len(all_htf)}) " + "─"*65 + "┐")
+                    print("│ TF │ Type │ Dir  │ Entry    │ SL       │ TP       │ Risk  │ R:R    │ Prob │ Conf       │")
+                    print("├" + "─"*102 + "┤")
+                    for sig in sorted(all_htf, key=lambda x: x['probability'], reverse=True)[:10]:
+                        emoji = "🟢" if sig['direction'] == 'BUY' else "🔴"
+                        print(f"│ {sig['timeframe']:<2} │ {sig['type']:<4} │ "
+                              f"{emoji} {sig['direction']:<2} │ {sig['entry']:<8.5f} │ {sig['sl']:<8.5f} │ "
+                              f"{sig['tp']:<8.5f} │ {sig['risk_pips']:>5.1f}p │ {sig['rr']:<6} │ "
+                              f"{sig['probability']:>4.1f}% │ {sig.get('confluence',''):<10} │")
+                    print("└" + "─"*102 + "┘")
+
+                all_sigs = all_15min + all_htf
+                if all_sigs:
+                    for sig in all_sigs:
+                        if not sig.get('timestamp'):
+                            sig['timestamp'] = cycle_time.isoformat()
+                        sig['last_seen'] = cycle_time.isoformat()
+                        if 'valid_until' not in sig or not sig.get('valid_until'):
+                            tf = sig.get('timeframe', '15min')
+                            if tf in ('1d', '1day', 'daily'):
+                                hours = 240   # 10 days
+                            elif tf in ('4h', '4hour'):
+                                hours = 120   # 5 days
+                            elif tf in ('1h', '1hour'):
+                                hours = 48    # 2 days
+                            else:
+                                hours = 8     # 15min/other — stale fast
+                            sig['valid_until'] = (cycle_time + timedelta(hours=hours)).isoformat()
+                    save_signals_to_single_file(all_sigs, "signals/all_signals.json")
+
+            # written this cycle are visible to the tracker immediately.
+            check_signal_outcomes(all_predictors)
+            apply_news_filter_to_active_signals(news_filter, predictors=all_predictors)
+
+            # Per-cycle cap for any downstream Telegram push
+            MAX_SIGNALS_PER_CYCLE = 3
+            # (Telegram push integration point — add your send function here)
+
+            print(f"\n{'─'*100}")
+            print(f"⏰ Next cycle: {(cycle_time + timedelta(minutes=15)).strftime('%H:%M:%S UTC')}")
+            print(f"{'─'*100}\n")
+            elapsed = time.monotonic() - cycle_start
+            time.sleep(max(0, 900 - elapsed))
+
+    except KeyboardInterrupt:
+        print("\n\n╔════════════════════════════════════════════════════════════════╗")
+        print("║                    MONITORING STOPPED                          ║")
+        print("╚════════════════════════════════════════════════════════════════╝\n")
+        print(f"Total Cycles: {iteration}\n")
+
+        for p in all_predictors:
+            strat = "CONTINUATION" if p.is_continuation_strategy else "REVERSION"
+            print(f"{strat} [{p.symbol}]  new_zones={p.stats['total_new_zones']}  "
+                  f"duplicates={p.stats['total_duplicates']}  "
+                  f"rejected={p.stats['total_rejected']}  "
+                  f"active={p.zone_tracker.get_active_count()}")
+
+        print(f"\nWalk-forward validated thresholds (2022-Q3 → 2025-Q1):")
+        print(f"  • Zone strength: 0.35 ATR  |  Wilder's ATR smoothing (IMPROVE-1)")
+        print(f"  • HTF FVG: 0.5 ATR | HTF OB: 2.5 ATR")
+        print(f"  • Max boost: Rev 7% | Cont 6%")
+        print(f"  • Zone persistence: zones_state.json (IMPROVE-3)")
+        print(f"{'─'*80}\n")
+
+
+if __name__ == "__main__":
+    # Runs all four pairs by default.
+    # To restrict to a subset, pass an explicit list, e.g.:
+    #   run_dual_strategy(symbols=["EUR/USD", "GBP/USD"])
+    run_dual_strategy()
